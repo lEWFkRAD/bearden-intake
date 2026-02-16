@@ -3,12 +3,13 @@
 ## Upload Section
 - [x] PDF file upload with drag-and-drop
 - [x] Client name input (auto-fills from filename)
+- [x] Quick link to upload PY docs / manage instructions (below client name)
 - [x] Tax year selector
 - [x] Document type pills (tax_returns, bank_statements, trust_documents, bookkeeping, payroll, other)
 - [x] Output format pills (tax_review, journal_entries, account_balances, trial_balance, transaction_register)
+- [x] AI Instructions textarea (visible, not hidden — tell the AI how to handle this document)
 - [x] Advanced Options accordion:
   - [x] User notes textarea
-  - [x] AI instructions textarea
   - [x] Skip verification checkbox
   - [x] Disable PII tokenization checkbox
   - [x] Use OCR-first mode checkbox (lower cost, less accurate)
@@ -30,6 +31,7 @@
 - [x] Download Excel button
 - [x] Download JSON log button
 - [x] Regenerate Excel button (manual trigger for re-generating with corrections)
+- [x] AI Chat panel ("Ask AI" button — chat about current page with Claude vision)
 - [x] Keyboard shortcuts overlay (? key)
 - [x] Verification progress bar
 - [x] Verification stats (confirmed/corrected/flagged counts)
@@ -39,7 +41,7 @@
 ### Field Verification
 - [x] Confirm field (green checkmark button / Enter key)
 - [x] Flag field (flag button / F key)
-- [x] Edit value (double-click or E key — inline text input)
+- [x] Edit value (edit button / double-click / E key — inline text input, won't get destroyed by focus events)
 - [x] Add note (pencil button / N key — inline text input)
 - [x] Confidence dots (green=confirmed, yellow=corrected, orange=low, gray=other)
 - [x] Corrected value display (strikethrough original + arrow + new value)
@@ -151,6 +153,7 @@
 - [x] POST /api/delete/<job_id> — Delete job
 - [x] POST /api/retry/<job_id> — Retry failed job
 - [x] POST /api/cancel/<job_id> — Cancel running job
+- [x] POST /api/ai-chat/<job_id> — Chat with AI about current page/extraction
 - [x] GET /api/clients — List clients
 - [x] GET /api/context/<client>/ — Get context index
 - [x] POST /api/context/<client>/upload — Upload context doc

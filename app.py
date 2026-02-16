@@ -1131,6 +1131,76 @@ def reextract_page(job_id, page_num):
         "fields": fields_out,
     })
 
+@app.route("/api/ai-chat/<job_id>", methods=["POST"])
+def ai_chat(job_id):
+    """Chat with AI about the current extraction / page."""
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    message = request.json.get("message", "").strip()
+    page_num = request.json.get("page")
+    if not message:
+        return jsonify({"error": "No message provided"}), 400
+
+    import base64
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return jsonify({"error": "Anthropic library not available"}), 500
+
+    # Build context from the extraction log
+    log_path = job.get("output_log")
+    extraction_context = ""
+    if log_path and os.path.exists(log_path):
+        with open(log_path) as f:
+            log_data = json.load(f)
+        exts = log_data.get("extractions", [])
+        if page_num:
+            page_exts = [e for e in exts if e.get("_page") == page_num]
+            if page_exts:
+                extraction_context = f"Extracted data for page {page_num}:\n{json.dumps(page_exts, indent=2, default=str)[:4000]}"
+        if not extraction_context:
+            summary = []
+            for e in exts:
+                p = e.get("_page", "?")
+                dt = e.get("document_type", "?")
+                ent = e.get("payer_or_entity", "?")
+                summary.append(f"Page {p}: {dt} — {ent}")
+            extraction_context = "Document summary:\n" + "\n".join(summary)
+
+    # Include page image if available
+    content = []
+    if page_num:
+        img_path = PAGES_DIR / job_id / f"page_{page_num}.jpg"
+        if img_path.exists():
+            with open(img_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}})
+
+    prompt = f"""You are an assistant helping a CPA firm review tax document extractions.
+The operator is reviewing extracted data and has a question.
+
+{extraction_context}
+
+Operator's question: {message}
+
+Be concise and helpful. If the operator asks about a specific value, reference the extracted data. If they ask you to look at the page image, describe what you see."""
+
+    content.append({"type": "text", "text": prompt})
+
+    try:
+        client = _anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=1500,
+            messages=[{"role": "user", "content": content}]
+        )
+        reply = msg.content[0].text
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"error": f"AI call failed: {str(e)}"}), 500
+
+
 @app.route("/api/page-image/<job_id>/<int:page_num>")
 def page_image(job_id, page_num):
     img_path = PAGES_DIR / job_id / f"page_{page_num}.jpg"
@@ -2469,7 +2539,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     </a>
     <a class="nav-item" onclick="showSection('clients')" data-section="clients">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-      <span>Clients</span>
+      <span>Clients &amp; PY Docs</span>
     </a>
     <a class="nav-item" onclick="showSection('batch')" data-section="batch">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
@@ -2517,6 +2587,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
               <label class="form-label">Client Name</label>
               <input type="text" id="clientName" class="form-input" placeholder="e.g. Watts, Stacy" list="clientSuggestions">
               <datalist id="clientSuggestions"></datalist>
+              <a href="#" onclick="event.preventDefault(); const cn=document.getElementById('clientName').value.trim(); if(cn){showSection('clients');setTimeout(()=>openClientDetail(cn),200);} else {showToast('Enter a client name first','error');}" style="font-size:11px; color:var(--accent); text-decoration:none; margin-top:4px; display:inline-block;">&#x1F4C2; Upload prior-year docs / manage instructions</a>
             </div>
             <div class="form-group">
               <label class="form-label">Tax Year</label>
@@ -2534,16 +2605,17 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
             <div class="pill-group" id="outputFormatPills"></div>
           </div>
 
+          <div class="form-group">
+            <label class="form-label">AI Instructions</label>
+            <textarea id="aiInstructions" class="form-input" rows="3" placeholder="Tell the AI how to handle this document. Example: 'This is a trust return — extract K-1 box 1-14 only' or 'Combine all 1099-DIV pages into one entry per payer'"></textarea>
+          </div>
+
           <details style="margin-bottom:16px">
             <summary style="font-size:12px; font-weight:600; color:var(--text-secondary); cursor:pointer; padding:4px 0;">Advanced Options</summary>
             <div style="padding-top:12px">
               <div class="form-group">
                 <label class="form-label">Notes for Extraction</label>
                 <textarea id="userNotes" class="form-input" rows="2" placeholder="Optional context about this document..."></textarea>
-              </div>
-              <div class="form-group">
-                <label class="form-label">AI Instructions</label>
-                <textarea id="aiInstructions" class="form-input" rows="2" placeholder="Optional special instructions for the AI..."></textarea>
               </div>
               <div class="form-group">
                 <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
@@ -2606,6 +2678,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <button class="btn btn-success btn-sm" onclick="downloadFile('xlsx')">&#x2B73; Excel</button>
       <button class="btn btn-secondary btn-sm" onclick="downloadFile('log')">&#x2B73; JSON</button>
       <button class="btn btn-secondary btn-sm" onclick="regenExcel()" title="Regenerate Excel with corrections">&#x21BB; Regen Excel</button>
+      <button class="btn btn-secondary btn-sm" onclick="toggleAiChat()" title="Ask AI about this page" id="aiChatToggle">&#x1F4AC; Ask AI</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
     </div>
   </div>
@@ -2618,11 +2691,23 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="review-pdf" id="pdfViewer"></div>
     <div class="review-fields" id="fieldsPanel"></div>
   </div>
+  <!-- AI Chat Panel -->
+  <div id="aiChatPanel" style="display:none; border-top:2px solid var(--accent); background:var(--bg-card);">
+    <div style="padding:12px 20px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border);">
+      <span style="font-size:13px; font-weight:700; color:var(--navy);">&#x1F4AC; AI Assistant — Page <span id="aiChatPage">1</span></span>
+      <button class="btn btn-ghost btn-sm" onclick="toggleAiChat()" title="Close">&#x2716;</button>
+    </div>
+    <div id="aiChatMessages" style="padding:12px 20px; max-height:200px; overflow-y:auto; font-size:13px;"></div>
+    <div style="padding:8px 20px 12px; display:flex; gap:8px;">
+      <input type="text" id="aiChatInput" class="form-input" placeholder="Ask about this page... e.g. 'What's in box 14?' or 'Is this K-1 or K-3?'" style="flex:1; font-size:13px;" onkeydown="if(event.key==='Enter')sendAiChat()">
+      <button class="btn btn-primary btn-sm" onclick="sendAiChat()">Send</button>
+    </div>
+  </div>
 </div>
 
 <!-- ═══ CLIENTS SECTION ═══ -->
 <div class="section" id="sec-clients">
-  <div class="page-header"><h2>Client Manager</h2><p>Prior-year context, instructions, and document tracking</p></div>
+  <div class="page-header"><h2>Client Manager</h2><p>Upload prior-year returns &amp; workpapers, set extraction instructions, track document completeness</p></div>
   <div class="page-content">
     <div id="clientListView">
       <div style="margin-bottom:16px; display:flex; gap:8px; align-items:center">
@@ -3263,8 +3348,9 @@ function loadPage(page, focusIdx) {
       html += '<div class="' + rowClass + '" data-key="' + esc(vk) + '" onclick="setFocus(' + idx + ')">';
       html += '<span class="field-name">' + esc(k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())) + '</span>';
       html += '<span class="field-val-wrap"><span class="conf-dot ' + dotClass + '"></span>';
-      html += '<span class="field-val" ondblclick="startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')">' + esc(displayStr) + '</span>';
+      html += '<span class="field-val" ondblclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')">' + esc(displayStr) + '</span>';
       html += '<span class="field-actions">';
+      html += '<button class="vf-btn" onclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')" title="Edit value (E)">&#x270F;</button>';
       html += '<button class="vf-btn vf-btn-confirm' + (vstate&&vstate.status==='confirmed'?' active':'') + '" onclick="event.stopPropagation();confirmField(\'' + esc(vk) + '\')" title="Confirm (Enter)">\u2713</button>';
       html += '<button class="vf-btn vf-btn-flag' + (vstate&&vstate.status==='flagged'?' active':'') + '" onclick="event.stopPropagation();flagField(\'' + esc(vk) + '\')" title="Flag (F)">\u2691</button>';
       html += '<button class="vf-btn vf-btn-note' + (vstate&&vstate.note?' has-note':'') + '" onclick="event.stopPropagation();toggleNoteInput(\'' + esc(vk) + '\')" title="Add note (N)">&#x270E;</button>';
@@ -3320,7 +3406,11 @@ function loadPage(page, focusIdx) {
   if (focusedFieldIdx >= pageFieldKeys.length) focusedFieldIdx = Math.max(0, pageFieldKeys.length - 1);
 }
 
-function setFocus(idx) { focusedFieldIdx = idx; loadPage(currentPage, idx); }
+function setFocus(idx) {
+  // Don't rebuild page if an edit input is active (would destroy it)
+  if (document.querySelector('.field-edit-input')) return;
+  focusedFieldIdx = idx; loadPage(currentPage, idx);
+}
 function prevPage() { if (currentPage > 1) loadPage(currentPage - 1); }
 function nextPage() { if (currentPage < totalPages) loadPage(currentPage + 1); }
 
@@ -3366,6 +3456,51 @@ function regenExcel() {
       showToast('Excel regenerated successfully', 'success');
     })
     .catch(e => { showToast('Regen failed: ' + e, 'error'); });
+}
+
+// ─── AI Chat ───
+function toggleAiChat() {
+  const panel = document.getElementById('aiChatPanel');
+  const isVisible = panel.style.display !== 'none';
+  panel.style.display = isVisible ? 'none' : '';
+  if (!isVisible) {
+    document.getElementById('aiChatPage').textContent = currentPage;
+    document.getElementById('aiChatInput').focus();
+  }
+}
+
+function sendAiChat() {
+  const input = document.getElementById('aiChatInput');
+  const message = input.value.trim();
+  if (!message || !currentJobId) return;
+  input.value = '';
+
+  const msgs = document.getElementById('aiChatMessages');
+  msgs.innerHTML += '<div style="margin-bottom:8px;"><strong style="color:var(--navy);">You:</strong> ' + esc(message) + '</div>';
+  msgs.innerHTML += '<div id="aiTyping" style="margin-bottom:8px;color:var(--text-light);font-style:italic;">AI is thinking...</div>';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  fetch('/api/ai-chat/' + currentJobId, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: message, page: currentPage })
+  })
+  .then(r => r.json())
+  .then(data => {
+    const typing = document.getElementById('aiTyping');
+    if (typing) typing.remove();
+    if (data.error) {
+      msgs.innerHTML += '<div style="margin-bottom:8px;color:var(--red);">Error: ' + esc(data.error) + '</div>';
+    } else {
+      msgs.innerHTML += '<div style="margin-bottom:8px;"><strong style="color:var(--accent);">AI:</strong> ' + esc(data.reply).replace(/\n/g, '<br>') + '</div>';
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  })
+  .catch(e => {
+    const typing = document.getElementById('aiTyping');
+    if (typing) typing.remove();
+    msgs.innerHTML += '<div style="margin-bottom:8px;color:var(--red);">Error: ' + esc(String(e)) + '</div>';
+  });
 }
 
 // ─── History ───
