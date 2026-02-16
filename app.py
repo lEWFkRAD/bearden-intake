@@ -26,6 +26,7 @@ import threading
 import uuid
 import re
 import glob
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -233,6 +234,29 @@ def _safe_client_name(name):
     """Sanitize client name for filesystem use."""
     safe = re.sub(r'[^\w\s\-\.,()]', '', name).strip() or "Unknown Client"
     return safe.title()
+
+def _client_info_path(name):
+    """Path to client metadata JSON."""
+    return CLIENTS_DIR / _safe_client_name(name) / "client_info.json"
+
+def _load_client_info(name):
+    """Load client metadata or return None."""
+    p = _client_info_path(name)
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def _save_client_info(name, info):
+    """Save client metadata JSON."""
+    p = _client_info_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    info["updated"] = datetime.now().isoformat()
+    with open(p, "w") as f:
+        json.dump(info, f, indent=2)
 
 def _context_dir(client_name):
     """Get or create the context directory for a client."""
@@ -902,6 +926,8 @@ def upload():
     disable_pii = request.form.get("disable_pii") == "true"
     use_ocr_first = request.form.get("use_ocr_first") == "true"
     client_name = request.form.get("client_name", "").strip()
+    if not client_name:
+        return jsonify({"error": "Please select a client"}), 400
     doc_type = request.form.get("doc_type", "tax_returns")
     if doc_type not in VALID_DOC_TYPES:
         doc_type = "tax_returns"  # Safe default
@@ -920,7 +946,7 @@ def upload():
     f.save(str(pdf_path))
 
     # Build client folder path
-    resolved_client = client_name or Path(f.filename).stem.replace("_", " ")
+    resolved_client = _safe_client_name(client_name)
     client_dir = _client_dir(resolved_client, doc_type, year)
 
     job_id = datetime.now().strftime("%m%d") + "-" + str(uuid.uuid4())[:6]
@@ -1417,8 +1443,101 @@ def list_clients():
     result = []
     for c in sorted(clients.values(), key=lambda x: x.get("latest", ""), reverse=True):
         c["years"] = sorted(c["years"])
+        # Include client metadata if available
+        info = _load_client_info(c["name"])
+        if info:
+            c["ein_last4"] = info.get("ein_last4", "")
+            c["contact"] = info.get("contact", "")
+            c["notes"] = info.get("notes", "")
         result.append(c)
     return jsonify(result)
+
+
+@app.route("/api/clients/create", methods=["POST"])
+def create_client():
+    """Create a new client with metadata."""
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Client name is required"}), 400
+    safe = _safe_client_name(name)
+    # Create directory
+    client_dir = CLIENTS_DIR / safe
+    client_dir.mkdir(parents=True, exist_ok=True)
+    info = {
+        "name": safe,
+        "ein_last4": (data.get("ein_last4") or "").strip()[:4],
+        "contact": (data.get("contact") or "").strip()[:200],
+        "notes": (data.get("notes") or "").strip()[:1000],
+        "created": datetime.now().isoformat(),
+    }
+    _save_client_info(safe, info)
+    return jsonify({"ok": True, "name": safe})
+
+
+@app.route("/api/clients/<path:client_name>/info", methods=["GET"])
+def get_client_info(client_name):
+    """Get client metadata."""
+    info = _load_client_info(client_name)
+    if not info:
+        return jsonify({"name": _safe_client_name(client_name)})
+    return jsonify(info)
+
+
+@app.route("/api/clients/<path:client_name>/info", methods=["PUT"])
+def update_client_info(client_name):
+    """Update client metadata."""
+    data = request.get_json(force=True)
+    safe = _safe_client_name(client_name)
+    info = _load_client_info(safe) or {"name": safe, "created": datetime.now().isoformat()}
+    if "ein_last4" in data:
+        info["ein_last4"] = (data["ein_last4"] or "").strip()[:4]
+    if "contact" in data:
+        info["contact"] = (data["contact"] or "").strip()[:200]
+    if "notes" in data:
+        info["notes"] = (data["notes"] or "").strip()[:1000]
+    _save_client_info(safe, info)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/clients/<path:client_name>/documents", methods=["GET"])
+def get_client_documents(client_name):
+    """List all extraction jobs for a client, grouped by document type."""
+    safe = _safe_client_name(client_name)
+    docs = []
+    for jid, j in jobs.items():
+        jclient = _safe_client_name(j.get("client_name", ""))
+        if jclient != safe:
+            continue
+        # Check for output files
+        has_xlsx = False
+        has_log = False
+        if j.get("status") == "complete":
+            xlsx_path = OUTPUT_DIR / f"{jid}.xlsx"
+            log_path = OUTPUT_DIR / f"{jid}_log.json"
+            has_xlsx = xlsx_path.exists()
+            has_log = log_path.exists()
+        docs.append({
+            "job_id": jid,
+            "filename": j.get("filename", ""),
+            "doc_type": j.get("doc_type", ""),
+            "year": j.get("year", ""),
+            "status": j.get("status", ""),
+            "cost_usd": j.get("cost_usd"),
+            "created": j.get("created", ""),
+            "has_xlsx": has_xlsx,
+            "has_log": has_log,
+        })
+    # Sort by created descending
+    docs.sort(key=lambda d: d.get("created", ""), reverse=True)
+    # Group by doc_type
+    grouped = {}
+    for d in docs:
+        dt = d["doc_type"] or "other"
+        if dt not in grouped:
+            grouped[dt] = []
+        grouped[dt].append(d)
+    return jsonify({"documents": docs, "grouped": grouped})
 
 
 # ─── Prior-Year Context Routes ────────────────────────────────────────────────
@@ -2097,6 +2216,81 @@ def regen_excel(job_id):
     return jsonify({"ok": ok})
 
 
+@app.route("/api/clients/<path:client_name>/generate-report", methods=["POST"])
+def generate_report(client_name):
+    """Generate a combined Excel report from multiple extraction jobs."""
+    data = request.get_json(force=True)
+    job_ids = data.get("job_ids", [])
+    output_format = data.get("output_format", "tax_review")
+    year = data.get("year", str(datetime.now().year))
+
+    if not job_ids:
+        return jsonify({"error": "No jobs selected"}), 400
+
+    # Gather extractions from all selected jobs
+    combined_extractions = []
+    for jid in job_ids:
+        job = jobs.get(jid)
+        if not job or job.get("status") != "complete":
+            continue
+        log_path = job.get("output_log")
+        if not log_path or not os.path.exists(log_path):
+            continue
+        try:
+            with open(log_path) as f:
+                log_data = json.load(f)
+            combined_extractions.extend(log_data.get("extractions", []))
+        except Exception:
+            continue
+
+    if not combined_extractions:
+        return jsonify({"error": "No extraction data found in selected jobs"}), 400
+
+    # Write combined log
+    safe = _safe_client_name(client_name)
+    report_id = f"report-{safe}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    combined_log = {
+        "extractions": combined_extractions,
+        "output_format": output_format,
+        "year": year,
+    }
+    combined_path = OUTPUT_DIR / f"{report_id}_log.json"
+    with open(combined_path, "w") as f:
+        json.dump(combined_log, f)
+
+    # Generate Excel via extract.py
+    output_path = OUTPUT_DIR / f"{report_id}.xlsx"
+    try:
+        cmd = [
+            sys.executable, str(BASE_DIR / "extract.py"),
+            "--regen-excel",
+            "--log-input", str(combined_path),
+            "--output", str(output_path),
+            "--year", str(year),
+            "--output-format", output_format,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return jsonify({"error": f"Report generation failed: {result.stderr[:500]}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if not output_path.exists():
+        return jsonify({"error": "Report file was not created"}), 500
+
+    return jsonify({"ok": True, "filename": report_id, "download_url": f"/api/download-report/{report_id}"})
+
+
+@app.route("/api/download-report/<report_id>")
+def download_report(report_id):
+    """Download a generated report."""
+    safe_id = re.sub(r'[^\w\-]', '', report_id)
+    path = OUTPUT_DIR / f"{safe_id}.xlsx"
+    if not path.exists():
+        return jsonify({"error": "Report not found"}), 404
+    return send_file(str(path), as_attachment=True, download_name=f"{safe_id}.xlsx")
+
+
 # ─── Retry Failed/Interrupted Jobs ──────────────────────────────────────────
 
 @app.route("/api/retry/<job_id>", methods=["POST"])
@@ -2517,6 +2711,11 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   .review-split { grid-template-columns: 1fr; }
   .form-row { grid-template-columns: 1fr; }
 }
+
+/* Modal */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:9999; display:none; align-items:center; justify-content:center; }
+.modal-overlay.visible { display:flex; }
+.modal-content { background:white; border-radius:12px; padding:24px; width:420px; max-width:90vw; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
 </style>
 </head>
 <body>
@@ -2541,7 +2740,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
       <span>Clients &amp; PY Docs</span>
     </a>
-    <a class="nav-item" onclick="showSection('batch')" data-section="batch">
+    <a class="nav-item" onclick="showSection('batch')" data-section="batch" style="display:none">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
       <span>Categorize</span>
     </a>
@@ -2584,10 +2783,14 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">Client Name</label>
-              <input type="text" id="clientName" class="form-input" placeholder="e.g. Watts, Stacy" list="clientSuggestions">
-              <datalist id="clientSuggestions"></datalist>
-              <a href="#" onclick="event.preventDefault(); const cn=document.getElementById('clientName').value.trim(); if(cn){showSection('clients');setTimeout(()=>openClientDetail(cn),200);} else {showToast('Enter a client name first','error');}" style="font-size:11px; color:var(--accent); text-decoration:none; margin-top:4px; display:inline-block;">&#x1F4C2; Upload prior-year docs / manage instructions</a>
+              <label class="form-label">Client</label>
+              <div style="display:flex;gap:8px;align-items:center">
+                <select id="clientName" class="form-input" style="flex:1">
+                  <option value="">— Select client —</option>
+                </select>
+                <button class="btn btn-secondary btn-sm" onclick="openNewClientModal()" title="Create new client" style="white-space:nowrap">+ New</button>
+              </div>
+              <a href="#" onclick="event.preventDefault(); const cn=document.getElementById('clientName').value.trim(); if(cn){showSection('clients');setTimeout(()=>openClientDetail(cn),200);} else {showToast('Select a client first','error');}" style="font-size:11px; color:var(--accent); text-decoration:none; margin-top:4px; display:inline-block;">&#x1F4C2; Upload prior-year docs / manage instructions</a>
             </div>
             <div class="form-group">
               <label class="form-label">Tax Year</label>
@@ -2717,14 +2920,22 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     </div>
     <div class="client-detail" id="clientDetailView">
       <div class="client-back" onclick="closeClientDetail()">&#9664; Back to all clients</div>
-      <h2 id="clientDetailName" style="font-size:20px;font-weight:700;color:var(--navy);margin-bottom:16px"></h2>
+      <h2 id="clientDetailName" style="font-size:20px;font-weight:700;color:var(--navy);margin-bottom:4px"></h2>
+      <div id="clientDetailMeta" style="font-size:13px;color:var(--text-secondary);margin-bottom:16px"></div>
       <div class="client-tabs">
-        <div class="client-tab active" onclick="showClientTab('context')">Prior-Year Context</div>
-        <div class="client-tab" onclick="showClientTab('instructions')">Instructions</div>
-        <div class="client-tab" onclick="showClientTab('completeness')">Completeness</div>
+        <div class="client-tab active" data-tab="documents" onclick="showClientTab('documents')">Documents</div>
+        <div class="client-tab" data-tab="context" onclick="showClientTab('context')">Prior-Year Context</div>
+        <div class="client-tab" data-tab="instructions" onclick="showClientTab('instructions')">Instructions</div>
+        <div class="client-tab" data-tab="completeness" onclick="showClientTab('completeness')">Completeness</div>
+      </div>
+      <!-- Documents Tab -->
+      <div class="client-tab-content active" id="tab-documents">
+        <div id="clientDocGroups">
+          <div class="empty-state"><p>No documents yet. Upload a PDF from the Upload section to get started.</p></div>
+        </div>
       </div>
       <!-- Context Tab -->
-      <div class="client-tab-content active" id="tab-context">
+      <div class="client-tab-content" id="tab-context">
         <div class="card" style="margin-bottom:16px">
           <div class="card-header"><h3>Upload Context Document</h3></div>
           <div class="card-body">
@@ -2775,7 +2986,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 </div>
 
 <!-- ═══ BATCH CATEGORIZE ═══ -->
-<div class="section" id="sec-batch">
+<div class="section" id="sec-batch" style="display:none">
   <div class="page-header"><h2>Batch Categorize</h2><p>Classify transactions across all documents at once</p></div>
   <div class="page-content">
     <div style="margin-bottom:16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
@@ -2851,6 +3062,27 @@ let totalFieldCount = 0;
 let focusedFieldIdx = -1;
 let pageFieldKeys = [];
 let selectedDocType = 'tax_returns';
+
+// Field display order by document type (matches extract.py TEMPLATE_SECTIONS)
+const FIELD_ORDER = {
+  'W-2': ['wages','federal_wh','ss_wages','ss_wh','medicare_wages','medicare_wh','state_wages','state_wh','local_wages','local_wh','nonqualified_plans_12a'],
+  '1099-INT': ['interest_income','early_withdrawal_penalty','us_savings_bonds_and_treasury','federal_wh','state_wh'],
+  '1099-DIV': ['ordinary_dividends','qualified_dividends','capital_gain_distributions','nondividend_distributions','federal_wh','state_wh','foreign_tax_paid','exempt_interest_dividends'],
+  '1099-R': ['gross_distribution','taxable_amount','federal_wh','state_wh','distribution_code','employee_contributions'],
+  'K-1': ['ordinary_income','net_rental_income','guaranteed_payments','interest_income','dividends','royalties','net_short_term_capital_gain','net_long_term_capital_gain','net_section_1231_gain','other_income','section_179_deduction','other_deductions','self_employment_earnings'],
+  '1099-NEC': ['nonemployee_compensation','federal_wh'],
+  '1099-MISC': ['rents','royalties','other_income','federal_wh','fishing_boat_proceeds','medical_payments','nonemployee_compensation'],
+  'SSA-1099': ['net_benefits','federal_wh','repaid_benefits'],
+};
+const FIELD_BOX_LABELS = {
+  'W-2': {wages:'Box 1',federal_wh:'Box 2',ss_wages:'Box 3',ss_wh:'Box 4',medicare_wages:'Box 5',medicare_wh:'Box 6',state_wages:'Box 16',state_wh:'Box 17',local_wages:'Box 18',local_wh:'Box 19'},
+  '1099-DIV': {ordinary_dividends:'Box 1a',qualified_dividends:'Box 1b',capital_gain_distributions:'Box 2a',nondividend_distributions:'Box 3',federal_wh:'Box 4',foreign_tax_paid:'Box 7',exempt_interest_dividends:'Box 12'},
+  '1099-INT': {interest_income:'Box 1',early_withdrawal_penalty:'Box 2',us_savings_bonds_and_treasury:'Box 3',federal_wh:'Box 4'},
+  '1099-R': {gross_distribution:'Box 1',taxable_amount:'Box 2a',federal_wh:'Box 4',distribution_code:'Box 7',employee_contributions:'Box 5',state_wh:'Box 12'},
+  'K-1': {ordinary_income:'Line 1',net_rental_income:'Line 2',guaranteed_payments:'Line 4c',interest_income:'Line 5',dividends:'Line 6a',royalties:'Line 7',net_short_term_capital_gain:'Line 8',net_long_term_capital_gain:'Line 9a',net_section_1231_gain:'Line 10',other_income:'Line 11',section_179_deduction:'Line 12',other_deductions:'Line 13',self_employment_earnings:'Line 14a'},
+  '1099-NEC': {nonemployee_compensation:'Box 1',federal_wh:'Box 4'},
+  'SSA-1099': {net_benefits:'Box 5',federal_wh:'Box 6'},
+};
 let selectedOutputFormat = 'tax_review';
 let vendorMap = {};
 let chartOfAccounts = {};
@@ -2936,9 +3168,16 @@ function handleFileObj(f) {
   document.getElementById('fileNameText').textContent = f.name;
   document.getElementById('uploadForm').classList.add('visible');
   dropZone.style.display = 'none';
-  // Auto-fill client name from filename
+  // Auto-match client from filename
   if (!document.getElementById('clientName').value) {
-    document.getElementById('clientName').value = f.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ');
+    const stem = f.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ').toLowerCase();
+    const sel = document.getElementById('clientName');
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value && stem.includes(sel.options[i].value.toLowerCase())) {
+        sel.value = sel.options[i].value;
+        break;
+      }
+    }
   }
 }
 function resetUpload() {
@@ -2950,10 +3189,12 @@ function resetUpload() {
 
 function startExtraction() {
   if (!uploadedFile) return;
+  const cn = document.getElementById('clientName').value;
+  if (!cn) { showToast('Please select a client', 'error'); return; }
   const fd = new FormData();
   fd.append('pdf', uploadedFile);
   fd.append('year', document.getElementById('taxYear').value);
-  fd.append('client_name', document.getElementById('clientName').value);
+  fd.append('client_name', cn);
   fd.append('doc_type', selectedDocType);
   fd.append('output_format', selectedOutputFormat);
   fd.append('user_notes', document.getElementById('userNotes').value);
@@ -3284,7 +3525,15 @@ function loadPage(page, focusIdx) {
 
   pageExts.forEach((ext, extIdx) => {
     const fields = ext.fields || {};
-    const allKeys = Object.keys(fields).sort();
+    // Sort fields by document-type order (box/line number), then alphabetical for unknowns
+    const docOrder = FIELD_ORDER[ext.document_type] || [];
+    const allKeys = Object.keys(fields).sort((a, b) => {
+      const ai = docOrder.indexOf(a), bi = docOrder.indexOf(b);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+      return a.localeCompare(b);
+    });
 
     html += '<div class="field-group">';
     html += '<div class="field-group-title">' + esc(ext.document_type) + '</div>';
@@ -3298,11 +3547,16 @@ function loadPage(page, focusIdx) {
     txnKeys.forEach(k => { const m = k.match(txnRegex); if(m) { if(!txnGroups[m[1]]) txnGroups[m[1]]={}; txnGroups[m[1]][m[2]]=k; }});
     const txnNums = Object.keys(txnGroups).sort((a,b)=>parseInt(a)-parseInt(b));
 
-    // Split monetary vs info
+    // Split monetary vs info, filter out $0.00 unless significant
     const monetaryKeys = summaryKeys.filter(k => {
       if (skipFields.has(k)) return false;
       const v = fields[k].value;
-      return typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim()));
+      const isNumeric = typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim()));
+      if (!isNumeric) return false;
+      // Filter out zero values unless field name suggests significance
+      const numVal = typeof v === 'number' ? v : parseFloat(String(v).replace(/[$,]/g, ''));
+      if (numVal === 0 && !/(balance|total|net)/i.test(k)) return false;
+      return true;
     });
     const infoKeys = summaryKeys.filter(k => {
       if (skipFields.has(k)) return true;
@@ -3346,7 +3600,9 @@ function loadPage(page, focusIdx) {
       if (conf.includes('dual')) dotClass='conf-dual'; else if (conf.includes('confirmed')||conf==='ocr_accepted') dotClass='conf-confirmed'; else if (conf.includes('corrected')) dotClass='conf-corrected'; else if (conf==='low') dotClass='conf-low';
 
       html += '<div class="' + rowClass + '" data-key="' + esc(vk) + '" onclick="setFocus(' + idx + ')">';
-      html += '<span class="field-name">' + esc(k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())) + '</span>';
+      const boxLabel = (FIELD_BOX_LABELS[ext.document_type] || {})[k];
+      const displayName = (boxLabel ? boxLabel + ' \u2014 ' : '') + k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+      html += '<span class="field-name">' + esc(displayName) + '</span>';
       html += '<span class="field-val-wrap"><span class="conf-dot ' + dotClass + '"></span>';
       html += '<span class="field-val" ondblclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')">' + esc(displayStr) + '</span>';
       html += '<span class="field-actions">';
@@ -3552,8 +3808,14 @@ function deleteJob(id) { if(!confirm('Delete this job?')) return; fetch('/api/de
 // ─── Clients ───
 function loadClientSuggestions() {
   fetch('/api/clients').then(r=>r.json()).then(data => {
-    const dl = document.getElementById('clientSuggestions');
-    dl.innerHTML = data.map(c => '<option value="' + esc(c.name) + '">').join('');
+    const sel = document.getElementById('clientName');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">\u2014 Select client \u2014</option>' +
+      data.map(c => {
+        const label = c.ein_last4 ? c.name + ' (' + c.ein_last4 + ')' : c.name;
+        return '<option value="' + esc(c.name) + '">' + esc(label) + '</option>';
+      }).join('');
+    if (current) sel.value = current;
   }).catch(()=>{});
 }
 
@@ -3573,6 +3835,7 @@ function renderClientGrid(clients) {
   if (!clients.length) { g.innerHTML = '<div class="empty-state"><h3>No clients yet</h3><p>Upload a document to create a client record.</p></div>'; return; }
   g.innerHTML = clients.map(c => {
     let badges = '';
+    if (c.ein_last4) badges += '<span class="badge badge-purple">EIN \u2026'+esc(c.ein_last4)+'</span>';
     if (c.has_context) badges += '<span class="badge badge-purple">Context</span>';
     if (c.has_instructions) badges += '<span class="badge badge-blue">Instructions</span>';
     return '<div class="client-card" onclick="openClientDetail(\''+esc(c.name)+'\')">' +
@@ -3589,7 +3852,9 @@ function openClientDetail(name) {
   document.getElementById('clientListView').style.display = 'none';
   document.getElementById('clientDetailView').classList.add('visible');
   document.getElementById('clientDetailName').textContent = name;
-  showClientTab('context');
+  showClientTab('documents');
+  loadClientDocuments(name);
+  loadClientInfo(name);
   loadContextDocs(name);
   loadInstructions(name);
 }
@@ -3601,9 +3866,68 @@ function closeClientDetail() {
 function showClientTab(tab) {
   document.querySelectorAll('.client-tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.client-tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelector('.client-tab-content#tab-'+tab).classList.add('active');
-  event.target.classList.add('active');
+  const tabContent = document.querySelector('.client-tab-content#tab-'+tab);
+  if (tabContent) tabContent.classList.add('active');
+  const tabBtn = document.querySelector('.client-tab[data-tab="'+tab+'"]');
+  if (tabBtn) tabBtn.classList.add('active');
   if (tab === 'completeness') loadCompleteness(currentClientName);
+  if (tab === 'documents') loadClientDocuments(currentClientName);
+}
+
+// Client Info
+function loadClientInfo(name) {
+  fetch('/api/clients/'+encodeURIComponent(name)+'/info').then(r=>r.json()).then(info => {
+    const el = document.getElementById('clientDetailMeta');
+    let parts = [];
+    if (info.ein_last4) parts.push('<span class="badge badge-purple">EIN \u2026'+esc(info.ein_last4)+'</span>');
+    if (info.contact) parts.push('<span>'+esc(info.contact)+'</span>');
+    if (info.notes) parts.push('<span style="color:var(--text-light)">'+esc(info.notes)+'</span>');
+    el.innerHTML = parts.join(' &middot; ');
+  }).catch(()=>{});
+}
+
+// Client Documents
+let clientCompletedJobs = [];
+function loadClientDocuments(name) {
+  fetch('/api/clients/'+encodeURIComponent(name)+'/documents').then(r=>r.json()).then(data => {
+    const el = document.getElementById('clientDocGroups');
+    const docs = data.documents || [];
+    clientCompletedJobs = docs.filter(d => d.status === 'complete');
+    if (!docs.length) {
+      el.innerHTML = '<div class="empty-state"><p>No documents yet. Upload a PDF from the Upload section.</p></div>';
+      return;
+    }
+    const grouped = data.grouped || {};
+    const hasComplete = clientCompletedJobs.length > 0;
+    let html = '<div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center">';
+    html += '<span style="font-size:13px;color:var(--text-secondary)">' + docs.length + ' document' + (docs.length!==1?'s':'') + '</span>';
+    if (hasComplete) html += '<button class="btn btn-primary btn-sm" onclick="openReportModal()">\u{1F4CA} Generate Report</button>';
+    html += '</div>';
+    const typeLabels = {tax_returns:'Tax Returns',bank_statements:'Bank Statements',trust_documents:'Trust Documents',bookkeeping:'Bookkeeping',payroll:'Payroll',other:'Other'};
+    for (const [dtype, items] of Object.entries(grouped)) {
+      const label = typeLabels[dtype] || dtype;
+      html += '<div class="card" style="margin-bottom:12px"><div class="card-header"><h3>'+esc(label)+' ('+items.length+')</h3></div>';
+      html += '<div class="card-body" style="padding:0"><table style="width:100%;font-size:13px;border-collapse:collapse">';
+      html += '<tr style="background:var(--bg);border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left">File</th><th style="padding:8px 12px;text-align:left">Year</th><th style="padding:8px 12px;text-align:left">Status</th><th style="padding:8px 12px;text-align:left">Cost</th><th style="padding:8px 12px;text-align:right">Actions</th></tr>';
+      items.forEach(d => {
+        const statusClass = d.status==='complete'?'badge-green':d.status==='running'?'badge-blue':'badge-yellow';
+        html += '<tr style="border-bottom:1px solid var(--border)">';
+        html += '<td style="padding:8px 12px">'+esc(d.filename)+'</td>';
+        html += '<td style="padding:8px 12px">'+esc(d.year)+'</td>';
+        html += '<td style="padding:8px 12px"><span class="badge '+statusClass+'">'+esc(d.status)+'</span></td>';
+        html += '<td style="padding:8px 12px">'+(d.cost_usd != null && d.status==='complete' ? '$'+Number(d.cost_usd).toFixed(4) : '\u2014')+'</td>';
+        html += '<td style="padding:8px 12px;text-align:right">';
+        if (d.status === 'complete') {
+          html += '<button class="btn btn-secondary btn-sm" onclick="openReview({id:\''+esc(d.job_id)+'\'})">Review</button> ';
+          if (d.has_xlsx) html += '<a class="btn btn-ghost btn-sm" href="/api/download/'+esc(d.job_id)+'" title="Download Excel">\u{1F4CA}</a> ';
+          if (d.has_log) html += '<a class="btn btn-ghost btn-sm" href="/api/download-log/'+esc(d.job_id)+'" title="Download JSON log">\u{1F4CB}</a> ';
+        }
+        html += '</td></tr>';
+      });
+      html += '</table></div></div>';
+    }
+    el.innerHTML = html;
+  }).catch(()=>{});
 }
 
 // Context
@@ -3805,7 +4129,142 @@ document.addEventListener('keydown', function(e) {
     }
   }
 });
+
+// ─── New Client Modal ───
+function openNewClientModal() {
+  document.getElementById('newClientOverlay').classList.add('visible');
+  document.getElementById('newClientName').value = '';
+  document.getElementById('newClientEin').value = '';
+  document.getElementById('newClientContact').value = '';
+  document.getElementById('newClientNotes').value = '';
+  setTimeout(() => document.getElementById('newClientName').focus(), 100);
+}
+function closeNewClientModal() {
+  document.getElementById('newClientOverlay').classList.remove('visible');
+}
+function createNewClient() {
+  const name = document.getElementById('newClientName').value.trim();
+  if (!name) { showToast('Client name is required', 'error'); return; }
+  const payload = {
+    name: name,
+    ein_last4: document.getElementById('newClientEin').value.trim(),
+    contact: document.getElementById('newClientContact').value.trim(),
+    notes: document.getElementById('newClientNotes').value.trim()
+  };
+  fetch('/api/clients/create', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r => r.json()).then(d => {
+    if (d.error) { showToast(d.error, 'error'); return; }
+    showToast('Client "' + d.name + '" created', 'success');
+    closeNewClientModal();
+    loadClientSuggestions();
+    // Auto-select the new client after dropdown refreshes
+    setTimeout(() => { document.getElementById('clientName').value = d.name; }, 300);
+    // Refresh clients list if on that section
+    if (document.getElementById('sec-clients').classList.contains('active')) loadClients();
+  }).catch(e => showToast('Failed: ' + e, 'error'));
+}
+
+// ─── Generate Report Modal ───
+function openReportModal() {
+  const el = document.getElementById('reportJobList');
+  if (!clientCompletedJobs.length) { showToast('No completed jobs to report on', 'error'); return; }
+  el.innerHTML = clientCompletedJobs.map(d =>
+    '<label style="display:flex;align-items:center;gap:8px;padding:6px 0;font-size:13px;cursor:pointer">' +
+    '<input type="checkbox" class="report-job-cb" value="'+esc(d.job_id)+'" checked> ' +
+    esc(d.filename) + ' <span style="color:var(--text-light)">('+esc(d.year)+')</span></label>'
+  ).join('');
+  document.getElementById('reportOverlay').classList.add('visible');
+}
+function closeReportModal() {
+  document.getElementById('reportOverlay').classList.remove('visible');
+}
+function generateReport() {
+  const cbs = document.querySelectorAll('.report-job-cb:checked');
+  const jobIds = Array.from(cbs).map(cb => cb.value);
+  if (!jobIds.length) { showToast('Select at least one job', 'error'); return; }
+  const fmt = document.getElementById('reportFormat').value;
+  const year = document.getElementById('reportYear').value;
+  const btn = document.querySelector('#reportOverlay .btn-primary');
+  btn.disabled = true; btn.textContent = 'Generating...';
+  fetch('/api/clients/'+encodeURIComponent(currentClientName)+'/generate-report', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({job_ids:jobIds, output_format:fmt, year:year})
+  }).then(r=>r.json()).then(d => {
+    btn.disabled = false; btn.textContent = 'Generate';
+    if (d.error) { showToast(d.error, 'error'); return; }
+    showToast('Report generated!', 'success');
+    closeReportModal();
+    window.open(d.download_url, '_blank');
+  }).catch(e => { btn.disabled = false; btn.textContent = 'Generate'; showToast('Failed: '+e, 'error'); });
+}
 </script>
+
+<!-- New Client Modal -->
+<div class="modal-overlay" id="newClientOverlay">
+  <div class="modal-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">New Client</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeNewClientModal()">&times;</button>
+    </div>
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label">Client Name <span style="color:var(--danger)">*</span></label>
+      <input type="text" id="newClientName" class="form-input" placeholder="e.g. Watts, Stacy">
+    </div>
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label">EIN / SSN (last 4)</label>
+      <input type="text" id="newClientEin" class="form-input" placeholder="e.g. 1234" maxlength="4">
+    </div>
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label">Contact</label>
+      <input type="text" id="newClientContact" class="form-input" placeholder="e.g. email or phone">
+    </div>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Notes</label>
+      <textarea id="newClientNotes" class="form-input" rows="2" placeholder="Optional notes about this client"></textarea>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn btn-ghost" onclick="closeNewClientModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createNewClient()">Create Client</button>
+    </div>
+  </div>
+</div>
+
+<!-- Generate Report Modal -->
+<div class="modal-overlay" id="reportOverlay">
+  <div class="modal-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0">Generate Report</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeReportModal()">&times;</button>
+    </div>
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label">Select Jobs</label>
+      <div id="reportJobList" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:8px 12px"></div>
+    </div>
+    <div class="form-row" style="margin-bottom:16px">
+      <div class="form-group">
+        <label class="form-label">Output Format</label>
+        <select id="reportFormat" class="form-input">
+          <option value="tax_review">Tax Review</option>
+          <option value="journal_entries">Journal Entries</option>
+          <option value="account_balances">Account Balances</option>
+          <option value="trial_balance">Trial Balance</option>
+          <option value="transaction_register">Transaction Register</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Year</label>
+        <input type="number" id="reportYear" class="form-input" value="2025" min="2000" max="2030">
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn btn-ghost" onclick="closeReportModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="generateReport()">Generate</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>"""
 

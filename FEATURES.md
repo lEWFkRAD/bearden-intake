@@ -2,12 +2,15 @@
 
 ## Upload Section
 - [x] PDF file upload with drag-and-drop
-- [x] Client name input (auto-fills from filename)
+- [x] Client selector dropdown (select existing client or create new)
+- [x] "+ New" client button (opens modal with name, EIN, contact, notes)
 - [x] Quick link to upload PY docs / manage instructions (below client name)
 - [x] Tax year selector
 - [x] Document type pills (tax_returns, bank_statements, trust_documents, bookkeeping, payroll, other)
 - [x] Output format pills (tax_review, journal_entries, account_balances, trial_balance, transaction_register)
 - [x] AI Instructions textarea (visible, not hidden — tell the AI how to handle this document)
+- [x] Auto-match filename to existing client in dropdown
+- [x] Client selection required before extraction
 - [x] Advanced Options accordion:
   - [x] User notes textarea
   - [x] Skip verification checkbox
@@ -37,6 +40,9 @@
 - [x] Verification stats (confirmed/corrected/flagged counts)
 - [x] Client instructions banner (shown if client has extraction rules)
 - [x] Reviewer initials input (sidebar)
+- [x] Field ordering by box/line number (W-2 wages first, etc.)
+- [x] Box/line number labels (e.g. "Box 1 — Wages", "Line 4c — Guaranteed Payments")
+- [x] Zero value filtering ($0.00 fields hidden unless balance/total/net)
 
 ### Field Verification
 - [x] Confirm field (green checkmark button / Enter key)
@@ -69,8 +75,31 @@
 ## Client Manager
 ### Client List
 - [x] Client search/filter
-- [x] Client cards with badges (Context, Instructions)
+- [x] Client cards with badges (EIN, Context, Instructions)
 - [x] Click to open client detail
+- [x] New Client modal (name, EIN last 4, contact, notes)
+
+### Client Detail
+- [x] Client metadata display (EIN badge, contact, notes)
+- [x] Documents tab (default) — shows all extraction jobs grouped by doc type
+- [x] Per-document actions: Review, Download Excel, Download JSON
+- [x] Generate Report button — combine multiple extractions into one Excel
+
+### Documents Tab
+- [x] Document count summary
+- [x] Documents grouped by type (Tax Returns, Bank Statements, etc.)
+- [x] Status badges (complete, running, failed)
+- [x] Cost display per document
+- [x] Review button (opens review for that job)
+- [x] Excel download link
+- [x] JSON log download link
+
+### Generate Report Modal
+- [x] Select jobs with checkboxes
+- [x] Output format selector (tax_review, journal_entries, etc.)
+- [x] Year input
+- [x] Generates combined Excel from multiple extraction jobs
+- [x] Auto-downloads generated report
 
 ### Prior-Year Context Tab
 - [x] Upload context documents (PDF, Excel, CSV, TXT)
@@ -89,7 +118,7 @@
 - [x] Matched payers (received this year, matched to prior year)
 - [x] New payers (received this year, not in prior year)
 
-## Batch Categorize
+## Batch Categorize (hidden — kept for future use)
 - [x] Client filter
 - [x] Vendor search
 - [x] Show categorized toggle
@@ -138,7 +167,7 @@
 - [x] Cross-document duplicate validation
 
 ## API Coverage
-- [x] POST /api/upload — Start extraction
+- [x] POST /api/upload — Start extraction (requires client selection)
 - [x] GET /api/status/<job_id> — Poll progress
 - [x] GET /api/results/<job_id> — Fetch extraction data
 - [x] GET /api/page-image/<job_id>/<page> — Serve page image
@@ -154,7 +183,13 @@
 - [x] POST /api/retry/<job_id> — Retry failed job
 - [x] POST /api/cancel/<job_id> — Cancel running job
 - [x] POST /api/ai-chat/<job_id> — Chat with AI about current page/extraction
-- [x] GET /api/clients — List clients
+- [x] GET /api/clients — List clients (includes EIN, contact, notes)
+- [x] POST /api/clients/create — Create new client
+- [x] GET /api/clients/<client>/info — Get client metadata
+- [x] PUT /api/clients/<client>/info — Update client metadata
+- [x] GET /api/clients/<client>/documents — List client's extraction jobs
+- [x] POST /api/clients/<client>/generate-report — Generate combined Excel report
+- [x] GET /api/download-report/<report_id> — Download generated report
 - [x] GET /api/context/<client>/ — Get context index
 - [x] POST /api/context/<client>/upload — Upload context doc
 - [x] DELETE /api/context/<client>/<doc_id> — Delete context doc
