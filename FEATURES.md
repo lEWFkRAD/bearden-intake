@@ -23,8 +23,9 @@
 
 ## Review Section
 - [x] Side-by-side PDF viewer + field panel
-- [x] Page navigation (Prev / Next buttons)
-- [x] Page indicator (1 / N)
+- [x] Page navigation (Prev / Next buttons) — navigates ALL PDF pages, not just extracted ones
+- [x] Page indicator (1 / N) — shows actual PDF page count
+- [x] Empty page state (no-data pages show message + re-extract button)
 - [x] Re-extract page button (sends custom instructions to Claude vision API)
 - [x] Download Excel button
 - [x] Download JSON log button

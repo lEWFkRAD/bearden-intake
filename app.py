@@ -990,6 +990,7 @@ def results(job_id):
                     if (v.get("value") if isinstance(v, dict) else v) is not None}
                 })
         data["page_map"] = page_map
+        data["total_pages"] = job.get("total_pages") or max((int(k) for k in page_map.keys()), default=1)
         return jsonify(data)
     return jsonify({"error": "Results not ready"}), 404
 
@@ -3169,7 +3170,7 @@ function toggleInfoSection(id, toggle) {
 // ─── Page Rendering ───
 function loadPage(page, focusIdx) {
   if (!reviewData || !reviewData.page_map) return;
-  totalPages = Object.keys(reviewData.page_map).length;
+  totalPages = reviewData.total_pages || Object.keys(reviewData.page_map).length;
   if (page < 1) page = 1;
   if (page > totalPages) page = totalPages;
   currentPage = page;
@@ -3181,6 +3182,19 @@ function loadPage(page, focusIdx) {
 
   const pageExts = reviewData.page_map[currentPage];
   let html = '';
+
+  if (!pageExts || pageExts.length === 0) {
+    html = '<div style="padding:40px 20px;text-align:center;color:var(--text-light)">'
+      + '<div style="font-size:32px;margin-bottom:12px">&#128196;</div>'
+      + '<div style="font-size:14px;font-weight:600;margin-bottom:6px">No extracted data for this page</div>'
+      + '<div style="font-size:12px">This page may be a continuation, composite summary, or supplemental info that was processed as part of another document.</div>'
+      + '<div style="margin-top:12px"><button class="btn btn-secondary btn-sm" onclick="reextractPage()">&#x21BB; Re-extract this page</button></div>'
+      + '</div>';
+    document.getElementById('fieldsPanel').innerHTML = html;
+    updateVerifyBar();
+    return;
+  }
+
   const skipFields = new Set(['payer_ein','recipient_ssn_last4','tax_year','entity_type','partner_type','state_id','account_number_last4']);
 
   pageExts.forEach((ext, extIdx) => {
