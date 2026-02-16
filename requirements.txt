@@ -1,0 +1,6 @@
+anthropic
+flask
+openpyxl
+pdf2image
+pytesseract
+Pillow

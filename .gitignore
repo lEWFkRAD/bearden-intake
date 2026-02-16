@@ -1,0 +1,23 @@
+# Runtime data (uploads, outputs, page images, job state)
+data/
+
+# Client data (contains real client information)
+clients/
+
+# Review decisions
+verifications/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
