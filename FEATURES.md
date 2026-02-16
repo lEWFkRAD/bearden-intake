@@ -141,6 +141,17 @@
 - [x] Retry button (failed, interrupted, error jobs)
 - [x] Delete button (all jobs, with confirmation)
 
+## Architecture & Security
+- [x] Unique file naming — uploads saved as `<job_id>.pdf` (no filename collisions)
+- [x] File permissions — 0o600 (owner-only) on all sensitive files (PDFs, Excel, JSON, DB)
+- [x] SQLite database — jobs, verifications, vendor categories persisted to `data/bearden.db`
+- [x] Auto-migration from JSON files — `jobs_history.json`, `verifications/*.json`, `vendor_categories.json`
+- [x] Legacy files renamed to `.migrated` (not deleted) for safe rollback
+- [x] WAL journal mode for concurrent read performance
+- [x] Health check endpoint (`GET /api/health`) — version, uptime, dependencies, disk usage
+- [x] Friendly download names — Excel/JSON downloads use original filename, not job ID
+- [x] Confirm/flag toggle — clicking confirmed/flagged fields un-confirms/un-flags them
+
 ## Extraction Engine (extract.py)
 - [x] PDF → image conversion (250 DPI via poppler)
 - [x] Auto-rotation (Tesseract OSD)
@@ -197,5 +208,6 @@
 - [x] GET /api/instructions/<client> — Fetch instructions
 - [x] POST /api/instructions/<client> — Add instruction
 - [x] DELETE /api/instructions/<client>/<rule_id> — Delete instruction
+- [x] GET /api/health — System health check (version, uptime, deps, disk)
 - [x] GET /api/batch-categories — Fetch batch data
 - [x] POST /api/batch-categories/apply — Apply batch category

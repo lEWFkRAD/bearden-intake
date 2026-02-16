@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bearden Document Intake Platform v5
-================================
+Bearden Document Intake Platform v5.1
+==================================
 Full-featured local web app wrapping extract.py.
 
 Features:
@@ -27,6 +27,7 @@ import uuid
 import re
 import glob
 import subprocess
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -60,6 +61,129 @@ JOBS_FILE = DATA_DIR / "jobs_history.json"
 for d in [DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, CLIENTS_DIR, PAGES_DIR, VERIFY_DIR]:
     d.mkdir(exist_ok=True)
 
+VENDOR_CATEGORIES_FILE = DATA_DIR / "vendor_categories.json"
+DB_PATH = DATA_DIR / "bearden.db"
+
+def _secure_file(path):
+    """Set restrictive permissions on sensitive files (owner-only read/write)."""
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass  # Non-fatal: may fail on some filesystems
+
+
+# ─── SQLite Database ──────────────────────────────────────────────────────────
+
+def _get_db():
+    """Get a SQLite connection. Each call creates a new connection (thread-safe)."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+def _init_db():
+    """Create tables if needed. Migrate from JSON files on first run."""
+    conn = _get_db()
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                client_name TEXT DEFAULT '',
+                created TEXT DEFAULT '',
+                updated TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client_name);
+
+            CREATE TABLE IF NOT EXISTS verifications (
+                job_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_categories (
+                vendor TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                data TEXT NOT NULL,
+                updated TEXT DEFAULT ''
+            );
+        """)
+        conn.commit()
+        _secure_file(DB_PATH)
+        _migrate_from_json(conn)
+    finally:
+        conn.close()
+
+def _migrate_from_json(conn):
+    """One-time import from legacy JSON files into SQLite."""
+    # Migrate jobs_history.json
+    row_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    if row_count == 0 and JOBS_FILE.exists():
+        try:
+            with open(JOBS_FILE) as f:
+                legacy_jobs = json.load(f)
+            for jid, jdata in legacy_jobs.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO jobs (id, data, status, client_name, created, updated) VALUES (?, ?, ?, ?, ?, ?)",
+                    (jid, json.dumps(jdata, default=str), jdata.get("status", ""),
+                     jdata.get("client_name", ""), jdata.get("created", ""),
+                     datetime.now().isoformat())
+                )
+            conn.commit()
+            print(f"  Migrated {len(legacy_jobs)} jobs from jobs_history.json to SQLite")
+            os.rename(str(JOBS_FILE), str(JOBS_FILE) + ".migrated")
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            print(f"  Warning: Could not migrate jobs_history.json: {e}")
+
+    # Migrate verifications/*.json
+    vcount = conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0]
+    if vcount == 0:
+        verify_files = list(VERIFY_DIR.glob("*.json"))
+        migrated = 0
+        for vf in verify_files:
+            try:
+                job_id = vf.stem
+                with open(vf) as f:
+                    vdata = json.load(f)
+                conn.execute(
+                    "INSERT OR IGNORE INTO verifications (job_id, data, updated) VALUES (?, ?, ?)",
+                    (job_id, json.dumps(vdata, default=str), vdata.get("updated", ""))
+                )
+                migrated += 1
+            except (json.JSONDecodeError, IOError):
+                continue
+        conn.commit()
+        if migrated:
+            print(f"  Migrated {migrated} verification files to SQLite")
+            backup_dir = VERIFY_DIR / "_migrated"
+            backup_dir.mkdir(exist_ok=True)
+            for vf in verify_files:
+                try:
+                    os.rename(str(vf), str(backup_dir / vf.name))
+                except OSError:
+                    pass
+
+    # Migrate vendor_categories.json
+    vccount = conn.execute("SELECT COUNT(*) FROM vendor_categories").fetchone()[0]
+    if vccount == 0 and VENDOR_CATEGORIES_FILE.exists():
+        try:
+            with open(VENDOR_CATEGORIES_FILE) as f:
+                vc_data = json.load(f)
+            for vendor, info in vc_data.items():
+                cat = info.get("category", "") if isinstance(info, dict) else str(info)
+                conn.execute(
+                    "INSERT OR IGNORE INTO vendor_categories (vendor, category, data, updated) VALUES (?, ?, ?, ?)",
+                    (vendor, cat, json.dumps(info, default=str), datetime.now().isoformat())
+                )
+            conn.commit()
+            print(f"  Migrated {len(vc_data)} vendor categories to SQLite")
+            os.rename(str(VENDOR_CATEGORIES_FILE), str(VENDOR_CATEGORIES_FILE) + ".migrated")
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            print(f"  Warning: Could not migrate vendor_categories.json: {e}")
+
+
 def _client_dir(client_name, doc_type, year):
     """Build a per-client output directory:  clients/<Client Name>/<doc_type>/<year>/"""
     safe_client = re.sub(r'[^\w\s\-\.,()]', '', client_name).strip() or "Unknown Client"
@@ -80,6 +204,9 @@ def _client_dir(client_name, doc_type, year):
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB
 
+_start_time = datetime.now()
+_app_version = "5.1"
+
 VALID_DOC_TYPES = {"tax_returns", "bank_statements", "trust_documents", "bookkeeping", "payroll", "other"}
 
 # In-memory job tracking (persisted to jobs_history.json)
@@ -88,30 +215,51 @@ _jobs_lock = threading.Lock()
 _active_procs = {}  # job_id -> subprocess.Popen for cancellation
 
 def load_jobs():
+    """Load all jobs from SQLite into the in-memory dict."""
     global jobs
-    if JOBS_FILE.exists():
-        try:
-            with open(JOBS_FILE) as f:
-                jobs = json.load(f)
-            # Clear stale "running" or "queued" jobs from previous sessions
-            for jid, j in jobs.items():
-                if j.get("status") in ("running", "queued"):
-                    j["status"] = "interrupted"
-        except (json.JSONDecodeError, IOError, OSError) as e:
-            print(f"  Warning: Could not load job history: {e}")
-            jobs = {}
+    conn = _get_db()
+    try:
+        rows = conn.execute("SELECT id, data FROM jobs").fetchall()
+        jobs = {}
+        for jid, data_json in rows:
+            try:
+                jdata = json.loads(data_json)
+                # Clear stale "running" or "queued" jobs from previous sessions
+                if jdata.get("status") in ("running", "queued"):
+                    jdata["status"] = "interrupted"
+                jobs[jid] = jdata
+            except json.JSONDecodeError:
+                print(f"  Warning: Could not parse job {jid}")
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not load jobs from database: {e}")
+        jobs = {}
+    finally:
+        conn.close()
 
 def save_jobs():
+    """Persist all jobs to SQLite (upsert)."""
     with _jobs_lock:
-        safe = {}
-        for jid, j in jobs.items():
-            safe[jid] = {k: v for k, v in j.items() if k != "log"}
+        conn = _get_db()
         try:
-            with open(JOBS_FILE, "w") as f:
-                json.dump(safe, f, indent=2, default=str)
-        except (IOError, OSError) as e:
-            print(f"  Warning: Could not save job history: {e}")
+            for jid, j in jobs.items():
+                safe = {k: v for k, v in j.items() if k != "log"}
+                conn.execute(
+                    """INSERT INTO jobs (id, data, status, client_name, created, updated)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           data = excluded.data, status = excluded.status,
+                           client_name = excluded.client_name, updated = excluded.updated""",
+                    (jid, json.dumps(safe, default=str), j.get("status", ""),
+                     j.get("client_name", ""), j.get("created", ""),
+                     datetime.now().isoformat())
+                )
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"  Warning: Could not save jobs to database: {e}")
+        finally:
+            conn.close()
 
+_init_db()
 load_jobs()
 
 # ─── Chart of Accounts + Vendor Memory ────────────────────────────────────────
@@ -160,8 +308,6 @@ ALL_ACCOUNTS = []
 for _grp in CHART_OF_ACCOUNTS.values():
     ALL_ACCOUNTS.extend(_grp)
 
-VENDOR_CATEGORIES_FILE = DATA_DIR / "vendor_categories.json"
-
 def _normalize_vendor(desc):
     """Normalize a vendor/payee name for matching.
     'GEORGIA POWER COMPANY #12345' → 'GEORGIA POWER'
@@ -179,20 +325,37 @@ def _normalize_vendor(desc):
     return s.strip()
 
 def _load_vendor_categories():
-    if VENDOR_CATEGORIES_FILE.exists():
-        try:
-            with open(VENDOR_CATEGORIES_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {}
+    conn = _get_db()
+    try:
+        rows = conn.execute("SELECT vendor, data FROM vendor_categories").fetchall()
+        result = {}
+        for vendor, data_json in rows:
+            try:
+                result[vendor] = json.loads(data_json)
+            except json.JSONDecodeError:
+                pass
+        return result
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
 
 def _save_vendor_categories(data):
+    conn = _get_db()
     try:
-        with open(VENDOR_CATEGORIES_FILE, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-    except (IOError, OSError) as e:
+        for vendor, info in data.items():
+            cat = info.get("category", "") if isinstance(info, dict) else str(info)
+            conn.execute(
+                """INSERT INTO vendor_categories (vendor, category, data, updated) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(vendor) DO UPDATE SET
+                       category = excluded.category, data = excluded.data, updated = excluded.updated""",
+                (vendor, cat, json.dumps(info, default=str), datetime.now().isoformat())
+            )
+        conn.commit()
+    except sqlite3.Error as e:
         print(f"  Warning: Could not save vendor categories: {e}")
+    finally:
+        conn.close()
 
 def _learn_vendor_category(vendor_desc, category):
     """Record that vendor_desc was categorized as category."""
@@ -830,6 +993,10 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             job["end_time"] = datetime.now().isoformat()
             job["output_xlsx"] = str(output_path) if output_path.exists() else None
             job["output_log"] = str(log_path) if log_path.exists() else None
+            if job["output_xlsx"]:
+                _secure_file(job["output_xlsx"])
+            if job["output_log"]:
+                _secure_file(job["output_log"])
 
             # Copy outputs to client directory
             import shutil
@@ -841,18 +1008,23 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                     if output_path.exists():
                         dst_xlsx = client_dir / output_path.name
                         shutil.copy2(str(output_path), str(dst_xlsx))
+                        _secure_file(dst_xlsx)
                         job["client_xlsx"] = str(dst_xlsx)
                         job["log"].append(f"  Saved to: {dst_xlsx}")
                     if log_path.exists():
                         dst_log = client_dir / log_path.name
                         shutil.copy2(str(log_path), str(dst_log))
+                        _secure_file(dst_log)
                         job["client_log"] = str(dst_log)
-                    # Copy the original PDF too
+                    # Copy the original PDF too (use original filename for client folder)
                     src_pdf = Path(pdf_path)
                     if src_pdf.exists():
-                        dst_pdf = client_dir / src_pdf.name
+                        original_name = job.get("filename", src_pdf.name)
+                        safe_original = re.sub(r'[^\w\s\-\.,()]', '', original_name).strip() or src_pdf.name
+                        dst_pdf = client_dir / safe_original
                         if not dst_pdf.exists():
                             shutil.copy2(str(src_pdf), str(dst_pdf))
+                            _secure_file(dst_pdf)
                 except Exception as e:
                     job["log"].append(f"  Warning: Could not copy to client folder: {e}")
 
@@ -938,18 +1110,18 @@ def upload():
     user_notes = request.form.get("user_notes", "").strip()[:2000]  # Cap at 2000 chars
     ai_instructions = request.form.get("ai_instructions", "").strip()[:2000]
 
-    # Save
-    safe_name = re.sub(r'[^\w\s\-\.,()]', '', f.filename).strip()
-    if not safe_name:
-        safe_name = "upload.pdf"
-    pdf_path = UPLOAD_DIR / safe_name
+    # Generate job ID first (needed for unique filename)
+    job_id = datetime.now().strftime("%m%d") + "-" + str(uuid.uuid4())[:6]
+
+    # Save with unique name to prevent overwrites
+    pdf_path = UPLOAD_DIR / (job_id + ".pdf")
     f.save(str(pdf_path))
+    _secure_file(pdf_path)
 
     # Build client folder path
     resolved_client = _safe_client_name(client_name)
     client_dir = _client_dir(resolved_client, doc_type, year)
 
-    job_id = datetime.now().strftime("%m%d") + "-" + str(uuid.uuid4())[:6]
     jobs[job_id] = {
         "id": job_id,
         "filename": f.filename,
@@ -1241,7 +1413,9 @@ def download_xlsx(job_id):
         abort(404)
     p = job["output_xlsx"]
     if os.path.exists(p):
-        return send_file(p, as_attachment=True, download_name=Path(p).name)
+        original_stem = Path(job.get("filename", "")).stem or job_id
+        friendly = re.sub(r'[^\w\s\-\.,()]', '', original_stem).strip() or job_id
+        return send_file(p, as_attachment=True, download_name=friendly + "_intake.xlsx")
     abort(404)
 
 @app.route("/api/download-log/<job_id>")
@@ -1251,7 +1425,9 @@ def download_log(job_id):
         abort(404)
     p = job["output_log"]
     if os.path.exists(p):
-        return send_file(p, as_attachment=True, download_name=Path(p).name)
+        original_stem = Path(job.get("filename", "")).stem or job_id
+        friendly = re.sub(r'[^\w\s\-\.,()]', '', original_stem).strip() or job_id
+        return send_file(p, as_attachment=True, download_name=friendly + "_intake_log.json")
     abort(404)
 
 def _sanitize_job(j):
@@ -1286,6 +1462,16 @@ def delete_job(job_id):
     if job_id in jobs:
         del jobs[job_id]
         save_jobs()
+        # Remove from SQLite (verifications)
+        conn = _get_db()
+        try:
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            conn.execute("DELETE FROM verifications WHERE job_id = ?", (job_id,))
+            conn.commit()
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
         # Clean up page images
         job_pages = PAGES_DIR / job_id
         if job_pages.exists():
@@ -1299,19 +1485,31 @@ def _verify_path(job_id):
     return VERIFY_DIR / f"{job_id}.json"
 
 def _load_verifications(job_id):
-    p = _verify_path(job_id)
-    if p.exists():
-        try:
-            with open(p) as f:
-                return json.load(f)
-        except (ValueError, OSError):
-            pass
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT data FROM verifications WHERE job_id = ?", (job_id,)).fetchone()
+        if row:
+            return json.loads(row[0])
+    except (sqlite3.Error, json.JSONDecodeError):
+        pass
+    finally:
+        conn.close()
     return {"fields": {}, "updated": None, "reviewer": ""}
 
 def _save_verifications(job_id, data):
     data["updated"] = datetime.now().isoformat()
-    with open(_verify_path(job_id), "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    conn = _get_db()
+    try:
+        conn.execute(
+            """INSERT INTO verifications (job_id, data, updated) VALUES (?, ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET data = excluded.data, updated = excluded.updated""",
+            (job_id, json.dumps(data, default=str), data["updated"])
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not save verifications for {job_id}: {e}")
+    finally:
+        conn.close()
     # Update job-level verification summary
     _update_verify_summary(job_id, data)
 
@@ -2371,6 +2569,69 @@ def cancel_job(job_id):
     return jsonify({"success": True})
 
 
+# ─── Health Check ─────────────────────────────────────────────────────────────
+
+@app.route("/api/health")
+def health_check():
+    """System health check: version, uptime, job counts, dependency status, disk usage."""
+    import shutil as _shutil
+
+    now = datetime.now()
+    uptime_seconds = (now - _start_time).total_seconds()
+
+    # Job counts by status
+    status_counts = {}
+    for j in jobs.values():
+        s = j.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    # Dependency checks
+    tesseract_ok = _shutil.which("tesseract") is not None
+    extract_ok = (BASE_DIR / "extract.py").exists()
+    api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    # Directory writability
+    dirs_ok = {}
+    for name, d in [("uploads", UPLOAD_DIR), ("outputs", OUTPUT_DIR), ("clients", CLIENTS_DIR), ("verifications", VERIFY_DIR)]:
+        dirs_ok[name] = os.access(str(d), os.W_OK)
+
+    # Disk usage
+    try:
+        usage = _shutil.disk_usage(str(DATA_DIR))
+        disk = {
+            "total_gb": round(usage.total / (1024**3), 2),
+            "free_gb": round(usage.free / (1024**3), 2),
+            "percent_used": round(usage.used / usage.total * 100, 1),
+        }
+    except Exception:
+        disk = None
+
+    # Data directory size
+    data_size_mb = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(str(DATA_DIR)):
+            for fname in filenames:
+                try:
+                    data_size_mb += os.path.getsize(os.path.join(dirpath, fname))
+                except OSError:
+                    pass
+        data_size_mb = round(data_size_mb / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": "ok",
+        "version": _app_version,
+        "uptime_hours": round(uptime_seconds / 3600, 2),
+        "started": _start_time.isoformat(),
+        "jobs": {"total": len(jobs), "by_status": status_counts},
+        "dependencies": {"extract_py": extract_ok, "tesseract": tesseract_ok, "api_key_set": api_key_set},
+        "directories": dirs_ok,
+        "disk": disk,
+        "data_size_mb": data_size_mb,
+    })
+
+
 # ─── HTML ─────────────────────────────────────────────────────────────────────
 
 
@@ -3356,6 +3617,18 @@ function saveVerification(key, status, correctedValue, note, category, vendorDes
 }
 
 function confirmField(key) {
+  const current = verifications[key];
+  if (current && current.status === 'confirmed') {
+    // Toggle off — un-confirm
+    delete verifications[key];
+    fetch('/api/verify/' + currentJobId, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: { [key]: { status: '_remove' } }, reviewer: getReviewer() })
+    }).catch(() => {});
+    updateVerifyBar();
+    loadPage(currentPage, focusedFieldIdx);
+    return;
+  }
   const nextIdx = focusedFieldIdx + 1;
   saveVerification(key, 'confirmed');
   showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' '), 'success');
@@ -4284,13 +4557,13 @@ if __name__ == "__main__":
         print("  Place extract.py in the same folder as app.py\n")
 
     print("=" * 52)
-    print("  Bearden Document Intake Platform v5")
+    print(f"  Bearden Document Intake Platform v{_app_version}")
     print("  ─────────────────────────────────────")
     print(f"  Open in browser:  http://localhost:{port}")
+    print(f"  Database:         {DB_PATH}")
     print(f"  Uploads:          {UPLOAD_DIR}")
     print(f"  Outputs:          {OUTPUT_DIR}")
     print(f"  Client folders:   {CLIENTS_DIR}")
-    print(f"  Vendor memory:    {VENDOR_CATEGORIES_FILE}")
     print("=" * 52)
     print()
 
