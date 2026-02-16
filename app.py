@@ -84,6 +84,7 @@ VALID_DOC_TYPES = {"tax_returns", "bank_statements", "trust_documents", "bookkee
 # In-memory job tracking (persisted to jobs_history.json)
 jobs = {}
 _jobs_lock = threading.Lock()
+_active_procs = {}  # job_id -> subprocess.Popen for cancellation
 
 def load_jobs():
     global jobs
@@ -641,16 +642,18 @@ def auto_rotate_page(img):
     """Detect and fix sideways/landscape pages for the review viewer."""
     w, h = img.size
     if w > h * 1.15:
-        # Landscape — likely sideways scan
+        # Landscape — use Tesseract OSD to determine correct rotation
         try:
             import pytesseract
             osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
             angle = osd.get("rotate", 0)
             if angle != 0:
                 return img.rotate(-angle, expand=True)
-        except Exception:
-            pass
-        # Fallback: rotate 90 CW
+            # Tesseract says angle=0 — page is already correct orientation (landscape)
+            return img
+        except Exception as e:
+            print(f"  Auto-rotate: Tesseract OSD failed ({e}), rotating 90 CW as fallback")
+        # Fallback only if Tesseract failed entirely
         return img.rotate(-90, expand=True)
     return img
 
@@ -671,7 +674,7 @@ def generate_page_images(job_id, pdf_path):
 
 # ─── Job Runner ───────────────────────────────────────────────────────────────
 
-def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", output_format="tax_review", user_notes="", ai_instructions="", disable_pii=False, resume=False, no_ocr_first=False):
+def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", output_format="tax_review", user_notes="", ai_instructions="", disable_pii=False, resume=False, use_ocr_first=False):
     """Run extract.py in a background thread, capturing progress line by line."""
     import subprocess
     job = jobs[job_id]
@@ -712,7 +715,7 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
         cmd.append("--no-pii")
     if resume:
         cmd.append("--resume")
-    if no_ocr_first:
+    if not use_ocr_first:
         cmd.append("--no-ocr-first")
 
     # Inject client instructions into ai_instructions
@@ -738,6 +741,7 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=str(BASE_DIR)
         )
+        _active_procs[job_id] = proc
 
         for line in proc.stdout:
             line = line.rstrip()
@@ -793,6 +797,7 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                 job["progress"] = 100
 
         proc.wait()
+        _active_procs.pop(job_id, None)
 
         if proc.returncode == 0:
             job["status"] = "complete"
@@ -865,6 +870,7 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
         job["status"] = "error"
         job["end_time"] = datetime.now().isoformat()
         job["error"] = str(e)
+        _active_procs.pop(job_id, None)
 
     save_jobs()
 
@@ -894,7 +900,7 @@ def upload():
 
     skip_verify = request.form.get("skip_verify") == "true"
     disable_pii = request.form.get("disable_pii") == "true"
-    no_ocr_first = request.form.get("no_ocr_first") == "true"
+    use_ocr_first = request.form.get("use_ocr_first") == "true"
     client_name = request.form.get("client_name", "").strip()
     doc_type = request.form.get("doc_type", "tax_returns")
     if doc_type not in VALID_DOC_TYPES:
@@ -935,11 +941,11 @@ def upload():
         "pdf_path": str(pdf_path),
         "client_folder": str(client_dir),
         "disable_pii": disable_pii,
-        "no_ocr_first": no_ocr_first,
+        "use_ocr_first": use_ocr_first,
     }
     save_jobs()
 
-    t = threading.Thread(target=run_extraction, args=(job_id, pdf_path, year, skip_verify, doc_type, output_format, user_notes, ai_instructions, disable_pii, False, no_ocr_first))
+    t = threading.Thread(target=run_extraction, args=(job_id, pdf_path, year, skip_verify, doc_type, output_format, user_notes, ai_instructions, disable_pii, False, use_ocr_first))
     t.daemon = True
     t.start()
 
@@ -2029,8 +2035,8 @@ def retry_job(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
 
-    if job.get("status") not in ("error", "interrupted"):
-        return jsonify({"error": f"Cannot retry a job with status '{job.get('status')}'. Only error or interrupted jobs can be retried."}), 400
+    if job.get("status") not in ("error", "interrupted", "failed"):
+        return jsonify({"error": f"Cannot retry a job with status '{job.get('status')}'. Only failed, error, or interrupted jobs can be retried."}), 400
 
     pdf_path = job.get("pdf_path", "")
     if not pdf_path or not os.path.exists(pdf_path):
@@ -2059,18 +2065,45 @@ def retry_job(job_id):
     user_notes = job.get("user_notes", "")
     ai_instructions = job.get("ai_instructions", "")
     disable_pii = job.get("disable_pii", False)
-    no_ocr_first = job.get("no_ocr_first", False)
+    use_ocr_first = job.get("use_ocr_first", False)
 
     t = threading.Thread(target=run_extraction, kwargs=dict(
         job_id=job_id, pdf_path=pdf_path, year=year, skip_verify=skip_verify,
         doc_type=doc_type, output_format=output_format, user_notes=user_notes,
         ai_instructions=ai_instructions, disable_pii=disable_pii, resume=True,
-        no_ocr_first=no_ocr_first,
+        use_ocr_first=use_ocr_first,
     ))
     t.daemon = True
     t.start()
 
     return jsonify({"job_id": job_id, "retry_count": job["retry_count"]})
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    """Cancel a running extraction job."""
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    if job.get("status") not in ("queued", "running"):
+        return jsonify({"error": "Job is not running"}), 400
+
+    proc = _active_procs.get(job_id)
+    if proc:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        _active_procs.pop(job_id, None)
+
+    job["status"] = "interrupted"
+    job["end_time"] = datetime.now().isoformat()
+    job["error"] = "Cancelled by user"
+    job["log"].append("── Cancelled by user ──")
+    save_jobs()
+
+    return jsonify({"success": True})
 
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
@@ -2283,7 +2316,11 @@ td.actions { white-space: nowrap; text-align: right; }
 .vf-btn:hover { border-color: var(--navy-light); color: var(--text); }
 .vf-btn-confirm.active { background: var(--green); color: white; border-color: var(--green); }
 .vf-btn-flag.active { background: var(--yellow); color: white; border-color: var(--yellow); }
+.vf-btn-note.has-note { background: #E8F4FD; border-color: #5B9BD5; color: #5B9BD5; }
 .vf-note { font-size: 11px; color: var(--text-secondary); padding: 2px 14px 4px 14px; }
+.vf-note-input { display:flex; align-items:center; gap:4px; padding:4px 14px; }
+.vf-note-input input { font-size:12px; padding:3px 6px; border:1px solid var(--border); border-radius:4px; flex:1; font-family:var(--sans); }
+.vf-note-input button { font-size:11px; padding:2px 8px; border-radius:4px; border:1px solid var(--border); background:var(--accent); color:white; cursor:pointer; }
 .vf-original { text-decoration: line-through; color: var(--red); }
 
 /* ─── Transaction table ─── */
@@ -2519,7 +2556,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
               </div>
               <div class="form-group">
                 <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-                  <input type="checkbox" id="noOcrFirst"> Force vision extraction (skip OCR-first, higher cost)
+                  <input type="checkbox" id="useOcrFirst"> Use OCR-first mode (lower cost, less accurate)
                 </label>
               </div>
             </div>
@@ -2561,11 +2598,13 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <button class="btn btn-secondary btn-sm" onclick="prevPage()">&#9664; Prev</button>
       <span class="review-pager" id="reviewPager">1 / 1</span>
       <button class="btn btn-secondary btn-sm" onclick="nextPage()">Next &#9654;</button>
+      <button class="btn btn-secondary btn-sm" onclick="reextractPage()" title="Re-extract this page with AI instructions" style="margin-left:8px">&#x21BB; Re-extract</button>
     </div>
     <div class="verify-stats" id="verifyStats"></div>
     <div style="display:flex;gap:8px;align-items:center">
       <button class="btn btn-success btn-sm" onclick="downloadFile('xlsx')">&#x2B73; Excel</button>
       <button class="btn btn-secondary btn-sm" onclick="downloadFile('log')">&#x2B73; JSON</button>
+      <button class="btn btn-secondary btn-sm" onclick="regenExcel()" title="Regenerate Excel with corrections">&#x21BB; Regen Excel</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
     </div>
   </div>
@@ -2697,6 +2736,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="kbd-row"><span>Confirm field</span><kbd>Enter</kbd></div>
     <div class="kbd-row"><span>Flag field</span><kbd>F</kbd></div>
     <div class="kbd-row"><span>Edit value</span><kbd>E</kbd></div>
+    <div class="kbd-row"><span>Add note</span><kbd>N</kbd></div>
     <div class="kbd-row"><span>Next field</span><kbd>&#x2193; / Tab</kbd></div>
     <div class="kbd-row"><span>Prev field</span><kbd>&#x2191; / Shift+Tab</kbd></div>
     <div class="kbd-row"><span>Next page</span><kbd>&#x2192;</kbd></div>
@@ -2834,7 +2874,7 @@ function startExtraction() {
   fd.append('ai_instructions', document.getElementById('aiInstructions').value);
   fd.append('skip_verify', document.getElementById('skipVerify').checked ? 'true' : 'false');
   fd.append('disable_pii', document.getElementById('disablePii').checked ? 'true' : 'false');
-  fd.append('no_ocr_first', document.getElementById('noOcrFirst').checked ? 'true' : 'false');
+  fd.append('use_ocr_first', document.getElementById('useOcrFirst').checked ? 'true' : 'false');
 
   document.getElementById('startBtn').disabled = true;
   fetch('/api/upload', { method: 'POST', body: fd })
@@ -2856,6 +2896,22 @@ function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(pollStatus, 800);
   pollStatus();
+  document.getElementById('procCancelBtn').style.display = '';
+}
+
+function cancelJob() {
+  if (!currentJobId) return;
+  if (!confirm('Cancel this extraction?')) return;
+  fetch('/api/cancel/' + currentJobId, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { showToast(data.error, 'error'); return; }
+      clearInterval(pollTimer); pollTimer = null;
+      document.getElementById('procCancelBtn').style.display = 'none';
+      showToast('Extraction cancelled', 'info');
+      showSection('upload');
+    })
+    .catch(e => { showToast('Cancel failed: ' + e, 'error'); });
 }
 
 function pollStatus() {
@@ -2874,13 +2930,15 @@ function pollStatus() {
 
     if (data.status === 'complete') {
       clearInterval(pollTimer); pollTimer = null;
+      document.getElementById('procCancelBtn').style.display = 'none';
       const costStr = data.cost_usd ? ' ($' + data.cost_usd.toFixed(4) + ')' : '';
       showToast('Extraction complete!' + costStr, 'success');
       document.getElementById('navReview').style.display = '';
       openReview(data);
-    } else if (data.status === 'failed') {
+    } else if (data.status === 'failed' || data.status === 'interrupted') {
       clearInterval(pollTimer); pollTimer = null;
-      showToast('Extraction failed', 'error');
+      document.getElementById('procCancelBtn').style.display = 'none';
+      showToast(data.status === 'interrupted' ? 'Extraction cancelled' : 'Extraction failed', 'error');
     }
   }).catch(() => {});
 }
@@ -2996,7 +3054,7 @@ function flagField(key) {
 }
 
 function startEdit(key, currentVal) {
-  const row = document.querySelector('[data-key="' + CSS.escape(key) + '"]');
+  const row = document.querySelector('[data-key="' + key.replace(/"/g, '\\"') + '"]');
   if (!row) return;
   const valSpan = row.querySelector('.field-val');
   if (!valSpan) return;
@@ -3015,6 +3073,35 @@ function startEdit(key, currentVal) {
   function onKey(e) { if (e.key === 'Enter') finishEdit(); else if (e.key === 'Escape') { loadPage(currentPage, focusedFieldIdx); } }
   input.addEventListener('blur', finishEdit);
   input.addEventListener('keydown', onKey);
+}
+
+function toggleNoteInput(key) {
+  const escapedKey = key.replace(/"/g, '\\"');
+  const row = document.querySelector('[data-key="' + escapedKey + '"]');
+  if (!row) return;
+  // Check if note input already exists after this row
+  const existing = row.nextElementSibling;
+  if (existing && existing.classList.contains('vf-note-input')) {
+    existing.remove();
+    return;
+  }
+  const current = verifications[key];
+  const currentNote = (current && current.note) || '';
+  const div = document.createElement('div');
+  div.className = 'vf-note-input';
+  div.innerHTML = '<input type="text" placeholder="Add a review note..." value="' + esc(currentNote) + '" onkeydown="if(event.key===\'Enter\')saveFieldNote(\'' + esc(key) + '\',this.value)">'
+    + '<button onclick="saveFieldNote(\'' + esc(key) + '\',this.previousElementSibling.value)">Save</button>';
+  row.after(div);
+  div.querySelector('input').focus();
+}
+
+function saveFieldNote(key, note) {
+  note = (note || '').trim();
+  const current = verifications[key] || {};
+  const status = current.status || 'confirmed';
+  saveVerification(key, status, current.corrected_value !== undefined ? current.corrected_value : null, note);
+  showToast(note ? 'Note saved' : 'Note removed', 'success');
+  loadPage(currentPage, focusedFieldIdx);
 }
 
 // ─── Category Handling ───
@@ -3166,10 +3253,11 @@ function loadPage(page, focusIdx) {
       html += '<span class="field-actions">';
       html += '<button class="vf-btn vf-btn-confirm' + (vstate&&vstate.status==='confirmed'?' active':'') + '" onclick="event.stopPropagation();confirmField(\'' + esc(vk) + '\')" title="Confirm (Enter)">\u2713</button>';
       html += '<button class="vf-btn vf-btn-flag' + (vstate&&vstate.status==='flagged'?' active':'') + '" onclick="event.stopPropagation();flagField(\'' + esc(vk) + '\')" title="Flag (F)">\u2691</button>';
+      html += '<button class="vf-btn vf-btn-note' + (vstate&&vstate.note?' has-note':'') + '" onclick="event.stopPropagation();toggleNoteInput(\'' + esc(vk) + '\')" title="Add note (N)">&#x270E;</button>';
       html += '</span></span></div>';
 
       if (vstate && vstate.status==='corrected') { html += '<div class="vf-note"><span class="vf-original">' + esc(String(rawVal)) + '</span> \u2192 ' + esc(displayStr) + '</div>'; }
-      if (vstate && vstate.note) { html += '<div class="vf-note">' + esc(vstate.note) + '</div>'; }
+      if (vstate && vstate.note) { html += '<div class="vf-note" id="note-' + esc(vk) + '">' + esc(vstate.note) + '</div>'; }
 
       if (needsCategoryPicker(k, ext.document_type)) {
         var cv = '';
@@ -3222,10 +3310,48 @@ function setFocus(idx) { focusedFieldIdx = idx; loadPage(currentPage, idx); }
 function prevPage() { if (currentPage > 1) loadPage(currentPage - 1); }
 function nextPage() { if (currentPage < totalPages) loadPage(currentPage + 1); }
 
+function reextractPage() {
+  if (!currentJobId || !currentPage) return;
+  const instructions = prompt('Enter instructions for re-extracting this page (e.g., "This is a K-1 Schedule, focus on box 1-3"):');
+  if (!instructions) return;
+  showToast('Re-extracting page ' + currentPage + '...', 'info');
+  fetch('/api/reextract-page/' + currentJobId + '/' + currentPage, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instructions: instructions })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) { showToast('Re-extract failed: ' + data.error, 'error'); return; }
+    showToast('Page ' + currentPage + ' re-extracted successfully', 'success');
+    // Reload the review data to pick up the new extraction
+    fetch('/api/results/' + currentJobId).then(r => r.json()).then(rd => {
+      if (rd.error) return;
+      reviewData = rd;
+      verifications = rd.verifications || {};
+      totalPages = rd.total_pages || 1;
+      loadPage(currentPage);
+    });
+  })
+  .catch(e => { showToast('Re-extract failed: ' + e, 'error'); });
+}
+
 // ─── Downloads ───
 function downloadFile(type) {
   if (!currentJobId) return;
   window.location = '/api/download' + (type==='log'?'-log':'') + '/' + currentJobId;
+}
+
+function regenExcel() {
+  if (!currentJobId) return;
+  showToast('Regenerating Excel...', 'info');
+  fetch('/api/regen-excel/' + currentJobId, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { showToast('Regen failed: ' + data.error, 'error'); return; }
+      showToast('Excel regenerated successfully', 'success');
+    })
+    .catch(e => { showToast('Regen failed: ' + e, 'error'); });
 }
 
 // ─── History ───
@@ -3254,7 +3380,7 @@ function renderHistory(data) {
       '<td style="font-size:12px;color:var(--text-secondary)">' + dt + '</td>' +
       '<td class="actions">' +
         (j.status==='complete'?'<button class="btn btn-sm btn-secondary" onclick=\'openReview('+JSON.stringify({id:j.id,client_name:j.client_name})+')\'>\u{1F50D} Review</button> ':'') +
-        (j.status==='failed'||j.status==='interrupted'?'<button class="btn btn-sm btn-secondary" onclick="retryJob(\''+j.id+'\')">Retry</button> ':'') +
+        (j.status==='failed'||j.status==='interrupted'||j.status==='error'?'<button class="btn btn-sm btn-secondary" onclick="retryJob(\''+j.id+'\')">Retry</button> ':'') +
         '<button class="btn btn-ghost btn-sm" onclick="deleteJob(\''+j.id+'\')" title="Delete">\u2716</button>' +
       '</td></tr>';
   }).join('');
@@ -3520,10 +3646,11 @@ document.addEventListener('keydown', function(e) {
   }
   else if (e.key === 'Enter') { if (pageFieldKeys[focusedFieldIdx]) confirmField(pageFieldKeys[focusedFieldIdx]); }
   else if (e.key === 'f' || e.key === 'F') { if (pageFieldKeys[focusedFieldIdx]) flagField(pageFieldKeys[focusedFieldIdx]); }
+  else if (e.key === 'n' || e.key === 'N') { if (pageFieldKeys[focusedFieldIdx]) toggleNoteInput(pageFieldKeys[focusedFieldIdx]); }
   else if (e.key === 'e' || e.key === 'E') {
     const vk = pageFieldKeys[focusedFieldIdx];
     if (vk) {
-      const row = document.querySelector('[data-key="'+CSS.escape(vk)+'"]');
+      const row = document.querySelector('[data-key="'+vk.replace(/"/g, '\\\\"')+'"]');
       const valEl = row ? row.querySelector('.field-val') : null;
       if (valEl) startEdit(vk, valEl.textContent);
     }

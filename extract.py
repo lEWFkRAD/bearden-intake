@@ -596,6 +596,33 @@ CRITICAL ACCURACY RULES:
 - DO NOT add or calculate. Only extract what is printed.
 - For dotted-line values, follow the dots carefully to the number.
 
+FIELD NAMING RULES — you MUST use these exact field names:
+For consolidated brokerage statements (multiple forms on one page), use prefixed names:
+  1099-DIV: div_ordinary_dividends, div_qualified_dividends, div_capital_gain_distributions, div_nondividend_distributions, div_federal_wh, div_section_199a, div_foreign_tax_paid, div_exempt_interest, div_private_activity_bond, div_state_wh
+  1099-INT: int_interest_income, int_early_withdrawal_penalty, int_us_savings_bonds_and_treasury, int_federal_wh, int_investment_expenses, int_foreign_tax_paid, int_tax_exempt_interest, int_market_discount, int_bond_premium, int_bond_premium_treasury, int_state_wh
+  1099-B: b_short_term_proceeds, b_short_term_basis, b_short_term_gain_loss, b_long_term_proceeds, b_long_term_basis, b_long_term_gain_loss, b_total_proceeds, b_total_basis, b_total_gain_loss, b_federal_wh, b_market_discount, b_wash_sale_loss
+  1099-MISC: misc_royalties, misc_other_income, misc_rents, misc_federal_wh, misc_state_wh
+
+For standalone forms, use unprefixed names:
+  W-2: employer_name, employer_ein, wages, federal_wh, ss_wages, ss_wh, medicare_wages, medicare_wh, state_wages, state_wh, local_wages, local_wh, nonqualified_plans_12a, state_id
+  1099-DIV: ordinary_dividends, qualified_dividends, capital_gain_distributions, nondividend_distributions, federal_wh, section_199a, foreign_tax_paid, exempt_interest, private_activity_bond, state_wh
+  1099-INT: interest_income, early_withdrawal_penalty, us_savings_bonds_and_treasury, federal_wh, investment_expenses, foreign_tax_paid, tax_exempt_interest, market_discount, bond_premium, state_wh
+  1099-R: gross_distribution, taxable_amount, capital_gain, federal_wh, distribution_code, state_wh
+  1099-NEC: nonemployee_compensation, federal_wh, state_wh
+  SSA-1099: net_benefits, federal_wh
+  K-1: partnership_name, partnership_ein, partner_name, entity_type, partner_type,
+       profit_share_begin, profit_share_end, loss_share_begin, loss_share_end,
+       capital_share_begin, capital_share_end,
+       box1_ordinary_income, box2_rental_real_estate, box3_other_rental,
+       box4a_guaranteed_services, box5_interest, box6a_ordinary_dividends,
+       box6b_qualified_dividends, box7_royalties, box8_short_term_capital_gain,
+       box9a_long_term_capital_gain, box10_net_1231_gain, box11_other_income,
+       box12_section_179, box13_other_deductions, box14_self_employment,
+       box15_credits, box17_alt_min_tax, box18_tax_exempt_income,
+       box19_distributions, box20_other_info,
+       beginning_capital_account, ending_capital_account,
+       current_year_net_income, withdrawals_distributions, capital_contributed
+
 K-1 CRITICAL: Box 2 = rental real estate income. Box 15 = credits. They are DIFFERENT.
 Small values like -9 ARE real values.
 
@@ -996,10 +1023,7 @@ def auto_rotate(img):
     """Detect and fix sideways/landscape pages. Returns corrected PIL image."""
     w, h = img.size
     if w > h * 1.15:
-        # Landscape — likely sideways. Try to determine correct rotation.
-        # Check if text runs top-to-bottom (rotated 90 CW) or bottom-to-top (90 CCW)
-        # Heuristic: most scanned docs are rotated 90 CCW (need to rotate 90 CW to fix)
-        # Try Tesseract OSD if available for precise detection
+        # Landscape — use Tesseract OSD to determine correct rotation
         if HAS_TESSERACT:
             try:
                 osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
@@ -1007,9 +1031,11 @@ def auto_rotate(img):
                 if angle != 0:
                     img = img.rotate(-angle, expand=True)
                     return img
-            except Exception:
-                pass
-        # Fallback: rotate 90 degrees clockwise (most common for landscape scans)
+                # Tesseract says angle=0 — page is already correct orientation (landscape)
+                return img
+            except Exception as e:
+                print(f"  Auto-rotate: Tesseract OSD failed ({e}), rotating 90 CW as fallback")
+        # Fallback only if Tesseract unavailable or failed entirely
         img = img.rotate(-90, expand=True)
     return img
 
