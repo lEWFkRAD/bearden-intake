@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# ============================================================
+# URITHIRU — Central Command of OathLedger
+# ============================================================
 """
 Bearden Document Intake Platform v5.1
 ==================================
@@ -23,6 +26,8 @@ import os
 import sys
 import json
 import threading
+import collections
+import atexit
 import uuid
 import re
 import glob
@@ -52,6 +57,34 @@ try:
     from PIL import Image
 except ImportError:
     sys.exit("Install Pillow: pip3 install Pillow")
+
+# ─── CAS: Telemetry Store (lazy init) ─────────────────────────────────────────
+_telemetry_store = None
+
+def _get_telemetry_store():
+    """Lazy-init the CAS telemetry store. Returns TelemetryStore or None."""
+    global _telemetry_store
+    if _telemetry_store is None:
+        try:
+            from telemetry_store import TelemetryStore
+            _telemetry_store = TelemetryStore(str(Path(__file__).parent / "data" / "bearden.db"))
+        except Exception:
+            pass
+    return _telemetry_store
+
+# ─── T-TXN-LEDGER-1: Transaction Store (lazy init) ───────────────────────────
+_transaction_store = None
+
+def _get_transaction_store():
+    """Lazy-init the transaction store. Returns TransactionStore or None."""
+    global _transaction_store
+    if _transaction_store is None:
+        try:
+            from transaction_store import TransactionStore
+            _transaction_store = TransactionStore(str(Path(__file__).parent / "data" / "bearden.db"))
+        except Exception:
+            pass
+    return _transaction_store
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -239,6 +272,281 @@ def _init_db():
             )
         """)
 
+        # B1: Review chain columns on jobs table
+        for col, col_type in [("review_stage", "TEXT DEFAULT 'draft'"),
+                               ("stage_owner_role", "TEXT DEFAULT ''"),
+                               ("stage_updated", "TEXT DEFAULT ''")]:
+            try:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
+        # B1: Review chain columns on verified_fields table
+        for col, col_type in [("review_stage", "TEXT DEFAULT ''"),
+                               ("reviewer_id", "INTEGER")]:
+            try:
+                conn.execute(f"ALTER TABLE verified_fields ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
+        # B1: Auto-set existing complete jobs to preparer_review if still draft
+        conn.execute("""
+            UPDATE jobs SET review_stage = 'preparer_review', stage_updated = datetime('now')
+            WHERE status = 'complete'
+              AND (review_stage IS NULL OR review_stage = '' OR review_stage = 'draft')
+        """)
+
+        # ─── CAS: Operational Telemetry Tables (T-CAS-1) ─────────────────────
+        # These op_* tables store ONLY operational metrics — never financial data.
+        # Dropping all op_* tables leaves the financial pipeline fully intact.
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_runs (
+                id INTEGER PRIMARY KEY,
+                job_id TEXT UNIQUE,
+                client_name TEXT,
+                doc_type TEXT,
+                status TEXT DEFAULT 'running',
+                started_at TEXT,
+                finished_at TEXT,
+                total_s REAL,
+                cost_usd REAL,
+                total_pages INTEGER,
+                pages_ocr INTEGER,
+                pages_vision INTEGER,
+                pages_blank INTEGER,
+                cache_hit INTEGER DEFAULT 0,
+                total_fields INTEGER,
+                fields_high_conf INTEGER,
+                fields_low_conf INTEGER,
+                fields_needs_review INTEGER,
+                total_api_calls INTEGER,
+                vision_calls INTEGER,
+                text_calls INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                time_to_first_values_s REAL,
+                batches_total INTEGER,
+                fields_streamed INTEGER,
+                app_version TEXT,
+                extract_version TEXT,
+                log_path TEXT,
+                error_message TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_job ON op_runs(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_started ON op_runs(started_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_status ON op_runs(status)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_phases (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER REFERENCES op_runs(id),
+                job_id TEXT,
+                phase_name TEXT,
+                duration_s REAL,
+                UNIQUE(run_id, phase_name)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_drift (
+                id INTEGER PRIMARY KEY,
+                job_id TEXT UNIQUE,
+                measured_at TEXT,
+                edit_rate REAL,
+                missing_evidence_rate REAL,
+                needs_review_rate REAL,
+                audit_pass_rate REAL,
+                low_confidence_rate REAL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_smoke_results (
+                id INTEGER PRIMARY KEY,
+                run_at TEXT,
+                passed INTEGER,
+                total_checks INTEGER,
+                results_json TEXT,
+                duration_s REAL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_golden_results (
+                id INTEGER PRIMARY KEY,
+                run_at TEXT,
+                golden_name TEXT,
+                passed INTEGER,
+                total_checks INTEGER,
+                fields_matched INTEGER,
+                fields_mismatched INTEGER,
+                fields_missing INTEGER,
+                fields_extra INTEGER,
+                duration_s REAL,
+                details_json TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_backups (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT,
+                backup_path TEXT,
+                db_size_bytes INTEGER,
+                sha256 TEXT,
+                row_counts_json TEXT,
+                verified INTEGER DEFAULT 0,
+                verify_sha256 TEXT,
+                verify_at TEXT
+            )
+        """)
+        # ─── CAS: Change Request Tables (T-CAS-2B) ─────────────────────────
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_change_requests (
+                id INTEGER PRIMARY KEY,
+                cr_id TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                severity TEXT NOT NULL DEFAULT 'WARNING',
+                source TEXT NOT NULL,
+                trigger_summary TEXT,
+                trigger_snapshot TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                folder_path TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_id ON op_change_requests(cr_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_status ON op_change_requests(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_created ON op_change_requests(created_at)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_cr_findings (
+                id INTEGER PRIMARY KEY,
+                cr_id TEXT NOT NULL,
+                finding_id TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'WARNING',
+                source TEXT NOT NULL,
+                check_name TEXT,
+                details TEXT,
+                measured_value TEXT,
+                threshold TEXT,
+                recommended_action TEXT,
+                UNIQUE(cr_id, finding_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_findings_cr ON op_cr_findings(cr_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS op_post_fix_gates (
+                id INTEGER PRIMARY KEY,
+                cr_id TEXT NOT NULL,
+                run_at TEXT NOT NULL,
+                gate_result TEXT NOT NULL,
+                checks_run INTEGER,
+                checks_passed INTEGER,
+                before_snapshot TEXT,
+                after_snapshot TEXT,
+                details_json TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_gates_cr ON op_post_fix_gates(cr_id)")
+
+        # ─── End CAS Tables ──────────────────────────────────────────────────
+
+        # ─── T-TXN-LEDGER-1: Transaction Ledger Tables ─────────────────────
+        # These tables are owned by transaction_store.py but mirrored here
+        # for consistency with the codebase pattern.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS txn_values (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                txn_id TEXT NOT NULL UNIQUE,
+                job_id TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                document_type TEXT NOT NULL,
+                payer_key TEXT NOT NULL DEFAULT '',
+                txn_index INTEGER NOT NULL,
+                txn_date TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                amount REAL,
+                txn_type TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                category_group TEXT DEFAULT '',
+                vendor_norm TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'staged',
+                source_page INTEGER,
+                confidence TEXT DEFAULT '',
+                evidence_ref TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_txn_values_job ON txn_values(job_id);
+            CREATE INDEX IF NOT EXISTS idx_txn_values_client_year ON txn_values(client_name, year);
+            CREATE INDEX IF NOT EXISTS idx_txn_values_status ON txn_values(status);
+            CREATE INDEX IF NOT EXISTS idx_txn_values_category ON txn_values(category);
+            CREATE INDEX IF NOT EXISTS idx_txn_values_vendor ON txn_values(vendor_norm);
+            CREATE INDEX IF NOT EXISTS idx_txn_values_date ON txn_values(txn_date);
+
+            CREATE TABLE IF NOT EXISTS txn_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                txn_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                old_value TEXT DEFAULT '',
+                new_value TEXT DEFAULT '',
+                reviewer TEXT DEFAULT '',
+                event_at TEXT NOT NULL,
+                details_json TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_txn_events_txn ON txn_events(txn_id);
+            CREATE INDEX IF NOT EXISTS idx_txn_events_type ON txn_events(event_type);
+
+            CREATE TABLE IF NOT EXISTS txn_evidence (
+                evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                txn_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                page_number INTEGER,
+                crop_coords TEXT DEFAULT '',
+                ocr_text TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_txn_evidence_txn ON txn_evidence(txn_id);
+
+            CREATE TABLE IF NOT EXISTS vendor_rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_pattern TEXT NOT NULL,
+                match_type TEXT NOT NULL DEFAULT 'exact',
+                category TEXT NOT NULL,
+                category_group TEXT DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL DEFAULT 1.0,
+                usage_count INTEGER DEFAULT 0,
+                created_by TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_rules_unique ON vendor_rules(vendor_pattern, match_type);
+            CREATE INDEX IF NOT EXISTS idx_vendor_rules_pattern ON vendor_rules(vendor_pattern);
+            CREATE INDEX IF NOT EXISTS idx_vendor_rules_category ON vendor_rules(category);
+
+            CREATE TABLE IF NOT EXISTS category_rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT NOT NULL,
+                category TEXT NOT NULL,
+                category_group TEXT DEFAULT '',
+                priority INTEGER DEFAULT 100,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_by TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_category_rules_unique ON category_rules(keyword, category);
+            CREATE INDEX IF NOT EXISTS idx_category_rules_keyword ON category_rules(keyword);
+        """)
+        # ─── End Transaction Ledger Tables ──────────────────────────────────
+
         conn.commit()
         _secure_file(DB_PATH)
         _migrate_from_json(conn)
@@ -354,7 +662,43 @@ _app_version = "5.2"
 SESSION_IDLE_SECONDS = 45 * 60       # 45 minute idle timeout
 LOGIN_LOCKOUT_SECONDS = 120           # 2 minute lockout after max failures
 MAX_FAILED_ATTEMPTS = 5               # lockout threshold
-VALID_ROLES = frozenset({"admin", "partner", "reviewer"})
+VALID_ROLES = frozenset({"admin", "preparer", "partner", "reviewer"})
+
+# ─── Review Chain Stage Model ────────────────────────────────────────────────
+# draft → preparer_review → reviewer_review → partner_review → final
+REVIEW_STAGES = ("draft", "preparer_review", "reviewer_review", "partner_review", "final")
+
+STAGE_ROLE_MAP = {
+    "preparer_review": {"preparer", "admin"},
+    "reviewer_review": {"reviewer", "admin"},
+    "partner_review":  {"partner", "admin"},
+}
+
+STAGE_NEXT = {
+    "draft":             "preparer_review",
+    "preparer_review":   "reviewer_review",
+    "reviewer_review":   "partner_review",
+    "partner_review":    "final",
+}
+
+STAGE_PREV = {
+    "reviewer_review":   "preparer_review",
+    "partner_review":    "reviewer_review",
+}
+
+STAGE_DISPLAY = {
+    "draft":             "Draft",
+    "preparer_review":   "Preparer Review",
+    "reviewer_review":   "Reviewer Review",
+    "partner_review":    "Partner Review",
+    "final":             "Final",
+}
+
+def can_act_at_stage(user_role, stage):
+    """Check if a user role is authorized to act at a given review stage."""
+    if user_role == "admin":
+        return True
+    return user_role in STAGE_ROLE_MAP.get(stage, set())
 
 _failed_logins = {}  # key=(username, ip) -> {"count": int, "locked_until": epoch}
 
@@ -372,11 +716,11 @@ def _seed_default_users():
         default_pin = generate_password_hash("000000")  # Temp PIN — must be reset
         seed_users = [
             ("jeff",    "Jeffrey Watts",  "admin"),
-            ("susan",   "Susan",          "partner"),
+            ("susan",   "Susan",          "reviewer"),
             ("charles", "Charles",        "partner"),
             ("chris",   "Chris",          "partner"),
-            ("ashley",  "Ashley",         "reviewer"),
-            ("leigh",   "Leigh",          "reviewer"),
+            ("ashley",  "Ashley",         "preparer"),
+            ("leigh",   "Leigh",          "preparer"),
             ("molly",   "Molly",          "reviewer"),
         ]
         for username, display_name, role in seed_users:
@@ -390,6 +734,18 @@ def _seed_default_users():
         print(f"  Seeded {len(seed_users)} default users (temp PIN: 000000)")
     finally:
         conn.close()
+
+    # B1: Migrate existing user roles for review chain
+    conn2 = _get_db()
+    try:
+        # Susan should be reviewer (second pass), not partner
+        conn2.execute("UPDATE users SET role='reviewer' WHERE username='susan' AND role='partner'")
+        # Ashley/Leigh should be preparers
+        conn2.execute("UPDATE users SET role='preparer' WHERE username='ashley' AND role='reviewer'")
+        conn2.execute("UPDATE users SET role='preparer' WHERE username='leigh' AND role='reviewer'")
+        conn2.commit()
+    finally:
+        conn2.close()
 
 
 def get_user_by_id(user_id):
@@ -750,19 +1106,189 @@ jobs = {}
 _jobs_lock = threading.Lock()
 _active_procs = {}  # job_id -> subprocess.Popen for cancellation
 
+# ── Aftercare: background task queue for deferred post-confirm work (T-UX-CONFIRM-FASTPATH) ──
+_aftercare_queue = collections.deque()
+_aftercare_event = threading.Event()
+_aftercare_running = True
+
+
+def _aftercare_worker():
+    """Single background thread processing deferred confirm tasks.
+
+    Consumes from _aftercare_queue (FIFO). Sleeps when idle, wakes on enqueue
+    via _aftercare_event. Runs as a daemon thread — exits when main process exits.
+    """
+    while _aftercare_running or _aftercare_queue:
+        _aftercare_event.wait(timeout=1.0)
+        _aftercare_event.clear()
+        while _aftercare_queue:
+            try:
+                task = _aftercare_queue.popleft()
+                _process_aftercare(task)
+            except Exception as e:
+                print(f"  Aftercare error: {e}")
+
+
+def _process_aftercare(task):
+    """Run deferred work for a single confirm action.
+
+    Operations: canonical promotion, FactStore update, verify summary, audit log.
+    All wrapped in try/except — failures logged, never block the user.
+    """
+    job_id = task["job_id"]
+    incoming = task["incoming"]
+    reviewer = task.get("reviewer", "")
+    action = task.get("action", "confirm")
+    field_id = task.get("field_id", "")
+    reviewer_id = task.get("reviewer_id")
+    field_count = task.get("field_count", 1)
+    statuses = task.get("statuses", {})
+    mode = task.get("mode", "guided")
+
+    # 1. Canonical promotion + FactStore
+    _aftercare_promote_facts(job_id, incoming)
+
+    # 2. Verify summary + save_jobs
+    try:
+        vdata = _load_verifications(job_id)
+        _update_verify_summary(job_id, vdata)
+    except Exception:
+        pass
+
+    # 3. Audit log
+    try:
+        if mode == "guided":
+            log_event("info", "fact_verified",
+                      f"Guided review: {action} {field_id} on job {job_id[:12]}",
+                      user_id=reviewer_id, job_id=job_id,
+                      details={"reviewer": reviewer, "action": action,
+                               "field_id": field_id, "mode": "guided"})
+        else:
+            log_event("info", "fact_verified",
+                      f"Verified {field_count} field(s) on job {job_id[:12]}",
+                      user_id=reviewer_id, job_id=job_id,
+                      details={"reviewer": reviewer, "field_count": field_count,
+                               "statuses": statuses})
+    except Exception:
+        pass
+
+
+def _aftercare_promote_facts(job_id, incoming_fields):
+    """Promote confirmed/corrected values to client_canonical + FactStore.
+
+    This is the expensive part of _upsert_verified_fields extracted for
+    background execution. Opens its own DB connection.
+    """
+    if not incoming_fields:
+        return
+    job = jobs.get(job_id)
+    log_data = _load_extraction_log(job_id)
+    if not job or not log_data:
+        return
+
+    client_name = job.get("client_name", "")
+    year = job.get("year", "")
+    if not client_name or not year:
+        return
+
+    conn = _get_db()
+    try:
+        from fact_store import FactStore
+        fs = FactStore(str(DB_PATH))
+        tax_year = int(year) if year.isdigit() else None
+    except Exception:
+        fs = None
+        tax_year = None
+
+    try:
+        now = datetime.now().isoformat()
+        for field_key, decision in incoming_fields.items():
+            status = decision.get("status", "")
+            if status not in ("confirmed", "corrected"):
+                continue
+            ext, fn = _resolve_extraction_for_field(log_data, field_key)
+            if not ext or not fn:
+                continue
+            doc_type = ext.get("document_type", "")
+            if not doc_type:
+                continue
+            payer_key = _normalize_payer_key(ext)
+            payer_display = ext.get("payer_or_entity", "")
+
+            canonical = None
+            original = _resolve_field_value(log_data, field_key)
+            if status == "corrected":
+                canonical = decision.get("corrected_value")
+            elif status == "confirmed":
+                canonical = original
+
+            if canonical is not None:
+                _upsert_client_canonical(
+                    conn, client_name, year, doc_type, payer_key,
+                    payer_display, fn, canonical, original,
+                    status, job_id,
+                    decision.get("reviewer", ""),
+                    decision.get("timestamp", now)
+                )
+
+            # FactStore update
+            if fs and tax_year is not None:
+                fact_key = FactStore.fact_key(doc_type, payer_key, fn)
+                try:
+                    if status == "corrected" and canonical is not None:
+                        corr_num = None
+                        corr_text = None
+                        try:
+                            corr_num = float(str(canonical).replace(",", "").replace("$", ""))
+                        except (ValueError, TypeError):
+                            corr_text = str(canonical)
+                        fs.apply_correction(
+                            job_id, tax_year, fact_key,
+                            value_num=corr_num, value_text=corr_text,
+                            reviewer=decision.get("reviewer", "")
+                        )
+                    elif status == "confirmed":
+                        fs.upgrade_fact_status(
+                            job_id, tax_year, fact_key, "confirmed"
+                        )
+                except Exception:
+                    pass
+        conn.commit()
+    except Exception as e:
+        print(f"  Aftercare canonical promotion error: {e}")
+    finally:
+        conn.close()
+
+
+def _enqueue_aftercare(task):
+    """Add a task to the aftercare queue and wake the worker."""
+    _aftercare_queue.append(task)
+    _aftercare_event.set()
+
+
+# Start aftercare worker thread
+_aftercare_thread = threading.Thread(target=_aftercare_worker, daemon=True, name="aftercare")
+_aftercare_thread.start()
+
+
 def load_jobs():
     """Load all jobs from SQLite into the in-memory dict."""
     global jobs
     conn = _get_db()
     try:
-        rows = conn.execute("SELECT id, data FROM jobs").fetchall()
+        rows = conn.execute("SELECT id, data, review_stage FROM jobs").fetchall()
         jobs = {}
-        for jid, data_json in rows:
+        for row in rows:
+            jid = row[0]
+            data_json = row[1]
+            review_stage = row[2] if len(row) > 2 else "draft"
             try:
                 jdata = json.loads(data_json)
                 # Clear stale "running" or "queued" jobs from previous sessions
                 if jdata.get("status") in ("running", "queued"):
                     jdata["status"] = "interrupted"
+                # Sync review_stage from DB column into in-memory dict
+                jdata["review_stage"] = review_stage or "draft"
                 jobs[jid] = jdata
             except json.JSONDecodeError:
                 print(f"  Warning: Could not parse job {jid}")
@@ -780,20 +1306,64 @@ def save_jobs():
             for jid, j in jobs.items():
                 safe = {k: v for k, v in j.items() if k != "log"}
                 conn.execute(
-                    """INSERT INTO jobs (id, data, status, client_name, created, updated)
-                       VALUES (?, ?, ?, ?, ?, ?)
+                    """INSERT INTO jobs (id, data, status, client_name, created, updated, review_stage, stage_updated)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                            data = excluded.data, status = excluded.status,
-                           client_name = excluded.client_name, updated = excluded.updated""",
+                           client_name = excluded.client_name, updated = excluded.updated,
+                           review_stage = excluded.review_stage, stage_updated = excluded.stage_updated""",
                     (jid, json.dumps(safe, default=str), j.get("status", ""),
                      j.get("client_name", ""), j.get("created", ""),
-                     datetime.now().isoformat())
+                     datetime.now().isoformat(),
+                     j.get("review_stage", "draft"),
+                     j.get("stage_updated", ""))
                 )
             conn.commit()
         except sqlite3.Error as e:
             print(f"  Warning: Could not save jobs to database: {e}")
         finally:
             conn.close()
+
+def _set_review_stage(job_id, new_stage, user=None):
+    """Update review stage for a job in both memory and DB. Logs the transition."""
+    job = jobs.get(job_id)
+    if not job:
+        return False
+    old_stage = job.get("review_stage", "draft")
+    now = datetime.now().isoformat()
+    job["review_stage"] = new_stage
+    job["stage_updated"] = now
+    save_jobs()
+
+    # Log the transition
+    log_event("info", "review_stage_advanced",
+              f"Job {job_id[:12]}: {STAGE_DISPLAY.get(old_stage, old_stage)} → {STAGE_DISPLAY.get(new_stage, new_stage)}",
+              user_id=user["id"] if user else None,
+              job_id=job_id,
+              details={"old_stage": old_stage, "new_stage": new_stage})
+
+    # CAS: Compute drift when job reaches final stage (never crashes workflow)
+    if new_stage == "final":
+        try:
+            ts = _get_telemetry_store()
+            if ts:
+                ts.compute_drift_for_job(job_id)
+                # T-CAS-2B: Check drift thresholds after computation
+                try:
+                    drift_check = ts.check_drift_thresholds()
+                    if drift_check and drift_check.get("triggered"):
+                        _maybe_create_cr(
+                            source="drift", severity="WARNING",
+                            trigger_summary=f"Drift threshold exceeded: {len(drift_check['violations'])} violations",
+                            trigger_snapshot={"drift_latest": ts.get_drift_summary(limit=1)},
+                            findings=drift_check["violations"],
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return True
 
 def _backfill_verified_fields():
     """One-time backfill: populate verified_fields from existing verifications blobs.
@@ -1659,6 +2229,16 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
               job_id=job_id,
               details={"doc_type": doc_type, "year": year})
 
+    # CAS Hook 1: Record run start (never crashes extraction)
+    try:
+        ts = _get_telemetry_store()
+        if ts:
+            ts.record_run_start(job_id, client_name=job.get("client_name", ""),
+                                doc_type=doc_type, app_version=_app_version,
+                                extract_version="v6")
+    except Exception:
+        pass
+
     # Generate page images for the side-by-side viewer
     job["stage"] = "rendering"
     job["progress"] = 2
@@ -1826,6 +2406,8 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             job["progress"] = 100
             job["stage"] = "done"
             job["end_time"] = datetime.now().isoformat()
+            # B1: Auto-advance to preparer_review on extraction complete
+            _set_review_stage(job_id, "preparer_review")
             # Sprint 2: Log job completion
             log_event("info", "job_completed",
                       f"Job completed: {job.get('client_name', '')}",
@@ -1900,6 +2482,41 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                         _populate_facts_from_extraction(job)
                     except Exception as fact_err:
                         job["log"].append(f"  Warning: Fact population failed: {fact_err}")
+
+                    # T-TXN-LEDGER-1: Ingest transactions into ledger
+                    try:
+                        txn_store = _get_transaction_store()
+                        if txn_store:
+                            txn_result = txn_store.ingest_from_extraction(
+                                job_id, log_data,
+                                client_name=job.get("client_name", ""),
+                                year=int(year) if str(year).isdigit() else 0,
+                            )
+                            if txn_result["inserted"] > 0:
+                                job["log"].append(
+                                    f"  Ledger: {txn_result['inserted']} transactions ingested"
+                                )
+                                # Auto-apply vendor rules
+                                txn_store.apply_vendor_rules(
+                                    client_name=job.get("client_name", ""),
+                                    year=int(year) if str(year).isdigit() else 0,
+                                )
+                    except Exception as txn_err:
+                        job["log"].append(f"  Warning: Transaction ingest failed: {txn_err}")
+
+                    # CAS Hook 2: Record run completion + phase timing (never crashes extraction)
+                    try:
+                        ts = _get_telemetry_store()
+                        if ts:
+                            log_data["log_path"] = str(log_path)
+                            ts.record_run_complete(job_id, log_data)
+                            # Record phase timing if available
+                            phase_timing = log_data.get("timing", {}).get("phases")
+                            if phase_timing:
+                                ts.record_phases(job_id, phase_timing)
+                    except Exception:
+                        pass
+
                 except (json.JSONDecodeError, KeyError, TypeError, IOError) as e:
                     job["log"].append(f"  Warning: Could not parse log stats: {e}")
         else:
@@ -1910,6 +2527,33 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             log_event("error", "job_failed",
                       f"Job failed: {job.get('client_name', '')} (exit code {proc.returncode})",
                       job_id=job_id)
+            # CAS Hook 3a: Record run error (never crashes extraction)
+            try:
+                ts = _get_telemetry_store()
+                if ts:
+                    ts.record_run_error(job_id, f"exit code {proc.returncode}")
+                    # T-CAS-2B: Check 24h error rate after error
+                    try:
+                        err_data = ts.get_error_rate_24h()
+                        if err_data and err_data.get("error_rate", 0) > 0.20:
+                            _maybe_create_cr(
+                                source="error_rate", severity="CRITICAL",
+                                trigger_summary=f"Extraction error rate {err_data['error_rate']*100:.1f}% exceeds 20% (last 24h)",
+                                trigger_snapshot=err_data,
+                                findings=[{
+                                    "severity": "CRITICAL",
+                                    "source": "error_rate",
+                                    "check_name": "extraction_error_rate_24h",
+                                    "details": f"{err_data['error_runs']}/{err_data['total_runs']} runs errored in last 24h",
+                                    "measured_value": f"{err_data['error_rate']*100:.1f}%",
+                                    "threshold": "20%",
+                                    "recommended_action": "Review recent error logs and fix extraction failures",
+                                }],
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     except Exception as e:
         job["status"] = "error"
@@ -1920,6 +2564,13 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
         log_event("error", "job_failed",
                   f"Job error: {job.get('client_name', '')} — {e}",
                   job_id=job_id)
+        # CAS Hook 3b: Record run error (never crashes extraction)
+        try:
+            ts = _get_telemetry_store()
+            if ts:
+                ts.record_run_error(job_id, str(e)[:500])
+        except Exception:
+            pass
 
     save_jobs()
 
@@ -2158,13 +2809,1101 @@ def api_admin_summary():
     return jsonify(build_admin_summary())
 
 
+# ─── CAS: Continuous Assurance System Routes (T-CAS-1) ──────────────────────
+
+@app.route("/api/cas/health")
+@require_login
+def api_cas_health():
+    """Aggregated CAS health status."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    return jsonify(ts.cas_health_summary())
+
+
+@app.route("/api/cas/smoke", methods=["POST"])
+@require_login
+def api_cas_smoke():
+    """Trigger smoke tests (admin only)."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    try:
+        from assurance_smoke import run_smoke_tests
+        result = run_smoke_tests(str(DB_PATH), str(BASE_DIR))
+        # Store result in telemetry
+        ts = _get_telemetry_store()
+        if ts:
+            ts.record_smoke_result(result["passed"], result["total"],
+                                   result["results"], result["duration_s"])
+        # T-CAS-2B: Auto-generate CR if smoke fails
+        try:
+            if result["passed"] < result["total"]:
+                failed_checks = [r for r in result["results"] if not r.get("passed")]
+                findings = []
+                for fc in failed_checks:
+                    findings.append({
+                        "severity": "CRITICAL" if fc["name"] in ("db_writable", "op_tables_exist") else "WARNING",
+                        "source": "smoke",
+                        "check_name": fc["name"],
+                        "details": fc.get("message", "Check failed"),
+                        "measured_value": "FAIL",
+                        "threshold": "PASS",
+                        "recommended_action": f"Investigate and fix {fc['name']}",
+                    })
+                sev = "CRITICAL" if any(f["severity"] == "CRITICAL" for f in findings) else "WARNING"
+                _maybe_create_cr(
+                    source="smoke", severity=sev,
+                    trigger_summary=f"Smoke test failed {len(failed_checks)}/{result['total']} checks",
+                    trigger_snapshot={"smoke_result": result},
+                    findings=findings,
+                )
+        except Exception:
+            pass
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/goldens/run", methods=["POST"])
+@require_login
+def api_cas_goldens_run():
+    """Trigger golden regression tests (admin only). WARNING: costs API tokens."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    try:
+        from assurance_goldens import run_all_goldens
+        results = run_all_goldens(goldens_dir=DATA_DIR / "goldens", base_dir=BASE_DIR)
+        # Store each result
+        ts = _get_telemetry_store()
+        if ts:
+            for r in results:
+                ts.record_golden_result(
+                    r["golden_name"], 1 if r["passed"] else 0,
+                    r["total_checks"], r.get("matched", 0),
+                    r.get("mismatched", 0), r.get("missing", 0),
+                    r.get("extra", 0), r.get("duration_s", 0),
+                    r.get("details"))
+        # T-CAS-2B: Auto-generate CR if any golden fails
+        try:
+            failed_goldens = [r for r in results if not r.get("passed")]
+            if failed_goldens:
+                findings = []
+                for fg in failed_goldens:
+                    findings.append({
+                        "severity": "CRITICAL",
+                        "source": "golden",
+                        "check_name": fg.get("golden_name", "unknown"),
+                        "details": f"Mismatched: {fg.get('mismatched', 0)}, Missing: {fg.get('missing', 0)}",
+                        "measured_value": f"{fg.get('mismatched', 0)} mismatches",
+                        "threshold": "0 mismatches",
+                        "recommended_action": f"Review golden case {fg.get('golden_name', '')} extraction output",
+                    })
+                _maybe_create_cr(
+                    source="golden", severity="CRITICAL",
+                    trigger_summary=f"Golden regression: {len(failed_goldens)}/{len(results)} cases failed",
+                    trigger_snapshot={"golden_results": results},
+                    findings=findings,
+                )
+        except Exception:
+            pass
+        return jsonify({"results": results, "count": len(results)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/backup", methods=["POST"])
+@require_login
+def api_cas_backup():
+    """Create a database backup (admin only)."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    try:
+        from assurance_backup import create_backup, cleanup_old_backups
+        result = create_backup(str(DB_PATH), str(DATA_DIR / "backups"))
+        # Store in telemetry
+        ts = _get_telemetry_store()
+        if ts:
+            ts.record_backup(result["path"], result["size_bytes"],
+                             result["sha256"], result["row_counts"])
+        # Cleanup old backups
+        cleanup_old_backups(str(DATA_DIR / "backups"), keep=30)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/backup/verify/<int:backup_id>", methods=["POST"])
+@require_login
+def api_cas_backup_verify(backup_id):
+    """Verify a backup (admin only)."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    try:
+        backups = ts.get_recent_backups(limit=100)
+        target = None
+        for b in backups:
+            if b["id"] == backup_id:
+                target = b
+                break
+        if not target:
+            return jsonify({"error": "Backup not found"}), 404
+
+        from assurance_backup import verify_backup
+        result = verify_backup(target["backup_path"], target["sha256"])
+        ts.record_backup_verify(backup_id, result["verified"], result["sha256"])
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/run/<job_id>")
+@require_login
+def api_cas_run_detail(job_id):
+    """Get run detail for a specific job."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    run = ts.get_run(job_id)
+    if not run:
+        return jsonify({"error": "Run not found"}), 404
+    return jsonify(run)
+
+
+@app.route("/api/cas/runs")
+@require_login
+def api_cas_runs():
+    """Get recent extraction runs."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    limit = request.args.get("limit", 50, type=int)
+    runs = ts.get_recent_runs(limit=min(limit, 200))
+    return jsonify({"runs": runs, "count": len(runs)})
+
+
+@app.route("/api/cas/drift")
+@require_login
+def api_cas_drift():
+    """Get drift metrics history."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    limit = request.args.get("limit", 20, type=int)
+    drift = ts.get_drift_summary(limit=min(limit, 100))
+    return jsonify({"drift": drift, "count": len(drift)})
+
+
+@app.route("/admin/cas")
+@require_login
+def admin_cas():
+    """CAS System Health dashboard page."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    cas_health = ts.cas_health_summary() if ts else {"state": "unknown", "label": "Unavailable"}
+    summary = build_admin_summary()
+    return render_template("admin_cas.html",
+        active="cas", header="System Health",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+        cas=cas_health,
+    )
+
+
+@app.route("/admin/cas/runs")
+@require_login
+def admin_cas_runs():
+    """CAS Run Inspector dashboard page."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    runs = ts.get_recent_runs(limit=50) if ts else []
+    summary = build_admin_summary()
+    return render_template("admin_cas_runs.html",
+        active="cas_runs", header="Run Inspector",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+        runs=runs,
+    )
+
+
+# ─── CAS: Report Endpoints (T-CAS-1R) ───────────────────────────────────────
+
+def _get_cas_report_gen():
+    """Lazy-init the CAS report generator."""
+    ts = _get_telemetry_store()
+    if not ts:
+        return None
+    try:
+        from cas_reports import CASReportGenerator
+        return CASReportGenerator(ts, app_version=_app_version)
+    except Exception:
+        return None
+
+
+@app.route("/api/cas/report/daily")
+@require_login
+def api_cas_report_daily():
+    """Generate Daily Health report (R1)."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        result = gen.render_daily_health()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/report/runs")
+@require_login
+def api_cas_report_runs():
+    """Generate Runs report (R2)."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        limit = request.args.get("limit", 50, type=int)
+        result = gen.render_runs(limit=min(limit, 200))
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/report/regressions")
+@require_login
+def api_cas_report_regressions():
+    """Generate Regressions report (R3)."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        days = request.args.get("days", 7, type=int)
+        result = gen.render_regressions(days=days)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/report/backups")
+@require_login
+def api_cas_report_backups():
+    """Generate Backups report (R4)."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        days = request.args.get("days", 30, type=int)
+        result = gen.render_backups(days=days)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cas/report/agent-pack")
+@require_login
+def api_cas_report_agent_pack():
+    """Generate and download Agent Pack (zip with all reports)."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        zip_bytes = gen.build_agent_pack()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return send_file(
+            BytesIO(zip_bytes),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"cas_agent_pack_{timestamp}.zip",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── CAS: Change Request Routes (T-CAS-2B) ──────────────────────────────────
+
+def _maybe_create_cr(source, severity, trigger_summary, trigger_snapshot, findings):
+    """Create a CR if findings are non-empty. Writes folder + files. Never crashes caller.
+
+    Includes dedup guard: skips if there's already an open CR for the same source.
+    All wrapped in try/except: pass to maintain the safety contract.
+
+    Returns:
+        cr_id (str) or None.
+    """
+    try:
+        ts = _get_telemetry_store()
+        if not ts or not findings:
+            return None
+
+        # Dedup guard: skip if open CR exists for same source
+        existing_open = ts.get_open_change_requests()
+        for ocr in existing_open:
+            if ocr.get("source") == source and ocr.get("status") in ("open", "fix_submitted"):
+                return None  # Already tracked
+
+        result = ts.create_change_request(source, severity, trigger_summary,
+                                          trigger_snapshot, findings)
+        cr_id = result["cr_id"]
+
+        # Create CR folder and write findings files
+        cr_folder = DATA_DIR / "reports" / "change_requests" / cr_id
+        os.makedirs(str(cr_folder), exist_ok=True)
+
+        # Write findings.json
+        findings_json_path = cr_folder / "findings.json"
+        with open(str(findings_json_path), "w") as f:
+            json.dump({"cr_id": cr_id, "findings": findings,
+                       "trigger_snapshot": trigger_snapshot}, f, indent=2, default=str)
+
+        # Write findings.md
+        gen = _get_cas_report_gen()
+        if gen:
+            try:
+                md_result = gen.render_cr_findings(cr_id)
+                findings_md_path = cr_folder / "findings.md"
+                with open(str(findings_md_path), "w") as f:
+                    f.write(md_result["markdown"])
+            except Exception:
+                pass
+
+        return cr_id
+    except Exception:
+        pass
+    return None
+
+
+def _run_post_fix_gate(cr_id):
+    """Re-run the checks that triggered a CR and compare before/after.
+
+    Returns:
+        dict with keys: gate_result, checks_run, checks_passed,
+                        before_snapshot, after_snapshot, details, error.
+    """
+    ts = _get_telemetry_store()
+    if not ts:
+        return {"gate_result": "REJECTED", "error": "TelemetryStore not available"}
+
+    cr = ts.get_change_request(cr_id)
+    if not cr:
+        return {"gate_result": "REJECTED", "error": "CR not found"}
+
+    source = cr["source"]
+    before_snapshot = json.loads(cr.get("trigger_snapshot") or "{}")
+    details = []
+    checks_run = 0
+    checks_passed = 0
+
+    try:
+        if source == "smoke":
+            from assurance_smoke import run_smoke_tests
+            result = run_smoke_tests(str(DB_PATH), str(BASE_DIR))
+            ts.record_smoke_result(result["passed"], result["total"],
+                                   result["results"], result["duration_s"])
+            checks_run = result["total"]
+            checks_passed = result["passed"]
+            after_snapshot = {"smoke_result": result}
+            for r in result["results"]:
+                details.append({"check": r["name"], "passed": r["passed"],
+                               "message": r.get("message", "")})
+
+        elif source == "golden":
+            from assurance_goldens import run_all_goldens
+            results = run_all_goldens(goldens_dir=DATA_DIR / "goldens",
+                                      base_dir=BASE_DIR)
+            for r in results:
+                ts.record_golden_result(
+                    r["golden_name"], 1 if r["passed"] else 0,
+                    r["total_checks"], r.get("matched", 0),
+                    r.get("mismatched", 0), r.get("missing", 0),
+                    r.get("extra", 0), r.get("duration_s", 0),
+                    r.get("details"))
+            checks_run = len(results)
+            checks_passed = sum(1 for r in results if r.get("passed"))
+            after_snapshot = {"golden_results": results}
+            for r in results:
+                details.append({"check": r["golden_name"], "passed": r.get("passed", False),
+                               "mismatched": r.get("mismatched", 0),
+                               "missing": r.get("missing", 0)})
+
+        elif source == "drift":
+            drift_check = ts.check_drift_thresholds()
+            checks_run = 3  # edit_rate, needs_review_rate, audit_pass_rate
+            violation_count = len(drift_check.get("violations", []))
+            checks_passed = checks_run - violation_count
+            after_snapshot = {"drift_latest": ts.get_drift_summary(limit=1),
+                             "drift_check": drift_check}
+            details = drift_check.get("violations", [])
+
+        elif source == "error_rate":
+            err_data = ts.get_error_rate_24h()
+            checks_run = 1
+            rate = err_data.get("error_rate", 0) if err_data else 0
+            checks_passed = 1 if rate <= 0.20 else 0
+            after_snapshot = err_data or {}
+            details = [{"check": "error_rate_24h", "passed": checks_passed == 1,
+                        "measured": f"{rate*100:.1f}%", "threshold": "20%"}]
+        else:
+            return {"gate_result": "REJECTED", "error": f"Unknown source: {source}"}
+
+    except Exception as e:
+        return {"gate_result": "REJECTED", "error": str(e)}
+
+    # Determine gate result
+    if checks_run > 0 and checks_passed == checks_run:
+        gate_result = "ACCEPTED"
+    elif checks_passed > 0:
+        gate_result = "NEEDS_REVIEW"
+    else:
+        gate_result = "REJECTED"
+
+    # Record gate result
+    ts.record_gate_result(cr_id, gate_result, checks_run, checks_passed,
+                          before_snapshot, after_snapshot, details)
+
+    # Write gate_result.json to CR folder
+    try:
+        cr_folder = DATA_DIR / "reports" / "change_requests" / cr_id
+        os.makedirs(str(cr_folder), exist_ok=True)
+        gate_path = cr_folder / "gate_result.json"
+        with open(str(gate_path), "w") as f:
+            json.dump({
+                "gate_result": gate_result,
+                "checks_run": checks_run,
+                "checks_passed": checks_passed,
+                "details": details,
+            }, f, indent=2, default=str)
+    except Exception:
+        pass
+
+    return {
+        "gate_result": gate_result,
+        "checks_run": checks_run,
+        "checks_passed": checks_passed,
+        "before_snapshot": before_snapshot,
+        "after_snapshot": after_snapshot,
+        "details": details,
+    }
+
+
+@app.route("/api/cas/cr")
+@require_login
+def api_cas_cr_list():
+    """List Change Requests. Optional ?status=open filter."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    status_filter = request.args.get("status")
+    if status_filter == "open":
+        crs = ts.get_open_change_requests()
+    elif status_filter == "closed":
+        all_crs = ts.get_all_change_requests(limit=100)
+        crs = [c for c in all_crs if c.get("status") == "closed"]
+    else:
+        crs = ts.get_all_change_requests(limit=100)
+    return jsonify({"change_requests": crs, "count": len(crs)})
+
+
+@app.route("/api/cas/cr/<cr_id>")
+@require_login
+def api_cas_cr_detail(cr_id):
+    """Get CR detail including findings and gate result."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+    cr = ts.get_change_request(cr_id)
+    if not cr:
+        return jsonify({"error": "CR not found"}), 404
+    # Add merge guard info
+    cr["merge_guard"] = ts.can_merge_fix(cr_id)
+    return jsonify(cr)
+
+
+@app.route("/api/cas/cr/<cr_id>/manifest", methods=["POST"])
+@require_login
+def api_cas_cr_submit_manifest(cr_id):
+    """Submit fix manifest. Body: JSON with files_changed, tests_added, config_changed, description, author."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+
+    data = request.get_json(silent=True) or {}
+    # Auto-fill author and timestamp if not provided
+    if not data.get("author"):
+        data["author"] = u.get("display_name", u.get("username", "admin"))
+    if not data.get("timestamp"):
+        data["timestamp"] = datetime.now().isoformat()
+
+    result = ts.submit_fix_manifest(cr_id, data)
+    if not result["success"]:
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/api/cas/cr/<cr_id>/gate", methods=["POST"])
+@require_login
+def api_cas_cr_run_gate(cr_id):
+    """Run post-fix gate verification."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+
+    # Verify CR exists and has manifest
+    cr = ts.get_change_request(cr_id)
+    if not cr:
+        return jsonify({"error": "CR not found"}), 404
+    if cr["status"] not in ("fix_submitted", "gate_failed", "gate_passed"):
+        return jsonify({"error": f"CR must have fix manifest submitted first (status: {cr['status']})"}), 400
+
+    result = _run_post_fix_gate(cr_id)
+    if result.get("error"):
+        return jsonify(result), 500
+    return jsonify(result)
+
+
+@app.route("/api/cas/cr/<cr_id>/close", methods=["POST"])
+@require_login
+def api_cas_cr_close(cr_id):
+    """Close a CR. Enforces merge guard (can_merge_fix must return True)."""
+    u = current_user()
+    if u["role"] != "admin":
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        return jsonify({"error": "CAS not available"}), 503
+
+    merge = ts.can_merge_fix(cr_id)
+    if not merge["can_merge"]:
+        return jsonify({"error": f"Cannot close CR: {merge['reason']}"}), 400
+
+    ok = ts.update_cr_status(cr_id, "closed", closed_by=u.get("display_name", u.get("username", "admin")))
+    if not ok:
+        return jsonify({"error": "Failed to close CR"}), 500
+    return jsonify({"status": "closed", "cr_id": cr_id})
+
+
+@app.route("/api/cas/cr/<cr_id>/agent-pack")
+@require_login
+def api_cas_cr_agent_pack(cr_id):
+    """Download CR-specific agent pack zip."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    gen = _get_cas_report_gen()
+    if not gen:
+        return jsonify({"error": "CAS report generator not available"}), 503
+    try:
+        zip_bytes = gen.build_cr_agent_pack(cr_id)
+        return send_file(
+            BytesIO(zip_bytes),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"cas_cr_{cr_id}.zip",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/admin/cas/cr")
+@require_login
+def admin_cas_cr_list():
+    """CR list page."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    status_filter = request.args.get("status", "all")
+    if status_filter == "open":
+        crs = ts.get_open_change_requests() if ts else []
+    elif status_filter == "closed":
+        all_crs = ts.get_all_change_requests(limit=100) if ts else []
+        crs = [c for c in all_crs if c.get("status") == "closed"]
+    else:
+        crs = ts.get_all_change_requests(limit=100) if ts else []
+    summary = build_admin_summary()
+    return render_template("admin_cas_cr.html",
+        active="cas_cr", header="Change Requests",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+        change_requests=crs,
+        filter=status_filter,
+    )
+
+
+@app.route("/admin/cas/cr/<cr_id>")
+@require_login
+def admin_cas_cr_detail(cr_id):
+    """CR detail page."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    ts = _get_telemetry_store()
+    if not ts:
+        abort(503)
+    cr = ts.get_change_request(cr_id)
+    if not cr:
+        abort(404)
+    cr["merge_guard"] = ts.can_merge_fix(cr_id)
+    summary = build_admin_summary()
+    return render_template("admin_cas_cr_detail.html",
+        active="cas_cr", header=f"CR {cr_id}",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+        cr=cr,
+    )
+
+
+# ─── Transaction Ledger Routes (T-TXN-LEDGER-1) ────────────────────────────
+
+@app.route("/admin/ledger")
+@require_login
+def admin_ledger():
+    """Transaction ledger dashboard: client picker + monthly summary grid."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner", "preparer"):
+        abort(403)
+    summary = build_admin_summary()
+    txn_store = _get_transaction_store()
+    clients = txn_store.get_clients_with_transactions() if txn_store else []
+    return render_template("admin_ledger.html",
+        active="ledger", header="Transaction Ledger",
+        current_user=u, clients=clients,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+@app.route("/admin/ledger/review")
+@require_login
+def admin_ledger_review():
+    """Transaction review page: table with inline category picker."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner", "preparer", "reviewer"):
+        abort(403)
+    summary = build_admin_summary()
+    txn_store = _get_transaction_store()
+    clients = txn_store.get_clients_with_transactions() if txn_store else []
+    return render_template("admin_ledger_review.html",
+        active="ledger", header="Transaction Review",
+        current_user=u, clients=clients,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+@app.route("/admin/ledger/rules")
+@require_login
+def admin_ledger_rules():
+    """Category and vendor rules management."""
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    summary = build_admin_summary()
+    return render_template("admin_ledger_rules.html",
+        active="ledger", header="Ledger Rules",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+
+# ─── Transaction Ledger API ─────────────────────────────────────────────────
+
+@app.route("/api/ledger/taxonomy")
+@require_login
+def api_ledger_taxonomy():
+    """Return category taxonomy for UI dropdowns."""
+    from transaction_store import CATEGORY_TAXONOMY
+    return jsonify({"ok": True, "taxonomy": CATEGORY_TAXONOMY})
+
+@app.route("/api/ledger/summary")
+@require_login
+def api_ledger_summary():
+    """Get monthly category summary for a client/year."""
+    client = request.args.get("client", "")
+    year = request.args.get("year", "", type=str)
+    if not client or not year:
+        return jsonify({"error": "client and year required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    summary = txn_store.get_monthly_summary(client, int(year) if year.isdigit() else 0)
+    stats = txn_store.count_by_status(client, int(year) if year.isdigit() else 0)
+    return jsonify({"ok": True, "summary": summary, "stats": stats})
+
+@app.route("/api/ledger/transactions")
+@require_login
+def api_ledger_transactions():
+    """Get transactions with pagination and filters."""
+    client = request.args.get("client", "")
+    year = request.args.get("year", "", type=str)
+    if not client or not year:
+        return jsonify({"error": "client and year required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("per_page", 100, type=int), 500)
+
+    filters = {}
+    for key in ("status", "category", "category_group", "month",
+                 "txn_type", "search", "date_from", "date_to", "vendor_norm"):
+        val = request.args.get(key, "")
+        if val:
+            filters[key] = int(val) if key == "month" else val
+
+    result = txn_store.get_transactions(
+        client, int(year) if year.isdigit() else 0,
+        filters=filters, page=page, per_page=per_page,
+    )
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/ledger/categorize", methods=["POST"])
+@require_login
+def api_ledger_categorize():
+    """Set category on one or more transactions."""
+    payload = request.get_json(silent=True) or {}
+    txn_ids = payload.get("txn_ids", [])
+    category = payload.get("category", "")
+    learn = payload.get("learn", False)
+
+    if not txn_ids or not category:
+        return jsonify({"error": "txn_ids and category required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    u = current_user()
+    reviewer = u["display_name"] if u else ""
+
+    count = txn_store.bulk_categorize(txn_ids, category, reviewer=reviewer)
+
+    # Learn vendor rule if requested
+    if learn and count > 0:
+        for tid in txn_ids:
+            txn = txn_store.get_transaction(tid)
+            if txn and txn.get("vendor_norm"):
+                txn_store.learn_vendor_rule(txn["vendor_norm"], category)
+                break  # Learn from first transaction with a vendor
+
+    return jsonify({"ok": True, "updated": count})
+
+@app.route("/api/ledger/verify", methods=["POST"])
+@require_login
+def api_ledger_verify():
+    """Mark transactions as verified."""
+    payload = request.get_json(silent=True) or {}
+    txn_ids = payload.get("txn_ids", [])
+
+    if not txn_ids:
+        return jsonify({"error": "txn_ids required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    u = current_user()
+    reviewer = u["display_name"] if u else ""
+
+    verified = 0
+    skipped = 0
+    for tid in txn_ids:
+        if txn_store.verify(tid, reviewer=reviewer):
+            verified += 1
+        else:
+            skipped += 1
+
+    return jsonify({"ok": True, "verified": verified, "skipped": skipped})
+
+@app.route("/api/ledger/correct", methods=["POST"])
+@require_login
+def api_ledger_correct():
+    """Apply corrections to a single transaction."""
+    payload = request.get_json(silent=True) or {}
+    txn_id = payload.get("txn_id", "")
+    corrections = payload.get("corrections", {})
+
+    if not txn_id or not corrections:
+        return jsonify({"error": "txn_id and corrections required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    u = current_user()
+    reviewer = u["display_name"] if u else ""
+
+    ok = txn_store.correct(txn_id, corrections, reviewer=reviewer)
+    if not ok:
+        return jsonify({"error": "Transaction not found or correction failed"}), 404
+
+    return jsonify({"ok": True, "txn_id": txn_id})
+
+@app.route("/api/ledger/apply-rules", methods=["POST"])
+@require_login
+def api_ledger_apply_rules():
+    """Run vendor/category rules engine on uncategorized transactions."""
+    payload = request.get_json(silent=True) or {}
+    client = payload.get("client", "")
+    year = payload.get("year")
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    result = txn_store.apply_vendor_rules(
+        client_name=client or None,
+        year=int(year) if year else None,
+    )
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/ledger/report", methods=["POST"])
+@require_login
+def api_ledger_report():
+    """Generate and download monthly summary Excel report."""
+    payload = request.get_json(silent=True) or {}
+    client = payload.get("client", "")
+    year = payload.get("year")
+
+    if not client or not year:
+        return jsonify({"error": "client and year required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    try:
+        from transaction_reports import TransactionReportBuilder
+        safe_client = re.sub(r'[^\w\s-]', '', client).strip().replace(' ', '_')
+        filename = f"{safe_client}-txn-summary-{year}.xlsx"
+        output_path = OUTPUT_DIR / filename
+
+        builder = TransactionReportBuilder(txn_store, client, int(year))
+        builder.build(str(output_path))
+
+        return send_file(str(output_path), as_attachment=True,
+                         download_name=filename,
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/ledger/events/<txn_id>")
+@require_login
+def api_ledger_events(txn_id):
+    """Get audit trail for a specific transaction."""
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    events = txn_store.get_events(txn_id)
+    txn = txn_store.get_transaction(txn_id)
+    return jsonify({"ok": True, "events": events, "transaction": txn})
+
+
+# ─── Ledger: Vendor/Category Rules API ──────────────────────────────────────
+
+@app.route("/api/ledger/vendor-rules")
+@require_login
+def api_ledger_vendor_rules_list():
+    """List all vendor rules."""
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 50, type=int)
+    result = txn_store.get_vendor_rules(page=page, per_page=per_page)
+    return jsonify({"ok": True, **result})
+
+@app.route("/api/ledger/vendor-rules", methods=["POST"])
+@require_login
+def api_ledger_vendor_rules_create():
+    """Create a vendor rule."""
+    payload = request.get_json(silent=True) or {}
+    pattern = payload.get("vendor_pattern", "").strip()
+    match_type = payload.get("match_type", "exact")
+    category = payload.get("category", "")
+
+    if not pattern or not category:
+        return jsonify({"error": "vendor_pattern and category required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    u = current_user()
+    try:
+        rule_id = txn_store.add_vendor_rule(
+            pattern, match_type, category,
+            created_by=u["display_name"] if u else "",
+        )
+        return jsonify({"ok": True, "rule_id": rule_id})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/ledger/vendor-rules/<int:rule_id>", methods=["DELETE"])
+@require_login
+def api_ledger_vendor_rules_delete(rule_id):
+    """Delete a vendor rule."""
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    ok = txn_store.delete_vendor_rule(rule_id)
+    if not ok:
+        return jsonify({"error": "Rule not found"}), 404
+    return jsonify({"ok": True})
+
+@app.route("/api/ledger/category-rules")
+@require_login
+def api_ledger_category_rules_list():
+    """List all category rules."""
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    rules = txn_store.get_category_rules()
+    return jsonify({"ok": True, "rules": rules})
+
+@app.route("/api/ledger/category-rules", methods=["POST"])
+@require_login
+def api_ledger_category_rules_create():
+    """Create a category rule."""
+    payload = request.get_json(silent=True) or {}
+    keyword = payload.get("keyword", "").strip()
+    category = payload.get("category", "")
+    priority = payload.get("priority", 100)
+
+    if not keyword or not category:
+        return jsonify({"error": "keyword and category required"}), 400
+
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    u = current_user()
+    try:
+        rule_id = txn_store.add_category_rule(
+            keyword, category, priority=priority,
+            created_by=u["display_name"] if u else "",
+        )
+        return jsonify({"ok": True, "rule_id": rule_id})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/ledger/category-rules/<int:rule_id>", methods=["DELETE"])
+@require_login
+def api_ledger_category_rules_delete(rule_id):
+    """Delete a category rule."""
+    txn_store = _get_transaction_store()
+    if not txn_store:
+        return jsonify({"error": "Transaction store not available"}), 503
+
+    ok = txn_store.delete_category_rule(rule_id)
+    if not ok:
+        return jsonify({"error": "Rule not found"}), 404
+    return jsonify({"ok": True})
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
+@require_login
 def index():
     return render_template_string(MAIN_HTML)
 
+@app.route("/api/me")
+def api_me():
+    """Return current logged-in user info (or anonymous fallback)."""
+    u = current_user()
+    if u:
+        return jsonify({
+            "logged_in": True,
+            "user_id": u["id"],
+            "username": u["username"],
+            "display_name": u["display_name"],
+            "role": u["role"],
+            "initials": "".join(w[0] for w in u["display_name"].split() if w).upper()[:3],
+        })
+    return jsonify({
+        "logged_in": False,
+        "username": "operator",
+        "display_name": "Operator",
+        "role": "reviewer",
+        "initials": "",
+    })
+
 @app.route("/api/upload", methods=["POST"])
+@require_login
 def upload():
     if "pdf" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
@@ -2889,6 +4628,12 @@ def _build_guided_queue(job_id):
         item.pop('_priority', None)
 
     reviewed_count = total_fields - len(queue)
+
+    # Cache total for fast-path response (T-UX-CONFIRM-FASTPATH)
+    _job = jobs.get(job_id)
+    if _job is not None:
+        _job["_guided_total_fields"] = total_fields
+
     return queue, reviewed_count
 
 
@@ -2939,6 +4684,7 @@ def _release_review_lock(job_id, field_id):
 # ── Guided Review: API Routes ──
 
 @app.route("/api/guided-review/queue/<job_id>")
+@require_login
 def guided_review_queue(job_id):
     """Return ordered review queue for guided review."""
     queue, reviewed_count = _build_guided_queue(job_id)
@@ -2951,6 +4697,7 @@ def guided_review_queue(job_id):
 
 
 @app.route("/api/guided-review/item/<job_id>/<path:field_id>")
+@require_login
 def guided_review_item(job_id, field_id):
     """Return full detail for one field, triggering evidence generation."""
     # Parse field_id: "page:extIdx:fieldName"
@@ -3015,6 +4762,7 @@ def guided_review_item(job_id, field_id):
 
 
 @app.route("/api/guided-review/evidence/<job_id>/<filename>")
+@require_login
 def guided_review_evidence(job_id, filename):
     """Serve a cached evidence highlight image."""
     # Sanitize filename to prevent path traversal
@@ -3026,6 +4774,7 @@ def guided_review_evidence(job_id, filename):
 
 
 @app.route("/api/guided-review/action/<job_id>/<path:field_id>", methods=["POST"])
+@require_login
 def guided_review_action(job_id, field_id):
     """Process a guided review action on a single field.
 
@@ -3034,7 +4783,19 @@ def guided_review_action(job_id, field_id):
     """
     payload = request.get_json(silent=True) or {}
     action = payload.get("action", "")
-    reviewer = payload.get("reviewer", "")
+
+    # B1: Session-enforced reviewer identity
+    u = current_user()
+    reviewer = u["display_name"] if u else payload.get("reviewer", "")
+    reviewer_id = u["id"] if u else None
+
+    # B1: Check stage permission
+    job = jobs.get(job_id)
+    if job:
+        stage = job.get("review_stage", "draft")
+        user_role = u["role"] if u else "admin"
+        if stage in STAGE_ROLE_MAP and not can_act_at_stage(user_role, stage):
+            return jsonify({"error": f"Your role ({user_role}) cannot act at stage: {STAGE_DISPLAY.get(stage, stage)}"}), 403
 
     if action not in ("confirm", "correct", "not_present", "skip"):
         return jsonify({"error": "Invalid action"}), 400
@@ -3053,6 +4814,8 @@ def guided_review_action(job_id, field_id):
         field_decision = {
             "status": status,
             "reviewer": reviewer,
+            "reviewer_id": reviewer_id,
+            "review_stage": job.get("review_stage", "") if job else "",
             "note": payload.get("note", ""),
         }
         if action == "correct":
@@ -3068,45 +4831,56 @@ def guided_review_action(job_id, field_id):
         if action == "not_present":
             field_decision["note"] = payload.get("note", "") or "Value not present on document"
 
-        # Reuse existing verification infrastructure
         incoming = {field_id: field_decision}
 
-        # Write to legacy verifications JSON
+        # ── FAST PATH (T-UX-CONFIRM-FASTPATH): minimal synchronous writes ──
+
+        # 1. Write verifications table (skip summary — deferred to aftercare)
         data = _load_verifications(job_id)
         data["reviewer"] = reviewer
-        for key, decision in incoming.items():
-            decision["timestamp"] = datetime.now().isoformat()
-            data["fields"][key] = decision
-        _save_verifications(job_id, data)
+        field_decision["timestamp"] = datetime.now().isoformat()
+        data["fields"][field_id] = field_decision
+        _save_verifications(job_id, data, skip_summary=True)
 
-        # Write to normalized tables + facts + client canonicals
-        _upsert_verified_fields(job_id, incoming)
+        # 2. Write verified_fields row only (skip canonical + FactStore — deferred)
+        _upsert_verified_fields_fast(job_id, incoming)
 
-        # Auto-regenerate Excel
-        _regen_excel(job_id)
+        # Excel regen deferred to Finish Review (no auto-regen per field)
 
-        # Audit log
-        verify_user = current_user()
-        log_event("info", "fact_verified",
-                  f"Guided review: {action} {field_id} on job {job_id[:12]}",
-                  user_id=verify_user["id"] if verify_user else None,
-                  job_id=job_id,
-                  details={"reviewer": reviewer, "action": action,
-                           "field_id": field_id, "mode": "guided"})
+        # ── AFTERCARE: defer heavy work to background thread ──
+        _enqueue_aftercare({
+            "job_id": job_id,
+            "incoming": incoming,
+            "reviewer": reviewer,
+            "reviewer_id": reviewer_id,
+            "action": action,
+            "field_id": field_id,
+            "mode": "guided",
+        })
 
-    # Return next item in queue
-    queue, reviewed = _build_guided_queue(job_id)
-    next_item = queue[0] if queue else None
+    # Return counts using cached total (no queue rebuild — client manages queue locally)
+    cached_total = (job or {}).get("_guided_total_fields", 0)
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM verified_fields WHERE job_id = ? AND status IN ('confirmed','corrected')",
+            (job_id,)).fetchone()
+        reviewed = row[0] if row else 0
+    finally:
+        conn.close()
+    total = max(cached_total, reviewed)
+
     return jsonify({
         "ok": True,
-        "next": next_item,
-        "remaining": len(queue),
+        "next": None,  # Client manages queue locally via splice
+        "remaining": total - reviewed,
         "reviewed": reviewed,
-        "total": len(queue) + reviewed,
+        "total": total,
     })
 
 
 @app.route("/api/guided-review/lock/<job_id>/<path:field_id>", methods=["POST"])
+@require_login
 def guided_review_lock(job_id, field_id):
     """Acquire or extend a review lock on a field."""
     payload = request.get_json(silent=True) or {}
@@ -3120,15 +4894,339 @@ def guided_review_lock(job_id, field_id):
 
 
 @app.route("/api/guided-review/lock/<job_id>/<path:field_id>", methods=["DELETE"])
+@require_login
 def guided_review_unlock(job_id, field_id):
     """Release a review lock."""
     _release_review_lock(job_id, field_id)
     return jsonify({"ok": True})
 
 
+# ─── Post-Run Audit Sampling ─────────────────────────────────────────────────
+
+def _compute_audit_sample_size(n):
+    """Compute audit sample size from meaningful field count. Zero-inflation aware."""
+    if n <= 20:
+        return min(3, n)
+    elif n <= 50:
+        return 5
+    elif n <= 120:
+        return 8
+    elif n <= 250:
+        return 10
+    else:
+        return 12
+
+def _is_meaningful_field(field_name, value, status):
+    """Determine if a field is meaningful (not zero-inflated placeholder)."""
+    # Always meaningful if explicitly confirmed or edited
+    if status in ("confirmed", "corrected"):
+        return True
+    # Skip empty/null/placeholder values
+    if value is None or value == "" or value == "(empty)":
+        return False
+    # Skip zero values for numeric fields (zero inflation)
+    try:
+        numval = float(str(value).replace(",", "").replace("$", "").replace("(", "-").replace(")", ""))
+        if numval == 0.0:
+            return False
+    except (ValueError, TypeError):
+        pass  # Non-numeric values like names, EINs — keep them
+    return True
+
+
+@app.route("/api/post-run-audit/sample/<job_id>")
+@require_login
+def post_run_audit_sample(job_id):
+    """Generate a random audit sample from meaningful verified fields.
+
+    Returns a list of field_ids to audit, plus metadata.
+    Zero-inflation aware: excludes $0, null, placeholder fields unless explicitly confirmed/edited.
+    """
+    import random
+
+    job = jobs.get(job_id)
+    if not job or job.get("status") != "complete":
+        return jsonify({"error": "Job not found or not complete"}), 404
+
+    # Get all verified fields for this job
+    vdata = _load_verifications(job_id)
+    verified = vdata.get("fields", {})
+
+    # Get extraction data to know field values
+    log_path = job.get("output_log")
+    extractions = []
+    if log_path and os.path.exists(log_path):
+        try:
+            with open(log_path) as f:
+                log_data = json.load(f)
+            extractions = log_data.get("extractions", [])
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Build population of meaningful fields
+    meaningful = []
+    for ext_idx, ext in enumerate(extractions):
+        page_num = ext.get("page_num", ext_idx + 1)
+        fields = ext.get("fields", {})
+        for fname, fval in fields.items():
+            if fname.startswith("_"):
+                continue
+            field_id = f"{page_num}:{ext_idx}:{fname}"
+            # Get verification status
+            vfield = verified.get(field_id, {})
+            status = vfield.get("status", "unverified")
+            value = vfield.get("corrected_value", fval) if vfield.get("corrected_value") else fval
+            # Get the display value
+            if isinstance(fval, dict):
+                value = fval.get("value", fval)
+            if _is_meaningful_field(fname, value, status):
+                meaningful.append({
+                    "field_id": field_id,
+                    "field_name": fname,
+                    "value": value,
+                    "status": status,
+                    "page_num": page_num,
+                })
+
+    n = len(meaningful)
+    sample_size = _compute_audit_sample_size(n)
+
+    if n == 0:
+        return jsonify({
+            "sample": [],
+            "sample_size": 0,
+            "population_size": 0,
+            "message": "No meaningful fields to audit",
+        })
+
+    sample = random.sample(meaningful, min(sample_size, n))
+
+    return jsonify({
+        "sample": sample,
+        "sample_size": len(sample),
+        "population_size": n,
+    })
+
+
+@app.route("/api/post-run-audit/result/<job_id>", methods=["POST"])
+@require_login
+def post_run_audit_result(job_id):
+    """Store post-run audit results.
+
+    Expects JSON: {
+        "sample_size": N,
+        "pass_count": N,
+        "fail_count": N,
+        "results": [{"field_id": "...", "outcome": "pass"|"flag", "note": "..."}],
+        "reviewer": "..."
+    }
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    data = request.json or {}
+    audit_record = {
+        "job_id": job_id,
+        "timestamp": datetime.now().isoformat(),
+        "sample_size": data.get("sample_size", 0),
+        "pass_count": data.get("pass_count", 0),
+        "fail_count": data.get("fail_count", 0),
+        "results": data.get("results", []),
+        "reviewer": data.get("reviewer", ""),
+    }
+
+    # Store in job metadata
+    job["post_run_audit"] = audit_record
+    _save_jobs()
+
+    # Any flagged items get routed back into the review queue
+    flagged_ids = [r["field_id"] for r in audit_record["results"] if r.get("outcome") == "flag"]
+    if flagged_ids:
+        # Mark these fields as needing re-review by setting status to 'flagged'
+        vdata = _load_verifications(job_id)
+        for fid in flagged_ids:
+            if fid in vdata.get("fields", {}):
+                vdata["fields"][fid]["status"] = "flagged"
+                vdata["fields"][fid]["note"] = (vdata["fields"][fid].get("note", "") +
+                    " [AUDIT FLAG: " + next((r.get("note", "") for r in audit_record["results"] if r["field_id"] == fid), "") + "]").strip()
+        _save_verifications(job_id, vdata)
+
+    # Log event
+    log_event("info", "post_run_audit",
+              f"Audit complete: {audit_record['pass_count']}/{audit_record['sample_size']} passed",
+              job_id=job_id,
+              details_json=json.dumps(audit_record, default=str))
+
+    return jsonify({
+        "ok": True,
+        "pass_count": audit_record["pass_count"],
+        "fail_count": audit_record["fail_count"],
+        "flagged_field_ids": flagged_ids,
+    })
+
+
+# ─── B1: Review Chain — Stage Transitions ────────────────────────────────────
+
+@app.route("/api/jobs/<job_id>/submit-review", methods=["POST"])
+@require_login
+def submit_review(job_id):
+    """Advance job to the next review stage.
+
+    Validates current user's role can act at the current stage.
+    Advances review_stage to next stage in chain.
+    """
+    u = current_user()
+    if not u:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    stage = job.get("review_stage", "draft")
+
+    # Check user can act at this stage
+    if not can_act_at_stage(u["role"], stage):
+        return jsonify({"error": f"Your role ({u['role']}) cannot submit from stage: {STAGE_DISPLAY.get(stage, stage)}"}), 403
+
+    next_stage = STAGE_NEXT.get(stage)
+    if not next_stage:
+        return jsonify({"error": f"No next stage from {STAGE_DISPLAY.get(stage, stage)}"}), 400
+
+    _set_review_stage(job_id, next_stage, user=u)
+
+    return jsonify({
+        "ok": True,
+        "old_stage": stage,
+        "new_stage": next_stage,
+        "display": STAGE_DISPLAY.get(next_stage, next_stage),
+    })
+
+
+@app.route("/api/jobs/<job_id>/send-back", methods=["POST"])
+@require_login
+def send_back_review(job_id):
+    """Send job back to the previous review stage.
+
+    Only reviewer/partner (or admin) can send back. Requires a reason.
+    """
+    u = current_user()
+    if not u:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    stage = job.get("review_stage", "draft")
+    payload = request.get_json(silent=True) or {}
+    reason = (payload.get("reason") or "").strip()
+
+    if not reason:
+        return jsonify({"error": "A reason is required when sending back"}), 400
+
+    # Check user can act at this stage
+    if not can_act_at_stage(u["role"], stage):
+        return jsonify({"error": f"Your role ({u['role']}) cannot send back from stage: {STAGE_DISPLAY.get(stage, stage)}"}), 403
+
+    prev_stage = STAGE_PREV.get(stage)
+    if not prev_stage:
+        return jsonify({"error": f"Cannot send back from {STAGE_DISPLAY.get(stage, stage)}"}), 400
+
+    _set_review_stage(job_id, prev_stage, user=u)
+
+    # Log the send-back with reason
+    log_event("info", "review_stage_returned",
+              f"Job {job_id[:12]}: sent back to {STAGE_DISPLAY.get(prev_stage, prev_stage)} — {reason}",
+              user_id=u["id"],
+              job_id=job_id,
+              details={"old_stage": stage, "new_stage": prev_stage, "reason": reason})
+
+    return jsonify({
+        "ok": True,
+        "old_stage": stage,
+        "new_stage": prev_stage,
+        "display": STAGE_DISPLAY.get(prev_stage, prev_stage),
+    })
+
+
+@app.route("/api/jobs/<job_id>/stage")
+@require_login
+def get_job_stage(job_id):
+    """Return the current review stage for a job."""
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    stage = job.get("review_stage", "draft")
+    u = current_user()
+    user_role = u["role"] if u else "admin"
+    return jsonify({
+        "stage": stage,
+        "display": STAGE_DISPLAY.get(stage, stage),
+        "can_act": can_act_at_stage(user_role, stage),
+        "can_submit": stage in STAGE_NEXT,
+        "can_send_back": stage in STAGE_PREV,
+    })
+
+
+# ─── B1: Inbox Endpoint ─────────────────────────────────────────────────────
+
+@app.route("/api/inbox")
+@require_login
+def api_inbox():
+    """Return jobs assigned to the current user's review stage.
+
+    admin sees all non-final jobs.
+    preparer sees preparer_review jobs.
+    reviewer sees reviewer_review jobs.
+    partner sees partner_review jobs.
+    """
+    u = current_user()
+    if not u:
+        return jsonify({"inbox": []})
+
+    role = u["role"]
+    inbox = []
+
+    for jid, j in jobs.items():
+        if j.get("status") != "complete":
+            continue
+        stage = j.get("review_stage", "draft")
+        if stage == "final":
+            continue
+
+        # Filter by role
+        if role == "admin":
+            pass  # admin sees everything
+        elif role == "preparer" and stage != "preparer_review":
+            continue
+        elif role == "reviewer" and stage != "reviewer_review":
+            continue
+        elif role == "partner" and stage != "partner_review":
+            continue
+
+        inbox.append({
+            "job_id": jid,
+            "filename": j.get("filename", ""),
+            "client_name": j.get("client_name", ""),
+            "doc_type": j.get("doc_type", ""),
+            "review_stage": stage,
+            "stage_display": STAGE_DISPLAY.get(stage, stage),
+            "created": j.get("start_time", ""),
+            "stage_updated": j.get("stage_updated", ""),
+        })
+
+    # Sort by stage_updated descending (newest first)
+    inbox.sort(key=lambda x: x.get("stage_updated") or x.get("created") or "", reverse=True)
+
+    return jsonify({"inbox": inbox, "count": len(inbox)})
+
+
 # ─── End Guided Review Backend ───────────────────────────────────────────────
 
 @app.route("/api/download/<job_id>")
+@require_login
 def download_xlsx(job_id):
     job = jobs.get(job_id)
     if not job or not job.get("output_xlsx"):
@@ -3141,6 +5239,7 @@ def download_xlsx(job_id):
     abort(404)
 
 @app.route("/api/download-log/<job_id>")
+@require_login
 def download_log(job_id):
     job = jobs.get(job_id)
     if not job or not job.get("output_log"):
@@ -3167,6 +5266,7 @@ def _sanitize_job(j):
     return safe
 
 @app.route("/api/jobs")
+@require_login
 def list_jobs():
     q = request.args.get("q", "").strip().lower()
     dtype = request.args.get("doc_type", "").strip()
@@ -3251,7 +5351,7 @@ def _load_verifications(job_id):
         conn.close()
     return {"fields": {}, "updated": None, "reviewer": ""}
 
-def _save_verifications(job_id, data):
+def _save_verifications(job_id, data, skip_summary=False):
     data["updated"] = datetime.now().isoformat()
     conn = _get_db()
     try:
@@ -3265,8 +5365,9 @@ def _save_verifications(job_id, data):
         print(f"  Warning: Could not save verifications for {job_id}: {e}")
     finally:
         conn.close()
-    # Update job-level verification summary
-    _update_verify_summary(job_id, data)
+    # Update job-level verification summary (skipped in fast path — deferred to aftercare)
+    if not skip_summary:
+        _update_verify_summary(job_id, data)
 
 def _update_verify_summary(job_id, vdata):
     job = jobs.get(job_id)
@@ -3553,8 +5654,9 @@ def _upsert_verified_fields(job_id, incoming_fields):
             conn.execute(
                 """INSERT INTO verified_fields
                    (job_id, field_key, canonical_value, original_value, status,
-                    category, vendor_desc, note, reviewer, verified_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    category, vendor_desc, note, reviewer, verified_at,
+                    review_stage, reviewer_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_id, field_key) DO UPDATE SET
                        canonical_value = excluded.canonical_value,
                        original_value = excluded.original_value,
@@ -3563,7 +5665,9 @@ def _upsert_verified_fields(job_id, incoming_fields):
                        vendor_desc = excluded.vendor_desc,
                        note = excluded.note,
                        reviewer = excluded.reviewer,
-                       verified_at = excluded.verified_at""",
+                       verified_at = excluded.verified_at,
+                       review_stage = excluded.review_stage,
+                       reviewer_id = excluded.reviewer_id""",
                 (job_id, field_key,
                  json.dumps(canonical) if canonical is not None else None,
                  json.dumps(original) if original is not None else None,
@@ -3572,7 +5676,9 @@ def _upsert_verified_fields(job_id, incoming_fields):
                  decision.get("vendor_desc", ""),
                  decision.get("note", ""),
                  decision.get("reviewer", decision.get("reviewer", "")),
-                 decision.get("timestamp", now))
+                 decision.get("timestamp", now),
+                 decision.get("review_stage", ""),
+                 decision.get("reviewer_id"))
             )
 
         # Promote to client-level canonical store + unified facts table
@@ -3646,6 +5752,77 @@ def _upsert_verified_fields(job_id, incoming_fields):
         conn.commit()
     except sqlite3.Error as e:
         print(f"  Warning: Could not upsert verified_fields for {job_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _upsert_verified_fields_fast(job_id, incoming_fields):
+    """Fast-path: write verified_fields rows only. Skips canonical + FactStore (deferred to aftercare).
+
+    This is the synchronous hot-path version of _upsert_verified_fields. It writes only the
+    verified_fields table (the source of truth for the review UI) and returns immediately.
+    Canonical promotion and FactStore updates happen in the aftercare background thread.
+    """
+    if not incoming_fields:
+        return
+    conn = _get_db()
+    try:
+        log_data = _load_extraction_log(job_id)
+        now = datetime.now().isoformat()
+
+        for field_key, decision in incoming_fields.items():
+            status = decision.get("status", "")
+            if status == "_remove":
+                conn.execute(
+                    "DELETE FROM verified_fields WHERE job_id = ? AND field_key = ?",
+                    (job_id, field_key))
+                continue
+            if status not in ("confirmed", "corrected", "flagged"):
+                continue
+
+            canonical = None
+            original = None
+            if status == "corrected":
+                canonical = decision.get("corrected_value")
+                if log_data:
+                    original = _resolve_field_value(log_data, field_key)
+            elif status == "confirmed":
+                if log_data:
+                    original = _resolve_field_value(log_data, field_key)
+                    canonical = original
+            # flagged: canonical stays None
+
+            conn.execute(
+                """INSERT INTO verified_fields
+                   (job_id, field_key, canonical_value, original_value, status,
+                    category, vendor_desc, note, reviewer, verified_at,
+                    review_stage, reviewer_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, field_key) DO UPDATE SET
+                       canonical_value = excluded.canonical_value,
+                       original_value = excluded.original_value,
+                       status = excluded.status,
+                       category = excluded.category,
+                       vendor_desc = excluded.vendor_desc,
+                       note = excluded.note,
+                       reviewer = excluded.reviewer,
+                       verified_at = excluded.verified_at,
+                       review_stage = excluded.review_stage,
+                       reviewer_id = excluded.reviewer_id""",
+                (job_id, field_key,
+                 json.dumps(canonical) if canonical is not None else None,
+                 json.dumps(original) if original is not None else None,
+                 status,
+                 decision.get("category", ""),
+                 decision.get("vendor_desc", ""),
+                 decision.get("note", ""),
+                 decision.get("reviewer", ""),
+                 decision.get("timestamp", now),
+                 decision.get("review_stage", ""),
+                 decision.get("reviewer_id")))
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not fast-upsert verified_fields for {job_id}: {e}")
     finally:
         conn.close()
 
@@ -3832,10 +6009,12 @@ def get_verified_extractions(job_id):
 
 
 @app.route("/api/verify/<job_id>", methods=["GET"])
+@require_login
 def get_verifications(job_id):
     return jsonify(_load_verifications(job_id))
 
 @app.route("/api/verify/<job_id>", methods=["POST"])
+@require_login
 def save_verification(job_id):
     """Save one or more field verification decisions.
 
@@ -3850,8 +6029,20 @@ def save_verification(job_id):
     """
     payload = request.get_json(silent=True) or {}
     data = _load_verifications(job_id)
-    reviewer = payload.get("reviewer", data.get("reviewer", ""))
+
+    # B1: Session-enforced reviewer identity
+    u = current_user()
+    reviewer = u["display_name"] if u else payload.get("reviewer", data.get("reviewer", ""))
+    reviewer_id = u["id"] if u else None
     data["reviewer"] = reviewer
+
+    # B1: Check stage permission
+    job = jobs.get(job_id)
+    if job:
+        stage = job.get("review_stage", "draft")
+        user_role = u["role"] if u else "admin"
+        if stage in STAGE_ROLE_MAP and not can_act_at_stage(user_role, stage):
+            return jsonify({"error": f"Your role ({user_role}) cannot act at stage: {STAGE_DISPLAY.get(stage, stage)}"}), 403
 
     for key, decision in (payload.get("fields") or {}).items():
         if decision.get("status") == "_remove":
@@ -3859,6 +6050,8 @@ def save_verification(job_id):
         else:
             decision["timestamp"] = datetime.now().isoformat()
             decision["reviewer"] = reviewer
+            decision["reviewer_id"] = reviewer_id
+            decision["review_stage"] = job.get("review_stage", "") if job else ""
             data["fields"][key] = decision
 
             # Learn vendor → category mapping
@@ -3867,27 +6060,28 @@ def save_verification(job_id):
             if cat and vendor:
                 _learn_vendor_category(vendor, cat)
 
-    _save_verifications(job_id, data)
+    # ── FAST PATH (T-UX-CONFIRM-FASTPATH): minimal synchronous writes ──
+    incoming_fields = payload.get("fields") or {}
+    _save_verifications(job_id, data, skip_summary=True)
+    _upsert_verified_fields_fast(job_id, incoming_fields)
 
-    # Write field-level verified values to normalized table
-    _upsert_verified_fields(job_id, payload.get("fields", {}))
+    # Excel regen deferred to Finish Review (no auto-regen per field)
 
-    # Auto-regenerate Excel with corrections applied
-    _regen_excel(job_id)
-
-    # Sprint 2: Log verification event
-    field_count = len(payload.get("fields", {}))
+    # ── AFTERCARE: defer heavy work to background thread ──
     statuses = {}
-    for _fk, _fd in (payload.get("fields") or {}).items():
+    for _fk, _fd in incoming_fields.items():
         s = _fd.get("status", "unknown")
         statuses[s] = statuses.get(s, 0) + 1
-    verify_user = current_user()
-    log_event("info", "fact_verified",
-              f"Verified {field_count} field(s) on job {job_id[:12]}",
-              user_id=verify_user["id"] if verify_user else None,
-              job_id=job_id,
-              details={"reviewer": reviewer, "field_count": field_count,
-                       "statuses": statuses})
+
+    _enqueue_aftercare({
+        "job_id": job_id,
+        "incoming": incoming_fields,
+        "reviewer": reviewer,
+        "reviewer_id": reviewer_id,
+        "field_count": len(incoming_fields),
+        "statuses": statuses,
+        "mode": "grid",
+    })
 
     return jsonify({"ok": True, "total_reviewed": len(data["fields"])})
 
@@ -4236,6 +6430,78 @@ def get_client_documents(client_name):
     return jsonify({"documents": docs, "grouped": grouped})
 
 
+@app.route("/api/clients/<path:client_name>/files", methods=["GET"])
+def get_client_files(client_name):
+    """List actual files on disk for a client — source PDFs, outputs, context docs."""
+    safe = _safe_client_name(client_name)
+    client_base = CLIENTS_DIR / safe
+    files = {"source": [], "outputs": [], "context": []}
+
+    if not client_base.exists():
+        return jsonify({"files": files, "client_path": str(client_base)})
+
+    # Walk through all subdirectories
+    for root, dirs, filenames in os.walk(str(client_base)):
+        rel_root = os.path.relpath(root, str(client_base))
+        for fname in sorted(filenames):
+            if fname.startswith(".") or fname.endswith(".migrated"):
+                continue
+            full_path = os.path.join(root, fname)
+            finfo = {
+                "name": fname,
+                "path": full_path,
+                "rel_path": os.path.join(rel_root, fname) if rel_root != "." else fname,
+                "size_kb": round(os.path.getsize(full_path) / 1024, 1),
+                "modified": datetime.fromtimestamp(os.path.getmtime(full_path)).isoformat(),
+            }
+            lower = fname.lower()
+            if lower.endswith(".pdf"):
+                files["source"].append(finfo)
+            elif lower.endswith((".xlsx", ".json", ".csv")):
+                files["outputs"].append(finfo)
+            elif rel_root.startswith("context"):
+                files["context"].append(finfo)
+            else:
+                files["outputs"].append(finfo)
+
+    return jsonify({
+        "files": files,
+        "client_path": str(client_base),
+        "total_files": sum(len(v) for v in files.values()),
+    })
+
+
+@app.route("/api/clients/<path:client_name>/export-zip", methods=["GET"])
+def export_client_zip(client_name):
+    """Export entire client folder as a zip download."""
+    import zipfile
+    safe = _safe_client_name(client_name)
+    client_base = CLIENTS_DIR / safe
+
+    if not client_base.exists():
+        return jsonify({"error": "Client folder not found"}), 404
+
+    # Create zip in memory
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, filenames in os.walk(str(client_base)):
+            for fname in filenames:
+                if fname.startswith(".") or fname.endswith(".migrated"):
+                    continue
+                full_path = os.path.join(root, fname)
+                arcname = os.path.relpath(full_path, str(client_base))
+                zf.write(full_path, arcname)
+
+    zip_buffer.seek(0)
+    friendly = re.sub(r'[^\w\s\-]', '', safe).strip() or "client"
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"{friendly}_documents.zip",
+    )
+
+
 # ─── Prior-Year Context Routes ────────────────────────────────────────────────
 
 @app.route("/api/context/<path:client_name>", methods=["GET"])
@@ -4515,11 +6781,14 @@ def apply_batch_categories():
 
 # ─── Excel Regeneration ──────────────────────────────────────────────────────
 
-def _regen_excel(job_id):
+def _regen_excel(job_id, output_format_override=None):
     """Regenerate the Excel file with operator verification corrections applied.
 
     Uses get_verified_extractions() to overlay all confirmed/corrected values
     onto the raw extraction data, then calls extract.py --regen-excel to rebuild.
+
+    Args:
+        output_format_override: If set, pass --output-format to extract.py subprocess.
     """
     job = jobs.get(job_id)
     if not job or job.get("status") != "complete":
@@ -4554,6 +6823,9 @@ def _regen_excel(job_id):
             "--output", xlsx_path,
             "--year", str(year),
         ]
+
+        if output_format_override:
+            cmd.extend(["--output-format", output_format_override])
 
         # Write verified log to a temp file for extract.py to read
         corrected_log_path = log_path.replace("_log.json", "_corrected_log.json")
@@ -4825,12 +7097,17 @@ def _apply_corrections_to_excel(xlsx_path, corrections, reviewer=""):
 
 
 @app.route("/api/regen-excel/<job_id>", methods=["POST"])
+@require_login
 def regen_excel(job_id):
-    """Manually trigger Excel regeneration with verification corrections."""
+    """Manually trigger Excel regeneration with verification corrections.
+    Accepts optional JSON body: { "output_format": "tax_review" } to override format."""
     job = jobs.get(job_id)
     if not job or job.get("status") != "complete":
         return jsonify({"error": "Job not found or not complete"}), 404
-    ok = _regen_excel(job_id)
+    fmt_override = None
+    if request.is_json and request.json:
+        fmt_override = request.json.get("output_format")
+    ok = _regen_excel(job_id, output_format_override=fmt_override)
     return jsonify({"ok": ok})
 
 
@@ -5165,7 +7442,7 @@ MAIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bearden Document Intake</title>
+<title>OathLedger — Document Intake</title>
 <style>
 /* ═══ DESIGN SYSTEM ═══ */
 :root {
@@ -5544,15 +7821,20 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <!-- ═══ SIDEBAR ═══ -->
 <aside class="sidebar">
   <div class="sidebar-brand">
-    <h1>Bearden</h1>
-    <p>Document Intake Platform</p>
+    <h1>OathLedger</h1>
+    <p>Deterministic Accounting Intelligence</p>
   </div>
   <nav class="sidebar-nav">
     <a class="nav-item active" onclick="showSection('upload')" data-section="upload">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       <span>Upload</span>
     </a>
-    <a class="nav-item" onclick="showSection('review')" data-section="review" id="navReview" style="display:none">
+    <a class="nav-item" onclick="showSection('inbox')" data-section="inbox">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/></svg>
+      <span>Inbox</span>
+      <span class="nav-badge" id="inboxCount" style="display:none">0</span>
+    </a>
+    <a class="nav-item" onclick="openGridReview()" data-section="review" id="navReview" style="display:none">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
       <span>Review</span>
     </a>
@@ -5578,6 +7860,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <label>Reviewer
       <input type="text" id="reviewerInitials" maxlength="4" placeholder="JW" value="">
     </label>
+    <p style="font-size:9px;color:rgba(255,255,255,0.25);margin-top:8px;text-align:center;">OathLedger — Deterministic Accounting Intelligence</p>
   </div>
 </aside>
 
@@ -5627,15 +7910,15 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
             <div class="pill-group" id="docTypePills"></div>
           </div>
 
-          <div class="form-group">
-            <label class="form-label">Output Format</label>
-            <div class="pill-group" id="outputFormatPills"></div>
-          </div>
-
-          <div class="form-group">
-            <label class="form-label">AI Instructions</label>
-            <textarea id="aiInstructions" class="form-input" rows="3" placeholder="Tell the AI how to handle this document. Example: 'This is a trust return — extract K-1 box 1-14 only' or 'Combine all 1099-DIV pages into one entry per payer'"></textarea>
-          </div>
+          <details style="margin-top:8px">
+            <summary style="cursor:pointer;font-size:13px;color:var(--text-muted);user-select:none">&#x2699; Advanced Options</summary>
+            <div style="margin-top:8px">
+              <div class="form-group">
+                <label class="form-label">AI Instructions</label>
+                <textarea id="aiInstructions" class="form-input" rows="3" placeholder="Tell the AI how to handle this document. Example: 'This is a trust return — extract K-1 box 1-14 only' or 'Combine all 1099-DIV pages into one entry per payer'"></textarea>
+              </div>
+            </div>
+          </details>
 
           <details style="margin-bottom:16px">
             <summary style="font-size:12px; font-weight:600; color:var(--text-secondary); cursor:pointer; padding:4px 0;">Advanced Options</summary>
@@ -5667,6 +7950,19 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
           </button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ INBOX SECTION (B1: Review Chain) ═══ -->
+<div class="section" id="sec-inbox">
+  <div class="page-header">
+    <h2>Inbox</h2>
+    <p>Documents assigned to your review stage</p>
+  </div>
+  <div class="page-content">
+    <div id="inboxContent" style="display:flex;flex-direction:column;gap:12px">
+      <p style="color:var(--text-muted)">Loading...</p>
     </div>
   </div>
 </div>
@@ -5740,14 +8036,19 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <!-- ═══ GUIDED REVIEW SECTION ═══ -->
 <div class="section" id="sec-guided-review">
   <div class="guided-header">
-    <div class="guided-progress">
-      <span class="guided-progress-text" id="guidedProgressText">0 of 0</span>
-      <div class="guided-progress-bar">
-        <div class="guided-progress-fill" id="guidedProgressBar" style="width:0%"></div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <button class="btn btn-secondary btn-sm" onclick="guidedGoBack()" id="guidedBackBtn" disabled title="Go to previous field (Backspace)">&#9664; Back</button>
+      <div class="guided-progress">
+        <span class="guided-progress-text" id="guidedProgressText">0 of 0</span>
+        <div class="guided-progress-bar">
+          <div class="guided-progress-fill" id="guidedProgressBar" style="width:0%"></div>
+        </div>
       </div>
     </div>
     <div class="guided-actions-top">
-      <button class="btn btn-secondary btn-sm" onclick="showSection('review')">Grid View</button>
+      <span id="guidedStageBadge" style="font-size:12px;font-weight:600;color:#fff;padding:3px 10px;border-radius:12px;margin-right:8px;display:none"></span>
+      <span id="guidedReviewerBadge" style="font-size:12px;color:var(--text-muted);margin-right:8px"></span>
+      <button class="btn btn-secondary btn-sm" onclick="openGridReview()">&#x2630; List View</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
     </div>
   </div>
@@ -5762,16 +8063,21 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <div class="guided-field-value" id="guidedValue"></div>
       <div class="guided-field-meta" id="guidedMeta"></div>
       <div class="guided-actions" id="guidedBtns">
-        <button class="btn btn-success" onclick="guidedAction('confirm')">Confirm <kbd>Y</kbd></button>
-        <button class="btn btn-primary" onclick="guidedStartEdit()">Edit <kbd>E</kbd></button>
-        <button class="btn btn-danger" onclick="guidedAction('not_present')">Not Present <kbd>N</kbd></button>
-        <button class="btn btn-secondary" onclick="guidedAction('skip')">Skip <kbd>S</kbd></button>
+        <button class="btn btn-success" onclick="guidedAction('confirm')">&#x2714; Confirm <kbd>Y</kbd></button>
+        <button class="btn btn-primary" onclick="guidedStartEdit()">&#x270F; Edit <kbd>E</kbd></button>
+        <button class="btn btn-danger" onclick="guidedAction('not_present')">&#x2716; Not Present <kbd>N</kbd></button>
+        <button class="btn btn-secondary" onclick="guidedAction('skip')">&#x23ED; Skip <kbd>S</kbd></button>
+      </div>
+      <div class="guided-note-area" id="guidedNoteArea">
+        <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+          <input type="text" class="form-input" id="guidedNoteInput" placeholder="Add a note (optional)..." style="flex:1;font-size:13px">
+        </div>
       </div>
       <div class="guided-edit-area" id="guidedEditArea" style="display:none">
         <input type="text" class="guided-edit-input" id="guidedEditInput" placeholder="Enter corrected value...">
         <div class="guided-edit-btns">
-          <button class="btn btn-success" onclick="guidedFinishEdit()">Save Correction</button>
-          <button class="btn btn-secondary" onclick="guidedCancelEdit()">Cancel</button>
+          <button class="btn btn-success" onclick="guidedFinishEdit()">Save Correction <kbd>Enter</kbd></button>
+          <button class="btn btn-secondary" onclick="guidedCancelEdit()">Cancel <kbd>Esc</kbd></button>
         </div>
       </div>
     </div>
@@ -5792,10 +8098,13 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <div class="client-back" onclick="closeClientDetail()">&#9664; Back to all clients</div>
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px">
         <h2 id="clientDetailName" style="font-size:20px;font-weight:700;color:var(--navy);margin:0"></h2>
+        <button class="btn btn-secondary btn-sm" onclick="copyClientPath()" title="Copy folder path to clipboard">&#x1F4CB; Copy Path</button>
+        <button class="btn btn-secondary btn-sm" onclick="exportClientZip()" title="Download client folder as zip">&#x1F4E6; Export Zip</button>
         <button class="btn btn-ghost btn-sm" onclick="openMergeClientModal()" title="Merge into another client" style="color:var(--purple)">&#x21C4; Merge</button>
         <button class="btn btn-ghost btn-sm" onclick="openDeleteClientModal()" title="Delete this client" style="color:var(--red)">&#x1F5D1; Delete</button>
       </div>
       <div id="clientDetailMeta" style="font-size:13px;color:var(--text-secondary);margin-bottom:16px"></div>
+      <div id="clientFilePath" style="font-size:11px;color:var(--text-muted);margin-bottom:8px;display:none"></div>
       <div class="client-tabs">
         <div class="client-tab active" data-tab="documents" onclick="showClientTab('documents')">Documents</div>
         <div class="client-tab" data-tab="context" onclick="showClientTab('context')">Prior-Year Context</div>
@@ -6032,10 +8341,94 @@ function showSection(id) {
   if (id === 'history') loadJobs();
   if (id === 'clients') loadClients();
   if (id === 'batch') loadBatchData();
+  if (id === 'inbox') loadInbox();
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function getReviewer() { return (document.getElementById('reviewerInitials').value || '').trim(); }
+
+// ─── B1: Inbox ───
+var _currentUserRole = 'admin';
+var _currentUserName = '';
+
+function loadInbox() {
+  fetch('/api/inbox').then(r => r.json()).then(data => {
+    var items = data.inbox || [];
+    var el = document.getElementById('inboxContent');
+    var badge = document.getElementById('inboxCount');
+
+    if (badge) {
+      if (items.length > 0) {
+        badge.textContent = items.length;
+        badge.style.display = '';
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+
+    if (items.length === 0) {
+      el.innerHTML = '<div class="card"><div class="card-body" style="text-align:center;padding:48px;color:var(--text-muted)">' +
+        '<div style="font-size:48px;margin-bottom:12px">&#x2705;</div>' +
+        '<h3 style="margin:0 0 8px;color:var(--navy)">Inbox Empty</h3>' +
+        '<p style="margin:0">No documents waiting for your review.</p>' +
+        '</div></div>';
+      return;
+    }
+
+    var stageColors = {
+      'preparer_review': '#3B82F6',
+      'reviewer_review': '#F59E0B',
+      'partner_review': '#8B5CF6',
+      'draft': '#94A3B8',
+      'final': '#10B981'
+    };
+
+    var html = '<div class="card"><div class="card-body" style="padding:0"><table class="data-table" style="width:100%">' +
+      '<thead><tr><th>Client</th><th>Document</th><th>Stage</th><th>Updated</th><th></th></tr></thead><tbody>';
+
+    items.forEach(function(item) {
+      var color = stageColors[item.review_stage] || '#94A3B8';
+      var updated = item.stage_updated ? new Date(item.stage_updated).toLocaleDateString() : '';
+      html += '<tr>' +
+        '<td style="padding:10px 12px;font-weight:600">' + esc(item.client_name || 'Unknown') + '</td>' +
+        '<td style="padding:10px 12px">' + esc(item.filename || '') + '</td>' +
+        '<td style="padding:10px 12px"><span style="background:' + color + ';color:#fff;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600">' + esc(item.stage_display) + '</span></td>' +
+        '<td style="padding:10px 12px;color:var(--text-muted);font-size:13px">' + updated + '</td>' +
+        '<td style="padding:10px 12px"><button class="btn btn-sm btn-primary" onclick=\'openReviewFromInbox(' + JSON.stringify(item.job_id) + ',' + JSON.stringify(item.client_name || '') + ')\'>Review</button></td>' +
+        '</tr>';
+    });
+
+    html += '</tbody></table></div></div>';
+    el.innerHTML = html;
+  }).catch(function(e) {
+    document.getElementById('inboxContent').innerHTML = '<p style="color:var(--error)">Failed to load inbox: ' + e + '</p>';
+  });
+}
+
+function openReviewFromInbox(jobId, clientName) {
+  var job = { id: jobId, client_name: clientName || '' };
+  _loadReviewData(job, function() {
+    openGuidedReview();
+  });
+}
+
+function refreshInboxBadge() {
+  fetch('/api/inbox').then(r => r.json()).then(data => {
+    var badge = document.getElementById('inboxCount');
+    var count = (data.inbox || []).length;
+    if (badge) {
+      badge.textContent = count;
+      badge.style.display = count > 0 ? '' : 'none';
+    }
+  }).catch(function() {});
+}
+
+// Load user info and inbox badge on startup
+fetch('/api/me').then(r => r.json()).then(data => {
+  _currentUserRole = data.role || 'admin';
+  _currentUserName = data.display_name || '';
+  refreshInboxBadge();
+}).catch(function() {});
 
 // ─── Upload ───
 const dropZone = document.getElementById('dropZone');
@@ -6079,7 +8472,7 @@ function startExtraction() {
   fd.append('year', document.getElementById('taxYear').value);
   fd.append('client_name', cn);
   fd.append('doc_type', selectedDocType);
-  fd.append('output_format', selectedOutputFormat);
+  fd.append('output_format', 'tax_review');  // Default; user picks format at Finish Review
   fd.append('user_notes', document.getElementById('userNotes').value);
   fd.append('ai_instructions', document.getElementById('aiInstructions').value);
   fd.append('skip_verify', document.getElementById('skipVerify').checked ? 'true' : 'false');
@@ -6185,10 +8578,16 @@ function pollStatus() {
 
 // ─── Review ───
 function openReview(job) {
-  showSection('review');
   currentJobId = job.id || job.job_id || currentJobId;
   document.getElementById('navReview').style.display = '';
   document.getElementById('navGuidedReview').style.display = '';
+  // Load review data first, then open guided review as default
+  _loadReviewData(job, function() { openGuidedReview(); });
+  return;
+}
+// Load review data without switching section (used by both guided and grid)
+function _loadReviewData(job, callback) {
+  currentJobId = job.id || job.job_id || currentJobId;
 
   Promise.all([
     fetch('/api/results/' + currentJobId).then(r => r.json()),
@@ -6219,7 +8618,17 @@ function openReview(job) {
     countTotalFields();
     updateVerifyBar();
     loadPage(1);
-  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); });
+    if (callback) callback();
+  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); if (callback) callback(); });
+}
+
+// Open grid view explicitly (from "List View" button in guided review)
+function openGridReview() {
+  if (!reviewData && currentJobId) {
+    _loadReviewData({ id: currentJobId }, function() { showSection('review'); });
+  } else {
+    showSection('review');
+  }
 }
 
 // ─── Early Review (T1.5) ───
@@ -6987,6 +9396,36 @@ function openClientDetail(name) {
   loadClientInfo(name);
   loadContextDocs(name);
   loadInstructions(name);
+  // Load file path info
+  fetch('/api/clients/'+encodeURIComponent(name)+'/files').then(function(r){return r.json();}).then(function(data) {
+    var pathEl = document.getElementById('clientFilePath');
+    if (data.client_path) {
+      pathEl.textContent = data.client_path;
+      pathEl.style.display = '';
+      pathEl.dataset.path = data.client_path;
+    }
+  }).catch(function(){});
+}
+function copyClientPath() {
+  var pathEl = document.getElementById('clientFilePath');
+  var path = pathEl ? pathEl.dataset.path : '';
+  if (!path && currentClientName) { path = 'clients/' + currentClientName; }
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(path).then(function() {
+      showToast('Path copied: ' + path, 'success');
+    });
+  } else {
+    // Fallback
+    var ta = document.createElement('textarea');
+    ta.value = path; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('Path copied: ' + path, 'success');
+  }
+}
+function exportClientZip() {
+  if (!currentClientName) { showToast('No client selected', 'error'); return; }
+  window.open('/api/clients/' + encodeURIComponent(currentClientName) + '/export-zip', '_blank');
 }
 function closeClientDetail() {
   document.getElementById('clientListView').style.display = '';
@@ -7236,16 +9675,23 @@ document.addEventListener('keydown', function(e) {
       if (e.key === 'Enter') { guidedFinishEdit(); e.preventDefault(); }
       else if (e.key === 'Escape') { guidedCancelEdit(); e.preventDefault(); }
     }
+    // Allow normal typing in guided note input
+    if (e.target.id === 'guidedNoteInput') {
+      return;
+    }
     return;
   }
   const sec = document.querySelector('.section.active');
   // Guided review shortcuts
   if (sec && sec.id === 'sec-guided-review') {
+    // Skip shortcuts when note input is focused
+    if (e.target.id === 'guidedNoteInput') return;
     if (e.key === '?') { toggleKbdHelp(); return; }
     if (e.key === 'y' || e.key === 'Y') { guidedAction('confirm'); e.preventDefault(); }
     else if (e.key === 'e' || e.key === 'E') { guidedStartEdit(); e.preventDefault(); }
     else if (e.key === 'n' || e.key === 'N') { guidedAction('not_present'); e.preventDefault(); }
     else if (e.key === 's' || e.key === 'S') { guidedAction('skip'); e.preventDefault(); }
+    else if (e.key === 'Backspace') { guidedGoBack(); e.preventDefault(); }
     else if (e.key === 'Escape') { guidedCancelEdit(); e.preventDefault(); }
     return;
   }
@@ -7418,13 +9864,37 @@ var guidedIdx = 0;
 var guidedCurrentItem = null;
 var guidedHeartbeatTimer = null;
 var guidedJobId = null;
+var guidedHistory = [];  // Stack of previously viewed field_ids for Back navigation
+var guidedReviewer = '';  // Will be populated from /api/me
+
+// Auto-populate reviewer from session on page load
+(function() {
+  fetch('/api/me').then(function(r) { return r.json(); }).then(function(u) {
+    guidedReviewer = u.display_name || u.username || '';
+    var badge = document.getElementById('guidedReviewerBadge');
+    if (badge && guidedReviewer) badge.textContent = 'Reviewing as: ' + guidedReviewer;
+    // Also fill legacy initials field if empty
+    var ini = document.getElementById('reviewerInitials');
+    if (ini && !ini.value && u.initials) ini.value = u.initials;
+  }).catch(function() {});
+})();
+
+function _getGuidedReviewer() {
+  return guidedReviewer || getReviewer() || 'operator';
+}
 
 function openGuidedReview() {
   guidedJobId = currentJobId;
   if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
   showSection('guided-review');
+  guidedHistory = [];
+  document.getElementById('guidedBackBtn').disabled = true;
   document.getElementById('guidedDetail').style.opacity = '0.5';
   document.getElementById('guidedEvidence').innerHTML = '<div class="empty-state" style="color:rgba(255,255,255,0.5)"><p>Loading queue...</p></div>';
+
+  // B1: Show stage badge
+  _updateStageBadge();
+
   fetch('/api/guided-review/queue/' + guidedJobId)
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -7440,13 +9910,29 @@ function openGuidedReview() {
     .catch(function(e) { showToast('Failed to load queue: ' + e, 'error'); });
 }
 
+function _updateStageBadge() {
+  var badge = document.getElementById('guidedStageBadge');
+  if (!badge || !guidedJobId) return;
+  fetch('/api/jobs/' + guidedJobId + '/stage').then(r => r.json()).then(function(info) {
+    var colors = {'preparer_review':'#3B82F6','reviewer_review':'#F59E0B','partner_review':'#8B5CF6','final':'#10B981','draft':'#94A3B8'};
+    badge.textContent = info.display || info.stage;
+    badge.style.background = colors[info.stage] || '#94A3B8';
+    badge.style.display = '';
+    if (!info.can_act && info.stage !== 'final') {
+      badge.title = 'Read-only: your role cannot act at this stage';
+    } else {
+      badge.title = '';
+    }
+  }).catch(function() { badge.style.display = 'none'; });
+}
+
 function updateGuidedProgress(reviewed, total) {
   var pct = total > 0 ? Math.round(reviewed / total * 100) : 0;
   document.getElementById('guidedProgressText').textContent = reviewed + ' of ' + total + ' reviewed';
   document.getElementById('guidedProgressBar').style.width = pct + '%';
 }
 
-function loadGuidedItem() {
+function loadGuidedItem(skipHistory) {
   if (guidedIdx >= guidedQueue.length) {
     // Reload queue to check for remaining items
     fetch('/api/guided-review/queue/' + guidedJobId)
@@ -7465,9 +9951,17 @@ function loadGuidedItem() {
   }
 
   var item = guidedQueue[guidedIdx];
+  // Push to history for Back navigation (unless we're going back)
+  if (!skipHistory && guidedCurrentItem) {
+    guidedHistory.push(guidedCurrentItem.field_id);
+    document.getElementById('guidedBackBtn').disabled = false;
+  }
+
   document.getElementById('guidedDetail').style.opacity = '0.5';
   document.getElementById('guidedEditArea').style.display = 'none';
   document.getElementById('guidedBtns').style.display = '';
+  // Clear note field
+  document.getElementById('guidedNoteInput').value = '';
 
   fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(item.field_id))
     .then(function(r) { return r.json(); })
@@ -7476,7 +9970,7 @@ function loadGuidedItem() {
       guidedCurrentItem = data;
       renderGuidedItem(data);
       // Acquire lock
-      var reviewer = getReviewer();
+      var reviewer = _getGuidedReviewer();
       if (reviewer) {
         fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(item.field_id), {
           method: 'POST',
@@ -7506,14 +10000,44 @@ function loadGuidedItem() {
     .catch(function(e) { showToast('Failed to load item: ' + e, 'error'); });
 }
 
+function guidedGoBack() {
+  if (guidedHistory.length === 0) return;
+  var prevFieldId = guidedHistory.pop();
+  if (guidedHistory.length === 0) document.getElementById('guidedBackBtn').disabled = true;
+  // Find the field in current queue, or fetch it directly
+  var foundIdx = -1;
+  for (var i = 0; i < guidedQueue.length; i++) {
+    if (guidedQueue[i].field_id === prevFieldId) { foundIdx = i; break; }
+  }
+  if (foundIdx >= 0) {
+    guidedIdx = foundIdx;
+    loadGuidedItem(true);
+  } else {
+    // Field was already confirmed/removed from queue — load directly
+    document.getElementById('guidedDetail').style.opacity = '0.5';
+    document.getElementById('guidedEditArea').style.display = 'none';
+    document.getElementById('guidedBtns').style.display = '';
+    document.getElementById('guidedNoteInput').value = '';
+    fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(prevFieldId))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) { showToast(data.error, 'error'); return; }
+        guidedCurrentItem = data;
+        renderGuidedItem(data);
+      });
+  }
+}
+
 function renderGuidedItem(data) {
   document.getElementById('guidedDetail').style.opacity = '1';
-  // Evidence image
+  // Evidence image — cropped highlight preferred, full page with banner as fallback
   var evEl = document.getElementById('guidedEvidence');
   if (data.evidence_url) {
-    evEl.innerHTML = '<img src="' + esc(data.evidence_url) + '" alt="Evidence for ' + esc(data.field_name) + '">';
+    evEl.innerHTML = '<img src="' + esc(data.evidence_url) + '" alt="Evidence for ' + esc(data.field_name) + '" style="max-width:100%;height:auto">';
   } else if (data.page_url) {
-    evEl.innerHTML = '<img src="' + esc(data.page_url) + '" alt="Page ' + data.page_num + '">';
+    evEl.innerHTML = '<div style="background:#FFF3CD;color:#856404;padding:6px 12px;font-size:12px;text-align:center;border-radius:4px;margin-bottom:4px">' +
+      '&#x26A0; Exact location uncertain — showing full page</div>' +
+      '<img src="' + esc(data.page_url) + '" alt="Page ' + data.page_num + '" style="max-width:100%;height:auto">';
   }
   // Field label + destination
   document.getElementById('guidedLabel').textContent = data.display_name || data.field_name;
@@ -7544,7 +10068,8 @@ function renderGuidedItem(data) {
 
 function guidedAction(action) {
   if (!guidedCurrentItem || !guidedJobId) return;
-  var body = { action: action, reviewer: getReviewer() };
+  var noteVal = (document.getElementById('guidedNoteInput').value || '').trim();
+  var body = { action: action, reviewer: _getGuidedReviewer(), note: noteVal };
   if (action === 'correct') {
     body.corrected_value = document.getElementById('guidedEditInput').value.trim();
     if (!body.corrected_value) { showToast('Enter a corrected value', 'error'); return; }
@@ -7614,14 +10139,359 @@ function guidedCancelEdit() {
 function showGuidedComplete(reviewed, total) {
   if (guidedHeartbeatTimer) { clearInterval(guidedHeartbeatTimer); guidedHeartbeatTimer = null; }
   guidedCurrentItem = null;
-  document.getElementById('guidedEvidence').innerHTML = '';
-  document.getElementById('guidedDetail').innerHTML =
-    '<div class="guided-complete">' +
-    '<h2>&#x2714; Review Complete</h2>' +
-    '<p>' + reviewed + ' of ' + total + ' fields reviewed</p>' +
-    '<button class="btn btn-primary" onclick="showSection(\'review\')">Return to Grid View</button> ' +
-    '<button class="btn btn-secondary" onclick="openGuidedReview()">Refresh Queue</button>' +
+
+  // Fetch current stage info to decide what buttons to show
+  fetch('/api/jobs/' + guidedJobId + '/stage').then(r => r.json()).then(function(stageInfo) {
+    _renderGuidedComplete(reviewed, total, stageInfo);
+  }).catch(function() {
+    _renderGuidedComplete(reviewed, total, { stage: 'preparer_review', can_act: true, can_submit: true, can_send_back: false, display: 'Preparer Review' });
+  });
+}
+
+function _renderGuidedComplete(reviewed, total, stageInfo) {
+  var stage = stageInfo.stage || 'preparer_review';
+  var canAct = stageInfo.can_act;
+  var stageDisplay = stageInfo.display || stage;
+
+  var stageColors = {
+    'preparer_review': '#3B82F6',
+    'reviewer_review': '#F59E0B',
+    'partner_review': '#8B5CF6',
+    'final': '#10B981',
+    'draft': '#94A3B8'
+  };
+  var stageColor = stageColors[stage] || '#94A3B8';
+
+  // Left panel — completion summary with stage badge
+  document.getElementById('guidedEvidence').innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.8);text-align:center;padding:40px">' +
+    '<div style="font-size:64px;margin-bottom:16px">&#x2714;</div>' +
+    '<h2 style="color:#fff;margin:0 0 8px">Review Complete</h2>' +
+    '<p style="font-size:18px;margin:0 0 16px">' + reviewed + ' of ' + total + ' fields reviewed</p>' +
+    '<div style="background:' + stageColor + ';color:#fff;padding:6px 16px;border-radius:16px;font-size:14px;font-weight:600">' + esc(stageDisplay) + '</div>' +
     '</div>';
+
+  // Right panel — stage-dependent actions
+  var html = '<div class="guided-complete" style="padding:32px">';
+
+  if (stage === 'final') {
+    // Already finalized — just show download buttons
+    html += '<h2 style="margin:0 0 8px">Review Finalized</h2>' +
+      '<p style="color:#10B981;margin:0 0 24px">This document has been finalized through all review stages.</p>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:8px">' +
+      '<button class="btn btn-success" onclick="window.open(\'/api/download/' + guidedJobId + '\',\'_blank\')">&#x2B73; Download Excel</button>' +
+      '<button class="btn btn-secondary" onclick="window.open(\'/api/download-log/' + guidedJobId + '\',\'_blank\')">&#x2B73; Download JSON</button>' +
+      '<button class="btn btn-ghost" onclick="showSection(\'inbox\')">&#x1F4E5; Back to Inbox</button>' +
+      '</div>';
+  } else if (stage === 'preparer_review') {
+    html += '<h2 style="margin:0 0 8px">Finish Preparer Review</h2>' +
+      '<p style="color:var(--text-muted);margin:0 0 24px">All fields reviewed. Submit to the next reviewer, or generate reports.</p>';
+    // Report format selection
+    html += _reportFormatCheckboxes();
+    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
+      '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x27A1; Submit to Reviewer</button>' +
+      '<button class="btn btn-secondary" onclick="finishReviewGenerate()" style="font-size:14px;padding:10px 20px">&#x1F4C4; Generate Reports</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check Queue</button>' +
+      '<button class="btn btn-ghost" onclick="openGridReview()">&#x2630; List View</button>' +
+      '</div>';
+  } else if (stage === 'reviewer_review') {
+    html += '<h2 style="margin:0 0 8px">Finish Reviewer Review</h2>' +
+      '<p style="color:var(--text-muted);margin:0 0 24px">All fields reviewed. Approve to Partner, send back to Preparer, or generate reports.</p>';
+    html += _reportFormatCheckboxes();
+    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
+      '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x2705; Approve &rarr; Partner</button>' +
+      '<button class="btn btn-warning" onclick="sendBackToPrev()" style="font-size:14px;padding:10px 20px;background:#F59E0B;color:#fff;border:none;border-radius:6px;cursor:pointer">&#x21A9; Send Back to Preparer</button>' +
+      '<button class="btn btn-secondary" onclick="finishReviewGenerate()">&#x1F4C4; Generate Reports</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check</button>' +
+      '</div>';
+  } else if (stage === 'partner_review') {
+    html += '<h2 style="margin:0 0 8px">Partner Final Review</h2>' +
+      '<p style="color:var(--text-muted);margin:0 0 24px">All fields reviewed. Finalize to complete the review chain, or send back.</p>';
+    html += _reportFormatCheckboxes();
+    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
+      '<button class="btn btn-success" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x1F3C6; Finalize</button>' +
+      '<button class="btn btn-warning" onclick="sendBackToPrev()" style="font-size:14px;padding:10px 20px;background:#F59E0B;color:#fff;border:none;border-radius:6px;cursor:pointer">&#x21A9; Send Back to Reviewer</button>' +
+      '<button class="btn btn-secondary" onclick="finishReviewGenerate()">&#x1F4C4; Generate Reports</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check</button>' +
+      '</div>';
+  } else {
+    // draft or unknown — generic finish
+    html += '<h2 style="margin:0 0 8px">Finish Review</h2>' +
+      '<p style="color:var(--text-muted);margin:0 0 24px">All fields reviewed.</p>';
+    html += _reportFormatCheckboxes();
+    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
+      '<button class="btn btn-primary" onclick="finishReviewGenerate()" style="font-size:14px;padding:10px 20px">&#x1F4C4; Generate Selected Reports</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check Queue</button>' +
+      '<button class="btn btn-ghost" onclick="openGridReview()">&#x2630; List View</button>' +
+      '</div>';
+  }
+
+  html += '</div>';
+  document.getElementById('guidedDetail').innerHTML = html;
+  document.getElementById('guidedDetail').style.opacity = '1';
+}
+
+function _reportFormatCheckboxes() {
+  return '<div style="margin-bottom:8px">' +
+    '<h3 style="font-size:14px;margin:0 0 12px;color:var(--navy)">Generate Reports</h3>' +
+    '<p style="font-size:12px;color:var(--text-muted);margin:0 0 12px">Select report formats to generate from verified data:</p>' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px;cursor:pointer">' +
+    '<input type="checkbox" id="frFmtTaxReview" checked> Tax Review Worksheet</label>' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px;cursor:pointer">' +
+    '<input type="checkbox" id="frFmtJournal"> Journal Entries <span style="font-size:11px;color:var(--text-muted)">(bank/payroll only)</span></label>' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px;cursor:pointer">' +
+    '<input type="checkbox" id="frFmtAcctBal"> Account Balances <span style="font-size:11px;color:var(--text-muted)">(bank/payroll only)</span></label>' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px;cursor:pointer">' +
+    '<input type="checkbox" id="frFmtTrialBal"> Trial Balance <span style="font-size:11px;color:var(--text-muted)">(bank/payroll only)</span></label>' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:14px;cursor:pointer">' +
+    '<input type="checkbox" id="frFmtTxnReg"> Transaction Register <span style="font-size:11px;color:var(--text-muted)">(bank/payroll only)</span></label>' +
+    '</div>';
+}
+
+function submitToNextStage() {
+  if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
+  fetch('/api/jobs/' + guidedJobId + '/submit-review', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({})
+  }).then(r => r.json()).then(function(data) {
+    if (data.error) { showToast(data.error, 'error'); return; }
+    showToast('Submitted! Moved to: ' + data.display, 'success');
+    refreshInboxBadge();
+    // If moving to final, chain into report generation + audit
+    if (data.new_stage === 'final') {
+      finishReviewGenerate();
+    } else {
+      // Go back to inbox
+      setTimeout(function() { showSection('inbox'); }, 1200);
+    }
+  }).catch(function(e) { showToast('Submit failed: ' + e, 'error'); });
+}
+
+function sendBackToPrev() {
+  if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
+  var reason = prompt('Reason for sending back:');
+  if (!reason || !reason.trim()) { showToast('A reason is required', 'error'); return; }
+  fetch('/api/jobs/' + guidedJobId + '/send-back', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ reason: reason.trim() })
+  }).then(r => r.json()).then(function(data) {
+    if (data.error) { showToast(data.error, 'error'); return; }
+    showToast('Sent back to: ' + data.display, 'success');
+    refreshInboxBadge();
+    setTimeout(function() { showSection('inbox'); }, 1200);
+  }).catch(function(e) { showToast('Send back failed: ' + e, 'error'); });
+}
+
+function finishReviewGenerate() {
+  if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
+  var formats = [];
+  if (document.getElementById('frFmtTaxReview').checked) formats.push('tax_review');
+  if (document.getElementById('frFmtJournal').checked) formats.push('journal_entries');
+  if (document.getElementById('frFmtAcctBal').checked) formats.push('account_balances');
+  if (document.getElementById('frFmtTrialBal').checked) formats.push('trial_balance');
+  if (document.getElementById('frFmtTxnReg').checked) formats.push('transaction_register');
+  if (formats.length === 0) { showToast('Select at least one report format', 'error'); return; }
+
+  showToast('Generating ' + formats.length + ' report(s)...', 'info');
+
+  // Generate each selected format
+  var completed = 0;
+  var failed = 0;
+  formats.forEach(function(fmt) {
+    fetch('/api/regen-excel/' + guidedJobId, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ output_format: fmt })
+    }).then(function(r) { return r.json(); })
+      .then(function(data) {
+        completed++;
+        if (data.error) { failed++; showToast('Failed: ' + fmt + ' — ' + data.error, 'error'); }
+        if (completed === formats.length) {
+          if (failed === 0) {
+            showToast('Reports generated. Starting audit sample...', 'success');
+          }
+          // Chain into post-run audit
+          startPostRunAudit();
+        }
+      })
+      .catch(function() { completed++; failed++; });
+  });
+}
+
+// ─── Post-Run Audit UI ───────────────────────────────────────────────────
+var auditSample = [];
+var auditIdx = 0;
+var auditResults = [];
+
+function startPostRunAudit() {
+  if (!guidedJobId) return;
+  fetch('/api/post-run-audit/sample/' + guidedJobId)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      auditSample = data.sample || [];
+      auditIdx = 0;
+      auditResults = [];
+      if (auditSample.length === 0) {
+        showAuditComplete();
+        return;
+      }
+      showAuditItem();
+    })
+    .catch(function(e) { showToast('Audit sample failed: ' + e, 'error'); });
+}
+
+function showAuditItem() {
+  if (auditIdx >= auditSample.length) {
+    submitAuditResults();
+    return;
+  }
+  var item = auditSample[auditIdx];
+  var pct = Math.round((auditIdx / auditSample.length) * 100);
+
+  // Update left panel with evidence
+  var evEl = document.getElementById('guidedEvidence');
+  evEl.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.7);text-align:center;padding:20px">' +
+    '<div style="font-size:13px;margin-bottom:12px;color:rgba(255,255,255,0.5)">POST-RUN AUDIT</div>' +
+    '<div style="font-size:14px;margin-bottom:20px">' + (auditIdx + 1) + ' of ' + auditSample.length + '</div>' +
+    '</div>';
+
+  // Load full item detail with evidence
+  fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(item.field_id))
+    .then(function(r) { return r.json(); })
+    .then(function(detail) {
+      // Show evidence in left panel
+      if (detail.evidence_url) {
+        evEl.innerHTML = '<div style="background:#E8F5E9;color:#2E7D32;padding:6px 12px;font-size:12px;text-align:center;border-radius:4px;margin-bottom:4px">' +
+          '&#x1F50D; AUDIT CHECK ' + (auditIdx + 1) + '/' + auditSample.length + '</div>' +
+          '<img src="' + esc(detail.evidence_url) + '" style="max-width:100%;height:auto">';
+      } else if (detail.page_url) {
+        evEl.innerHTML = '<div style="background:#FFF3CD;color:#856404;padding:6px 12px;font-size:12px;text-align:center;border-radius:4px;margin-bottom:4px">' +
+          '&#x1F50D; AUDIT CHECK ' + (auditIdx + 1) + '/' + auditSample.length + ' — location uncertain</div>' +
+          '<img src="' + esc(detail.page_url) + '" style="max-width:100%;height:auto">';
+      }
+
+      // Right panel — audit check card
+      var displayName = detail.display_name || item.field_name;
+      var displayVal = item.value;
+      if (typeof displayVal === 'number') {
+        displayVal = displayVal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      } else {
+        displayVal = String(displayVal || '(empty)');
+      }
+
+      var statusBadge = '';
+      if (item.status === 'confirmed') statusBadge = '<span class="badge badge-green">confirmed</span>';
+      else if (item.status === 'corrected') statusBadge = '<span class="badge badge-yellow">corrected</span>';
+      else statusBadge = '<span class="badge badge-gray">' + esc(item.status) + '</span>';
+
+      var html = '<div style="padding:32px">' +
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:24px">' +
+        '<span style="background:#E8F5E9;color:#2E7D32;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600">AUDIT CHECK</span>' +
+        '<span style="font-size:12px;color:var(--text-muted)">' + (auditIdx + 1) + ' of ' + auditSample.length + '</span>' +
+        '</div>' +
+        '<div style="font-size:13px;color:var(--text-muted);margin-bottom:4px">' + esc(detail.document_type || '') + (detail.entity ? ' \u2022 ' + esc(detail.entity) : '') + ' \u2022 Page ' + item.page_num + '</div>' +
+        '<div style="font-size:18px;font-weight:600;color:var(--navy);margin-bottom:8px">' + esc(displayName) + '</div>' +
+        '<div style="font-size:36px;font-family:monospace;font-weight:700;color:var(--navy);margin-bottom:12px;word-break:break-all">' + esc(displayVal) + '</div>' +
+        '<div style="margin-bottom:16px">' + statusBadge + '</div>' +
+        '<div style="margin-bottom:12px"><input type="text" class="form-input" id="auditNoteInput" placeholder="Audit note (optional)..." style="width:100%;font-size:13px"></div>' +
+        '<div style="display:flex;gap:8px">' +
+        '<button class="btn btn-success" onclick="auditAction(\'pass\')" style="font-size:14px;padding:10px 24px">&#x2714; Confirm</button>' +
+        '<button class="btn btn-danger" onclick="auditAction(\'flag\')" style="font-size:14px;padding:10px 24px">&#x1F6A9; Flag</button>' +
+        '</div>' +
+        '<div style="margin-top:16px">' +
+        '<div style="background:var(--border);border-radius:4px;height:6px;overflow:hidden">' +
+        '<div style="background:#4CAF50;height:100%;width:' + pct + '%;transition:width 0.3s"></div>' +
+        '</div></div>' +
+        '</div>';
+
+      document.getElementById('guidedDetail').innerHTML = html;
+      document.getElementById('guidedDetail').style.opacity = '1';
+    })
+    .catch(function() {
+      // Fallback without evidence
+      showToast('Could not load evidence for audit item', 'info');
+      auditIdx++;
+      showAuditItem();
+    });
+}
+
+function auditAction(outcome) {
+  var item = auditSample[auditIdx];
+  var note = (document.getElementById('auditNoteInput') || {}).value || '';
+  auditResults.push({
+    field_id: item.field_id,
+    field_name: item.field_name,
+    outcome: outcome,
+    note: note.trim(),
+  });
+  auditIdx++;
+  if (outcome === 'flag') {
+    showToast('Flagged — will route back for re-review', 'error');
+  } else {
+    showToast('Confirmed', 'success');
+  }
+  showAuditItem();
+}
+
+function submitAuditResults() {
+  var passCount = auditResults.filter(function(r) { return r.outcome === 'pass'; }).length;
+  var failCount = auditResults.filter(function(r) { return r.outcome === 'flag'; }).length;
+
+  fetch('/api/post-run-audit/result/' + guidedJobId, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      sample_size: auditResults.length,
+      pass_count: passCount,
+      fail_count: failCount,
+      results: auditResults,
+      reviewer: _getGuidedReviewer(),
+    })
+  }).then(function(r) { return r.json(); })
+    .then(function(data) {
+      showAuditComplete(passCount, failCount, data.flagged_field_ids || []);
+    })
+    .catch(function() { showAuditComplete(passCount, failCount, []); });
+}
+
+function showAuditComplete(passCount, failCount, flaggedIds) {
+  passCount = passCount || 0;
+  failCount = failCount || 0;
+
+  var badgeColor = failCount === 0 ? '#4CAF50' : '#E53935';
+  var badgeText = failCount === 0
+    ? 'Audit Passed: ' + passCount + '/' + (passCount + failCount)
+    : 'Audit Flagged: ' + failCount + ' issue' + (failCount !== 1 ? 's' : '');
+
+  // Left panel
+  document.getElementById('guidedEvidence').innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.8);text-align:center;padding:40px">' +
+    '<div style="font-size:64px;margin-bottom:16px">' + (failCount === 0 ? '&#x2705;' : '&#x26A0;') + '</div>' +
+    '<h2 style="color:#fff;margin:0 0 8px">Audit ' + (failCount === 0 ? 'Passed' : 'Complete') + '</h2>' +
+    '<div style="background:' + badgeColor + ';color:#fff;padding:8px 20px;border-radius:20px;font-size:16px;font-weight:600;margin-top:8px">' + badgeText + '</div>' +
+    '</div>';
+
+  // Right panel
+  var html = '<div style="padding:32px">' +
+    '<h2 style="margin:0 0 8px">Post-Run Audit Complete</h2>';
+
+  if (failCount > 0) {
+    html += '<p style="color:#E53935;margin:0 0 16px">' + failCount + ' field(s) flagged for re-review. They have been routed back into the review queue.</p>';
+    html += '<button class="btn btn-primary" onclick="openGuidedReview()" style="margin-bottom:12px">&#x21BB; Re-open Review Queue</button><br>';
+  } else {
+    html += '<p style="color:#4CAF50;margin:0 0 16px">All sampled values confirmed. Review is complete.</p>';
+  }
+
+  html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
+    '<button class="btn btn-success" onclick="window.open(\'/api/download/' + guidedJobId + '\',\'_blank\')">&#x2B73; Download Excel</button>' +
+    '<button class="btn btn-secondary" onclick="window.open(\'/api/download-log/' + guidedJobId + '\',\'_blank\')">&#x2B73; Download JSON</button>' +
+    '<button class="btn btn-ghost" onclick="openGridReview()">&#x2630; List View</button>' +
+    '<button class="btn btn-ghost" onclick="showSection(\'history\')">&#x1F4CB; History</button>' +
+    '</div></div>';
+
+  document.getElementById('guidedDetail').innerHTML = html;
   document.getElementById('guidedDetail').style.opacity = '1';
 }
 
@@ -7735,6 +10605,20 @@ function showGuidedComplete(reviewed, total) {
 </html>"""
 
 
+# ── Aftercare shutdown (T-UX-CONFIRM-FASTPATH) ──
+
+def _drain_aftercare(timeout=5.0):
+    """Drain aftercare queue on shutdown. Best-effort."""
+    global _aftercare_running
+    _aftercare_running = False
+    _aftercare_event.set()
+    _aftercare_thread.join(timeout=timeout)
+    if _aftercare_queue:
+        print(f"  Warning: {len(_aftercare_queue)} aftercare tasks abandoned at shutdown")
+
+atexit.register(_drain_aftercare)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -7750,7 +10634,8 @@ if __name__ == "__main__":
         print("  Place extract.py in the same folder as app.py\n")
 
     print("=" * 52)
-    print(f"  Bearden Document Intake Platform v{_app_version}")
+    print(f"  Starting OathLedger on :{port}")
+    print(f"  (Bearden Document Intake Platform v{_app_version})")
     print("  ─────────────────────────────────────")
     print(f"  Open in browser:  http://localhost:{port}")
     print(f"  Database:         {DB_PATH}")

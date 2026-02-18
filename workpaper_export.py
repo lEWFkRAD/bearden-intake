@@ -1,3 +1,7 @@
+# ============================================================
+# CULTIVATION — Workpaper Generator
+# ============================================================
+
 """Deterministic workpaper generator for the Bearden Document Intake Platform.
 
 Generates professional accountant-style workpapers from the fact store.

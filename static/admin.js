@@ -31,6 +31,30 @@ async function pollAdmin(){
   }catch(e){
     setPill("health_pill", "bad", "Disconnected");
   }
+
+  // CAS: Poll CAS health if on a CAS page
+  try{
+    const casEl = document.getElementById("cas_overall_pill");
+    if(casEl){
+      const cas = await fetchJSON("/api/cas/health");
+      setPill("cas_overall_pill", cas.state, cas.label);
+    }
+  }catch(e){
+    // CAS health poll failure is non-critical
+  }
+
+  // T-CAS-2B: Poll open CR count if pill exists
+  try{
+    const crPill = document.getElementById("cr_count_pill");
+    if(crPill){
+      const crs = await fetchJSON("/api/cas/cr?status=open");
+      const count = (crs.change_requests || []).length;
+      crPill.textContent = count + " open";
+      crPill.className = "pill " + (count > 0 ? "bad" : "good");
+    }
+  }catch(e){
+    // CR poll failure is non-critical
+  }
 }
 
 setInterval(pollAdmin, 7000);

@@ -1,0 +1,52 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <div class="card" style="grid-column: span 12;">
+      <h2>Change Requests</h2>
+      <div class="controls" style="margin-bottom:12px">
+        <a href="/admin/cas/cr" class="btn {{ 'primary' if filter=='all' else '' }}">All</a>
+        <a href="/admin/cas/cr?status=open" class="btn {{ 'primary' if filter=='open' else '' }}">Open</a>
+        <a href="/admin/cas/cr?status=closed" class="btn {{ 'primary' if filter=='closed' else '' }}">Closed</a>
+      </div>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>CR ID</th>
+            <th>Severity</th>
+            <th>Source</th>
+            <th>Status</th>
+            <th>Summary</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for cr in change_requests %}
+          <tr>
+            <td class="mono"><a href="/admin/cas/cr/{{ cr.cr_id }}">{{ cr.cr_id }}</a></td>
+            <td><span class="pill {{ 'bad' if cr.severity=='CRITICAL' else ('warn' if cr.severity=='WARNING' else '') }}">{{ cr.severity }}</span></td>
+            <td>{{ cr.source }}</td>
+            <td>
+              {% if cr.status == 'closed' %}
+                <span class="pill good">closed</span>
+              {% elif cr.status == 'gate_passed' %}
+                <span class="pill good">gate_passed</span>
+              {% elif cr.status == 'fix_submitted' or cr.status == 'gate_failed' %}
+                <span class="pill warn">{{ cr.status }}</span>
+              {% else %}
+                <span class="pill bad">{{ cr.status }}</span>
+              {% endif %}
+            </td>
+            <td class="small">{{ cr.trigger_summary or '-' }}</td>
+            <td class="small">{{ (cr.created_at or '')[:16] }}</td>
+            <td><a href="/admin/cas/cr/{{ cr.cr_id }}" class="btn">View</a></td>
+          </tr>
+          {% endfor %}
+          {% if not change_requests %}
+          <tr><td colspan="7" class="small">No change requests found.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}

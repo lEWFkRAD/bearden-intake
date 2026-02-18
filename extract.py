@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# ============================================================
+# PASSION — Extraction Engine
+# ============================================================
 """
 Document Intake Extractor v6
 =================================
@@ -666,7 +669,7 @@ def _load_cache(pdf_path, dpi):
 def _print_routing_summary(routing_plan):
     """Print routing summary from cached data (same format as route_pages for app.py)."""
     counts = {"text_layer": 0, "ocr": 0, "vision": 0, "skip_blank": 0}
-    print("\n── Per-Page Routing (from cache) ──")
+    print("\n── [PASSION] Per-Page Routing (from cache) ──")
     for r in routing_plan:
         m = r.get("method", "vision")
         counts[m] = counts.get(m, 0) + 1
@@ -1983,7 +1986,7 @@ def pdf_to_images(pdf_path, dpi=DPI, page_texts=None):
     deskewed_count = 0
     quality_scores = []
 
-    print(f"\n── Preprocessing ({len(raw_images)} pages) ──")
+    print(f"\n── [PASSION] Preprocessing ({len(raw_images)} pages) ──")
     for i, img in enumerate(raw_images):
         page_num = i + 1
         orig_size = img.size
@@ -2101,7 +2104,7 @@ def ocr_all_pages(pil_images):
     Returns (ocr_texts, ocr_confidences) — two parallel lists.
     ocr_texts[i]: text string or None. ocr_confidences[i]: avg confidence (0-100) or None.
     Entries in pil_images may be None (blank pages) — these are skipped."""
-    print("\n── OCR Pass (Tesseract) ──")
+    print("\n── [PASSION] OCR Pass (Tesseract) ──")
     n = len(pil_images)
     if not HAS_TESSERACT:
         print("  Tesseract not available — all pages will use vision")
@@ -2161,7 +2164,7 @@ def route_pages(page_texts, ocr_texts, ocr_confidences, preproc_meta):
     routing_plan = []
     counts = {"text_layer": 0, "ocr": 0, "vision": 0, "skip_blank": 0}
 
-    print("\n── Per-Page Routing ──")
+    print("\n── [PASSION] Per-Page Routing ──")
 
     for i in range(n):
         page_num = i + 1
@@ -2278,7 +2281,7 @@ def detect_sections(page_texts, routing_plan, ocr_texts=None):
     sections_by_page = {}
     label_counts = {}
 
-    print("\n── Section Detection ──")
+    print("\n── [PASSION] Section Detection ──")
 
     for i in range(n):
         page_num = i + 1
@@ -2608,7 +2611,7 @@ def _parse_json_response(text, tag=""):
 # ─── PHASE 1: CLASSIFY (always vision — need to see page layout) ─────────
 
 def classify_pages(client, b64_images, tokenizer=None, doc_type=None, user_notes="", ai_instructions=""):
-    print(f"\n── Phase 1: Classification ({len(b64_images)} pages, {MAX_CONCURRENT} concurrent) ──")
+    print(f"\n── [PASSION] Phase 1: Classification ({len(b64_images)} pages, {MAX_CONCURRENT} concurrent) ──")
     results = [None] * len(b64_images)
 
     # Narrow classification prompt to relevant doc types
@@ -2810,7 +2813,7 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
     PII redaction (if tokenizer provided) blacks out sensitive data in images.
     Uses concurrent API calls for speed.
     """
-    print(f"\n── Phase 2: Extraction ({MAX_CONCURRENT} concurrent) ──")
+    print(f"\n── [PASSION] Phase 2: Extraction ({MAX_CONCURRENT} concurrent) ──")
 
     # Build context hints based on doc_type
     doc_type_hints = {
@@ -3093,7 +3096,7 @@ def verify_extractions(client, b64_images, extractions, tokenizer=None):
       - Focus on CRITICAL_FIELDS to minimize API calls
       - Uses concurrent API calls for speed
     """
-    print(f"\n── Phase 3: Verification ({MAX_CONCURRENT} concurrent) ──")
+    print(f"\n── [PASSION] Phase 3: Verification ({MAX_CONCURRENT} concurrent) ──")
     corrections = 0
     confirmations = 0
     total_fields = 0
@@ -3490,7 +3493,7 @@ def build_consensus(extractions, page_texts, ocr_texts, ocr_confidences=None):
     Zero additional API calls — uses existing text/OCR data + regex parsing.
     Returns (modified extractions, consensus_data dict for logging).
     """
-    print("\n── Phase 2.5: Consensus Verification ──")
+    print("\n── [PASSION] Phase 2.5: Consensus Verification ──")
 
     consensus_log = {
         "fields_checked": 0,
@@ -3665,7 +3668,7 @@ def build_consensus(extractions, page_texts, ocr_texts, ocr_confidences=None):
 
 def normalize_brokerage_data(extractions):
     """Split brokerage composites, cross-ref K-1 continuations, roll up K-1 interest."""
-    print("\n── Phase 4: Normalize ──")
+    print("\n── [PASSION] Phase 4: Normalize ──")
     normalized = []
     rollups = []
     continuation_data = {}
@@ -3815,7 +3818,7 @@ def validate(extractions, prior_year_context=None):
       2. Relational: do related fields follow known constraints?
       3. Cross-document: do related documents agree?
     """
-    print("\n── Phase 5: Validate ──")
+    print("\n── [PASSION] Phase 5: Validate ──")
     warnings = []
 
     # Per-extraction checks
@@ -4171,7 +4174,7 @@ def populate_template(extractions, template_path, output_path, year, output_form
         "account_balances": "Account Balances", "trial_balance": "Trial Balance",
         "transaction_register": "Transaction Register",
     }
-    print(f"\n── Phase 6: Excel ({fmt_labels.get(output_format, output_format)}) ──")
+    print(f"\n── [PASSION] Phase 6: Excel ({fmt_labels.get(output_format, output_format)}) ──")
 
     if template_path and os.path.exists(template_path):
         wb = openpyxl.load_workbook(template_path)
@@ -6100,7 +6103,7 @@ def clear_partial_results(output_path):
 
 
 def print_summary(extractions):
-    print("\n── Summary ──")
+    print("\n── [PASSION] Summary ──")
     methods = {}
     confs = {}
     for ext in extractions:
@@ -6240,7 +6243,7 @@ def main():
         _pipeline_timer.start("text_layer")
         # Always extract text layer per page (never discard — routing decides per-page)
         if HAS_PYMUPDF:
-            print("\n── Text-Layer Extraction (PyMuPDF) ──")
+            print("\n── [PASSION] Text-Layer Extraction (PyMuPDF) ──")
             page_texts = extract_text_per_page(args.pdf)
             if page_texts:
                 _tl_usable, text_layer_stats = has_meaningful_text(page_texts)
@@ -6352,7 +6355,7 @@ def main():
     _pipeline_timer.start("classify")
     if resume_phase in ("classify", "group", "extract", "verify"):
         classifications = checkpoint.get("classifications", [])
-        print(f"\n── Phase 1: Classification (restored {len(classifications)} from checkpoint) ──")
+        print(f"\n── [PASSION] Phase 1: Classification (restored {len(classifications)} from checkpoint) ──")
     else:
         classifications = classify_pages(client, b64_images, tokenizer=tokenizer, doc_type=args.doc_type, user_notes=args.user_notes, ai_instructions=effective_instructions)
         save_checkpoint(output, "classify", classifications=classifications)
@@ -6380,7 +6383,7 @@ def main():
     streaming_meta = {"time_to_first_values_s": None, "batches_processed": 0, "fields_streamed": 0}
     if resume_phase in ("extract", "verify"):
         extractions = checkpoint.get("extractions", [])
-        print(f"\n── Phase 2: Extraction (restored {len(extractions)} from checkpoint) ──")
+        print(f"\n── [PASSION] Phase 2: Extraction (restored {len(extractions)} from checkpoint) ──")
     else:
         extractions, streaming_meta = extract_data(client, b64_images, groups, tokenizer=tokenizer,
                                     doc_type=args.doc_type, user_notes=args.user_notes,
@@ -6401,7 +6404,7 @@ def main():
     _pipeline_timer.start("verify")
     verify_stats = {"pages_verified": 0, "pages_skipped": 0}
     if resume_phase == "verify":
-        print(f"\n── Phase 3: Verification (already done in checkpoint) ──")
+        print(f"\n── [PASSION] Phase 3: Verification (already done in checkpoint) ──")
         verify_stats = {"pages_verified": 0, "pages_skipped": len(extractions)}
     elif not args.skip_verify:
         extractions, verify_stats = verify_extractions(client, b64_images, extractions, tokenizer=tokenizer)
@@ -6422,7 +6425,7 @@ def main():
     print_summary(extractions)
 
     # Cost summary
-    print("\n── Cost ──")
+    print("\n── [PASSION] Cost ──")
     print(_cost_tracker.summary())
 
     # PII tokenization summary
@@ -6468,7 +6471,7 @@ def main():
     clear_partial_results(output)
 
     # Timing summary
-    print("\n── Timing ──")
+    print("\n── [PASSION] Timing ──")
     print(_pipeline_timer.summary())
 
     print("\n" + "=" * 60)

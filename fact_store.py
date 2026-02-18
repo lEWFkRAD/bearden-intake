@@ -1,3 +1,8 @@
+# ============================================================
+# HONOR — The Fact Ledger
+# "A number is born once, confirmed once, and used many times."
+# ============================================================
+
 """Canonical fact storage for the Bearden Document Intake Platform.
 
 DB-only gateway for extraction facts. Manages the unified `facts` table
@@ -780,3 +785,5 @@ class FactStore:
             "source_doc": row[8] if len(row) > 8 else "",
             "page_number": row[9] if len(row) > 9 else None,
         }
+
+# "Honor is dead, but I'll see what I can do."

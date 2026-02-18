@@ -323,7 +323,7 @@ def test_login_flow():
         # Login page renders
         resp = client.get("/login")
         check(resp.status_code == 200, "GET /login returns 200")
-        check(b"Bearden Intake Platform" in resp.data, "login page has title")
+        check(b"OathLedger" in resp.data, "login page has title")
         check(b"testadmin" in resp.data, "login page lists users")
 
         # Successful login
@@ -762,7 +762,8 @@ def test_constants():
     check("admin" in _app.VALID_ROLES, "admin in VALID_ROLES")
     check("partner" in _app.VALID_ROLES, "partner in VALID_ROLES")
     check("reviewer" in _app.VALID_ROLES, "reviewer in VALID_ROLES")
-    check(len(_app.VALID_ROLES) == 3, f"3 roles (got {len(_app.VALID_ROLES)})")
+    check("preparer" in _app.VALID_ROLES, "preparer in VALID_ROLES")
+    check(len(_app.VALID_ROLES) == 4, f"4 roles (got {len(_app.VALID_ROLES)})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

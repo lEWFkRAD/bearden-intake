@@ -1,0 +1,241 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <!-- CAS Overall Status -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Continuous Assurance System
+        <span class="pill {{ cas.state or 'unknown' }}" id="cas_overall_pill">{{ cas.label or 'Unknown' }}</span>
+      </h2>
+      <div class="kpis">
+        <div class="kpi">
+          <div class="label">Smoke Tests</div>
+          <div class="value"><span class="pill {{ cas.smoke.state or 'unknown' }}">{{ cas.smoke.passed or '?' }}/{{ cas.smoke.total or '?' }}</span></div>
+          <div class="hint">{% if cas.smoke.run_at %}Last: {{ cas.smoke.run_at[:16] }}{% else %}Never run{% endif %}</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Golden Regressions</div>
+          <div class="value"><span class="pill {{ cas.goldens.state or 'unknown' }}">{{ cas.goldens.count or 0 }} cases</span></div>
+          <div class="hint">{% if cas.goldens.all_pass %}All passing{% elif cas.goldens.count %}Some failing{% else %}No data{% endif %}</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Backup</div>
+          <div class="value"><span class="pill {{ cas.backup.state or 'unknown' }}">{{ 'Verified' if cas.backup.verified else ('Exists' if cas.backup.last_at else 'None') }}</span></div>
+          <div class="hint">{% if cas.backup.last_at %}Last: {{ cas.backup.last_at[:16] }}{% else %}No backups{% endif %}</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Drift Samples</div>
+          <div class="value">{{ cas.drift.count or 0 }}</div>
+          <div class="hint">Jobs with drift data</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Smoke Tests Card -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Smoke Tests</h2>
+      <div id="smoke_results">
+        <p class="small">Run smoke tests to check environment health.</p>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn cas-action-btn" onclick="runSmoke()">Run Smoke Tests</button>
+      </div>
+    </div>
+
+    <!-- Backup Card -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Backup Management</h2>
+      <div id="backup_status">
+        <p class="small">Create a backup snapshot of the database.</p>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn cas-action-btn" onclick="createBackup()">Create Backup</button>
+      </div>
+    </div>
+
+    <!-- Golden Regressions Card -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Golden Regressions</h2>
+      <div id="golden_results">
+        <p class="small">Run extraction against reference documents to detect regressions.</p>
+        <p class="small" style="color:var(--muted)">Note: Uses API tokens. Run manually.</p>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn cas-action-btn" onclick="runGoldens()">Run Goldens</button>
+      </div>
+    </div>
+
+    <!-- Drift Indicators Card -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Drift Indicators</h2>
+      <div id="drift_summary">
+        <p class="small">Drift metrics are computed when jobs reach final review stage.</p>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn cas-action-btn" onclick="loadDrift()">Refresh Drift</button>
+      </div>
+    </div>
+
+    <!-- Change Requests Card (T-CAS-2B) -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Change Requests <span class="pill" id="cr_count_pill">Loading...</span></h2>
+      <div id="cr_list">
+        <p class="small">Loading change requests...</p>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <a href="/admin/cas/cr" class="btn cas-action-btn">View All CRs</a>
+      </div>
+    </div>
+
+    <!-- CAS Reports Card -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>CAS Reports</h2>
+      <div class="report-card">
+        <div class="row" style="gap:12px;flex-wrap:wrap">
+          <button class="btn cas-action-btn" onclick="genReport('daily')">Daily Health (R1)</button>
+          <button class="btn cas-action-btn" onclick="genReport('runs')">Runs Report (R2)</button>
+          <button class="btn cas-action-btn" onclick="genReport('regressions')">Regressions (R3)</button>
+          <button class="btn cas-action-btn" onclick="genReport('backups')">Backups (R4)</button>
+          <button class="btn cas-action-btn" onclick="genAgentPack()" style="background:var(--accent)">Generate Agent Pack</button>
+        </div>
+        <div id="report_output" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+async function runSmoke(){
+  const el = document.getElementById('smoke_results');
+  el.innerHTML = '<p class="small">Running smoke tests...</p>';
+  try {
+    const r = await fetch('/api/cas/smoke', {method:'POST'});
+    const d = await r.json();
+    if(d.error){ el.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`; return; }
+    let html = `<p><span class="pill ${d.passed===d.total?'good':'bad'}">${d.passed}/${d.total} passed</span> (${d.duration_s}s)</p>`;
+    html += '<table class="table"><thead><tr><th>Check</th><th>Status</th><th>Message</th></tr></thead><tbody>';
+    for(const c of d.results||[]){
+      html += `<tr><td>${c.name}</td><td><span class="pill ${c.passed?'good':'bad'}">${c.passed?'Pass':'Fail'}</span></td><td class="small">${c.message}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function createBackup(){
+  const el = document.getElementById('backup_status');
+  el.innerHTML = '<p class="small">Creating backup...</p>';
+  try {
+    const r = await fetch('/api/cas/backup', {method:'POST'});
+    const d = await r.json();
+    if(d.error){ el.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`; return; }
+    el.innerHTML = `<p><span class="pill good">Backup created</span></p>
+      <p class="small">Path: ${d.path}</p>
+      <p class="small">Size: ${(d.size_bytes/1024).toFixed(0)} KB</p>
+      <p class="small">SHA-256: ${d.sha256.substring(0,16)}...</p>`;
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function runGoldens(){
+  const el = document.getElementById('golden_results');
+  el.innerHTML = '<p class="small">Running golden regressions (this may take a while)...</p>';
+  try {
+    const r = await fetch('/api/cas/goldens/run', {method:'POST'});
+    const d = await r.json();
+    if(d.error){ el.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`; return; }
+    if(!d.results || d.results.length===0){
+      el.innerHTML = '<p class="small">No golden test cases found. Add cases to data/goldens/.</p>'; return;
+    }
+    let html = `<p>${d.count} cases run</p>`;
+    html += '<table class="table"><thead><tr><th>Case</th><th>Result</th><th>Match</th><th>Mismatch</th><th>Missing</th><th>Time</th></tr></thead><tbody>';
+    for(const g of d.results){
+      html += `<tr><td>${g.golden_name}</td><td><span class="pill ${g.passed?'good':'bad'}">${g.passed?'Pass':'Fail'}</span></td>
+        <td>${g.matched}</td><td>${g.mismatched}</td><td>${g.missing}</td><td>${g.duration_s}s</td></tr>`;
+      if(g.error) html += `<tr><td colspan="6" class="small" style="color:var(--bad)">Error: ${g.error}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function loadDrift(){
+  const el = document.getElementById('drift_summary');
+  try {
+    const r = await fetch('/api/cas/drift');
+    const d = await r.json();
+    if(!d.drift || d.drift.length===0){
+      el.innerHTML = '<p class="small">No drift data yet. Finalize jobs through the review chain.</p>'; return;
+    }
+    let html = '<table class="table"><thead><tr><th>Job</th><th>Edit Rate</th><th>Needs Review</th><th>Audit Pass</th><th>Measured</th></tr></thead><tbody>';
+    for(const dr of d.drift){
+      html += `<tr><td class="mono">${(dr.job_id||'').substring(0,12)}</td>
+        <td>${dr.edit_rate!==null?(dr.edit_rate*100).toFixed(1)+'%':'—'}</td>
+        <td>${dr.needs_review_rate!==null?(dr.needs_review_rate*100).toFixed(1)+'%':'—'}</td>
+        <td>${dr.audit_pass_rate!==null?(dr.audit_pass_rate*100).toFixed(1)+'%':'—'}</td>
+        <td class="small">${(dr.measured_at||'').substring(0,16)}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function genReport(type){
+  const el = document.getElementById('report_output');
+  el.innerHTML = `<p class="small">Generating ${type} report...</p>`;
+  try {
+    const r = await fetch(`/api/cas/report/${type}`);
+    const d = await r.json();
+    if(d.error){ el.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`; return; }
+    el.innerHTML = `<details open><summary>${type} report</summary><pre style="white-space:pre-wrap;max-height:400px;overflow:auto;font-size:12px">${d.markdown||JSON.stringify(d,null,2)}</pre></details>`;
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function genAgentPack(){
+  const el = document.getElementById('report_output');
+  el.innerHTML = '<p class="small">Generating Agent Pack...</p>';
+  try {
+    window.location.href = '/api/cas/report/agent-pack';
+    el.innerHTML = '<p class="small"><span class="pill good">Agent Pack download started</span></p>';
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function loadOpenCRs(){
+  const el = document.getElementById('cr_list');
+  const pill = document.getElementById('cr_count_pill');
+  try {
+    const r = await fetch('/api/cas/cr?status=open');
+    const d = await r.json();
+    const crs = d.change_requests || [];
+    if(pill){
+      pill.textContent = crs.length + ' open';
+      pill.className = 'pill ' + (crs.length > 0 ? 'bad' : 'good');
+    }
+    if(crs.length === 0){
+      el.innerHTML = '<p class="small">No open change requests.</p>';
+      return;
+    }
+    let html = '<table class="table"><thead><tr><th>CR ID</th><th>Severity</th><th>Source</th><th>Status</th><th>Summary</th><th>Created</th></tr></thead><tbody>';
+    for(const cr of crs.slice(0, 5)){
+      const sevClass = cr.severity==='CRITICAL'?'bad':(cr.severity==='WARNING'?'warn':'');
+      html += `<tr>
+        <td class="mono"><a href="/admin/cas/cr/${cr.cr_id}">${cr.cr_id}</a></td>
+        <td><span class="pill ${sevClass}">${cr.severity}</span></td>
+        <td>${cr.source}</td>
+        <td><span class="pill ${cr.status==='open'?'bad':'warn'}">${cr.status}</span></td>
+        <td class="small">${cr.trigger_summary||''}</td>
+        <td class="small">${(cr.created_at||'').substring(0,16)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    if(crs.length > 5) html += `<p class="small">${crs.length - 5} more open CRs...</p>`;
+    el.innerHTML = html;
+  } catch(e){
+    if(el) el.innerHTML = '<p class="small">Could not load CRs.</p>';
+    if(pill){ pill.textContent = '?'; pill.className = 'pill'; }
+  }
+}
+
+// Auto-load drift and CRs on page load
+window.addEventListener('load', function(){ loadDrift(); loadOpenCRs(); });
+</script>
+{% endblock %}

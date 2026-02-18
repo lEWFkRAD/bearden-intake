@@ -1,0 +1,112 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <div class="card" style="grid-column: span 12;">
+      <h2>Recent Extraction Runs</h2>
+      <table class="table" id="runs_table">
+        <thead>
+          <tr>
+            <th>Job ID</th>
+            <th>Client</th>
+            <th>Status</th>
+            <th>Runtime</th>
+            <th>Cost</th>
+            <th>Pages</th>
+            <th>Fields</th>
+            <th>Method Split</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in runs %}
+          <tr class="run-row" onclick="toggleRunDetail('{{ r.job_id }}')" style="cursor:pointer">
+            <td class="mono">{{ (r.job_id or '')[:12] }}</td>
+            <td>{{ r.client_name or '-' }}</td>
+            <td><span class="pill {{ 'good' if r.status=='complete' else ('bad' if r.status=='error' else 'warn') }}">{{ r.status }}</span></td>
+            <td class="small">{{ '%.1f'|format(r.total_s or 0) }}s</td>
+            <td class="small">${{ '%.3f'|format(r.cost_usd or 0) }}</td>
+            <td class="small">{{ r.total_pages or '-' }}</td>
+            <td class="small">{{ r.total_fields or '-' }}</td>
+            <td class="small">
+              {% if r.pages_ocr or r.pages_vision %}
+              OCR:{{ r.pages_ocr or 0 }} / Vision:{{ r.pages_vision or 0 }}
+              {% else %}-{% endif %}
+            </td>
+            <td class="small">{{ (r.started_at or '')[:16] }}</td>
+          </tr>
+          <tr id="detail-{{ r.job_id }}" class="run-detail" style="display:none">
+            <td colspan="9">
+              <div class="run-detail-inner" id="detail-inner-{{ r.job_id }}">
+                <p class="small">Loading...</p>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not runs %}
+          <tr><td colspan="9" class="small">No runs recorded yet. Process a document to see data.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+async function toggleRunDetail(jobId){
+  const row = document.getElementById(`detail-${jobId}`);
+  if(!row) return;
+  if(row.style.display === 'none'){
+    row.style.display = '';
+    const inner = document.getElementById(`detail-inner-${jobId}`);
+    try {
+      const r = await fetch(`/api/cas/run/${jobId}`);
+      const d = await r.json();
+      if(d.error){ inner.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`; return; }
+      let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+
+      // Left: Phase timing
+      html += '<div><h3 style="margin:0 0 8px">Phase Timing</h3>';
+      if(d.phases && Object.keys(d.phases).length > 0){
+        const maxDur = Math.max(...Object.values(d.phases));
+        for(const [name, dur] of Object.entries(d.phases)){
+          const pct = maxDur > 0 ? (dur/maxDur*100) : 0;
+          html += `<div style="margin-bottom:4px">
+            <div class="small" style="display:flex;justify-content:space-between"><span>${name}</span><span>${dur.toFixed(1)}s</span></div>
+            <div class="timing-bar"><div class="timing-bar-fill" style="width:${pct}%"></div></div>
+          </div>`;
+        }
+      } else {
+        html += '<p class="small">No phase data</p>';
+      }
+      html += '</div>';
+
+      // Right: Metrics
+      html += '<div><h3 style="margin:0 0 8px">Metrics</h3>';
+      html += '<table class="table">';
+      const metrics = [
+        ['Total Time', `${(d.total_s||0).toFixed(1)}s`],
+        ['Cost', `$${(d.cost_usd||0).toFixed(4)}`],
+        ['Time to First Values', `${(d.time_to_first_values_s||0).toFixed(1)}s`],
+        ['API Calls', `${d.total_api_calls||0} (vision: ${d.vision_calls||0}, text: ${d.text_calls||0})`],
+        ['Tokens', `${d.input_tokens||0} in / ${d.output_tokens||0} out`],
+        ['Fields', `${d.total_fields||0} (high: ${d.fields_high_conf||0}, low: ${d.fields_low_conf||0}, review: ${d.fields_needs_review||0})`],
+        ['Pages', `${d.total_pages||0} (OCR: ${d.pages_ocr||0}, Vision: ${d.pages_vision||0}, Blank: ${d.pages_blank||0})`],
+      ];
+      for(const [k,v] of metrics){
+        html += `<tr><td class="small"><b>${k}</b></td><td class="small">${v}</td></tr>`;
+      }
+      html += '</table>';
+      if(d.error_message) html += `<p class="small" style="color:var(--bad)">Error: ${d.error_message}</p>`;
+      html += '</div></div>';
+
+      inner.innerHTML = html;
+    } catch(e){
+      inner.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`;
+    }
+  } else {
+    row.style.display = 'none';
+  }
+}
+</script>
+{% endblock %}
