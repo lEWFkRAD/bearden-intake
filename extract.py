@@ -16,14 +16,16 @@ New in v6:
   - --no-ocr-first flag to force vision-only mode
 
 Pipeline:
-  0. PDF → images (250 DPI)
-  0.5. Tesseract OCR every page (free, local)
+  0a. PyMuPDF text-layer extraction (instant, digital PDFs)
+  0b. PDF → images (250 DPI, always needed for classification + vision)
+  0c. Tesseract OCR every page (skipped if text layer usable)
   1. Claude vision classifies each page
   1.5. Group pages by EIN/entity
   2. Extract fields:
+       Text layer good → Claude text call (cheapest, best quality)
        OCR text good → Claude text call (cheap)
        OCR partial → text call + flag ambiguous fields for verification
-       OCR poor → Claude vision call (expensive)
+       No text / poor → Claude vision call (expensive)
   3. Verify critical fields (vision cross-check)
   4. Normalize (split brokerage composites, cross-ref K-1 continuations)
   5. Validate (arithmetic checks, cross-document reconciliation)
@@ -44,10 +46,13 @@ Setup:
 
 import argparse
 import base64
+import hashlib
 import json
+import math
 import os
 import sys
 import re
+import time
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime
@@ -75,6 +80,11 @@ except ImportError:
     HAS_TESSERACT = False
     print("WARNING: pytesseract not installed. Will use vision-only mode (slower, more expensive).")
     print("  Install: pip install pytesseract && brew install tesseract")
+try:
+    import fitz  # PyMuPDF — text-layer extraction from digitally-generated PDFs
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 
@@ -85,6 +95,29 @@ MAX_CONCURRENT = 4  # Parallel API calls (Anthropic rate limit friendly)
 
 # Minimum OCR character count to consider OCR usable
 OCR_MIN_CHARS = 100
+
+# Text-layer thresholds (PyMuPDF) — used by has_meaningful_text()
+TEXT_MIN_CHARS_PER_PAGE = 200  # Minimum chars for a page to count as "meaningful"
+TEXT_MIN_TOTAL_CHARS = 800     # Minimum total chars across all meaningful pages
+
+# ─── PAGE PREPROCESSING (T1.1) ───────────────────────────────────────────────
+# Deskew: max angle correction (degrees). Pages skewed more than this are left alone.
+DESKEW_MAX_ANGLE = 5.0
+# Deskew: minimum OSD confidence to trust angle detection
+DESKEW_MIN_CONFIDENCE = 2.0
+# Blank page detection: page is blank if fewer than this many non-white pixels (as %)
+BLANK_PAGE_THRESHOLD = 0.5     # 0.5% non-white pixels → blank
+# Blank page: minimum OCR chars to NOT be blank (overrides pixel check)
+BLANK_MIN_OCR_CHARS = 20
+# Contrast boost: target std-dev for page luminance (skip if already good)
+CONTRAST_TARGET_STD = 60.0
+# Contrast boost: minimum std-dev below which we enhance
+# Synthetic pages: ~20-26 std_dev. Real scans: faded photocopies ~5-12, clean ~25-40.
+# Set low to avoid false positives on clean pages with sparse text areas.
+CONTRAST_MIN_STD = 15.0
+# Quality score thresholds
+QUALITY_GOOD = 0.5
+QUALITY_POOR = 0.15
 
 # Fields where errors matter most — always verify these against the image
 CRITICAL_FIELDS = {
@@ -102,6 +135,240 @@ CRITICAL_FIELDS = {
     "beginning_balance", "ending_balance", "total_deposits", "total_withdrawals",
     "gross_pay", "net_pay", "total_amount",
 }
+
+# ─── CONSENSUS LAYER (T1.2.5) ──────────────────────────────────────────────
+# Fields verified by multi-candidate consensus: brokerage totals + K-1 boxes.
+# These get independent readings from text-layer, OCR, and Claude extraction.
+CONSENSUS_FIELDS = {
+    # Brokerage totals — 1099-DIV
+    "ordinary_dividends", "qualified_dividends",
+    "div_ordinary_dividends", "div_qualified_dividends",
+    "div_federal_wh", "div_foreign_tax_paid",
+    # Brokerage totals — 1099-INT
+    "interest_income", "int_interest_income",
+    "us_savings_bonds_and_treasury", "int_us_savings_bonds_and_treasury",
+    "int_federal_wh", "int_foreign_tax_paid",
+    # Brokerage totals — 1099-B / Schedule D
+    "b_total_gain_loss", "b_short_term_gain_loss", "b_long_term_gain_loss",
+    "total_gain_loss", "short_term_gain_loss", "long_term_gain_loss",
+    # Withholding (generic)
+    "federal_wh", "foreign_tax_paid",
+    # K-1 boxes 1–9
+    "box1_ordinary_income", "box2_rental_real_estate", "box3_other_rental",
+    "box4a_guaranteed_services", "box5_interest",
+    "box6a_ordinary_dividends", "box6b_qualified_dividends",
+    "box7_royalties", "box8_short_term_capital_gain",
+    "box9a_long_term_capital_gain",
+    # K-1 coded box amounts
+    "box10_net_1231_gain", "box11_other_income", "box12_section_179",
+    "box13_other_deductions",
+}
+
+# Consensus scoring thresholds
+CONSENSUS_ACCEPT_THRESHOLD = 5.0   # Minimum score to auto-accept top candidate
+CONSENSUS_MARGIN = 2.0              # Minimum gap between top and runner-up
+
+# Doc types eligible for consensus verification
+CONSENSUS_DOC_TYPES = {"1099-DIV", "1099-INT", "1099-OID", "1099-B", "K-1", "brokerage"}
+
+# ─── PER-PAGE ROUTING (T1.2) ───────────────────────────────────────────────
+# Routing thresholds for text-layer and OCR quality
+ROUTE_TEXT_MIN_CHARS = 200       # text_chars >= this → text_layer
+ROUTE_TEXT_MIN_WORDS = 40        # text_words >= this AND text_chars >= 120 → text_layer
+ROUTE_TEXT_MIN_CHARS_ALT = 120   # used with word count threshold
+ROUTE_OCR_MIN_CHARS = 200        # ocr_chars >= this → ocr
+ROUTE_OCR_MIN_CONF = 70.0        # ocr_conf_avg >= this → ocr
+
+# ─── SECTION / FORM DETECTION (T1.3) ─────────────────────────────────────────
+# Keyword scoring heuristic: each section has a list of (phrase, weight) tuples.
+# Higher weight = stronger/rarer signal. Score = sum of weights for all phrase hits.
+# A page can match multiple sections (multi-label).
+SECTION_SCORE_THRESHOLD = 3.0    # Minimum score to assign a section label
+SECTION_KEYWORDS = {
+    # ── Brokerage 1099 sections ──
+    "summary": [
+        # Strong signals — unique to brokerage summary pages
+        ("summary of income", 5),
+        ("tax information statement", 4),
+        ("combined summary", 4),
+        ("year-end summary", 4),
+        ("year end summary", 4),
+        ("annual summary", 4),
+        ("composite statement", 3),
+        ("total ordinary dividends", 3),
+        ("total qualified dividends", 3),
+        ("total interest income", 3),
+        ("federal income tax withheld", 3),
+        ("total capital gains", 2),
+        ("total dividends", 2),
+        ("total interest", 2),
+        ("aggregate amounts", 2),
+        ("reportable amounts", 2),
+    ],
+    "div": [
+        # Strong signals — IRS form identifiers
+        ("1099-div", 6),
+        ("form 1099-div", 6),
+        ("dividends and distributions", 5),
+        # Box labels unique to 1099-DIV
+        ("1a ordinary dividends", 4),
+        ("1a  ordinary dividends", 4),
+        ("1b qualified dividends", 4),
+        ("1b  qualified dividends", 4),
+        ("nondividend distributions", 3),
+        ("section 199a dividends", 3),
+        ("collectibles (28%) gain", 3),
+        ("section 897 dividends", 3),
+        ("foreign tax paid", 2),
+        ("exempt-interest dividends", 3),
+        ("specified private activity bond interest dividends", 3),
+        # Medium signals — common but not unique
+        ("ordinary dividends", 2),
+        ("qualified dividends", 2),
+    ],
+    "int": [
+        # Strong signals
+        ("1099-int", 6),
+        ("form 1099-int", 6),
+        ("interest income", 4),
+        # Box labels unique to 1099-INT
+        ("early withdrawal penalty", 4),
+        ("us savings bonds and treasury", 3),
+        ("u.s. savings bonds", 3),
+        ("tax-exempt interest", 3),
+        ("tax exempt interest", 3),
+        ("specified private activity bond interest", 3),
+        ("investment expenses", 2),
+        ("bond premium", 2),
+        ("market discount", 2),
+    ],
+    "oid": [
+        # Strong signals
+        ("1099-oid", 6),
+        ("form 1099-oid", 6),
+        ("original issue discount", 5),
+        # Box labels
+        ("other periodic interest", 3),
+        ("early withdrawal penalty", 2),  # shared with INT, lower weight
+        ("acquisition premium", 3),
+        ("oid on us treasury", 3),
+    ],
+    "b_summary": [
+        # Strong signals — 1099-B summary/totals
+        ("1099-b", 5),
+        ("form 1099-b", 5),
+        ("proceeds from broker", 5),
+        ("short-term transactions", 4),
+        ("long-term transactions", 4),
+        ("short term capital gains", 3),
+        ("long term capital gains", 3),
+        ("aggregate profit or loss", 3),
+        ("total proceeds", 3),
+        ("total cost basis", 3),
+        ("total gain/loss", 3),
+        ("total gain or loss", 3),
+        ("wash sale loss disallowed", 3),
+        ("reported to irs", 2),
+        ("basis reported", 2),
+        ("basis not reported", 2),
+        ("noncovered securities", 2),
+    ],
+    "b_transactions": [
+        # Transaction detail pages — high volume, lower priority
+        ("date acquired", 3),
+        ("date sold", 3),
+        ("date of sale", 3),
+        ("quantity sold", 3),
+        ("proceeds", 2),
+        ("cost basis", 2),
+        ("gain/loss", 2),
+        ("gain or loss", 2),
+        ("cusip", 2),
+        ("symbol", 1),
+    ],
+    # ── K-1 sections ──
+    "k1_1065": [
+        # Very strong — form-specific
+        ("schedule k-1 (form 1065)", 8),
+        ("schedule k-1(form 1065)", 8),
+        ("form 1065", 5),
+        ("partner's share of income", 5),
+        ("partner's share", 4),
+        ("partnership", 3),
+        ("partner's instructions", 3),
+        ("general partner", 2),
+        ("limited partner", 2),
+    ],
+    "k1_1120s": [
+        # Very strong — form-specific
+        ("schedule k-1 (form 1120-s)", 8),
+        ("schedule k-1 (form 1120s)", 8),
+        ("schedule k-1(form 1120-s)", 8),
+        ("schedule k-1(form 1120s)", 8),
+        ("form 1120-s", 5),
+        ("form 1120s", 5),
+        ("shareholder's share of income", 5),
+        ("shareholder's share", 4),
+        ("s corporation", 3),
+        ("shareholder's instructions", 3),
+    ],
+    "k1_1041": [
+        # Very strong — form-specific
+        ("schedule k-1 (form 1041)", 8),
+        ("schedule k-1(form 1041)", 8),
+        ("form 1041", 5),
+        ("beneficiary's share of income", 5),
+        ("beneficiary's share", 4),
+        ("estate or trust", 4),
+        ("fiduciary", 3),
+        ("beneficiary's instructions", 3),
+        ("trust", 2),
+        ("estate", 2),
+    ],
+    # ── Generic / fallback ──
+    "cover": [
+        ("important tax information", 4),
+        ("important tax return information", 4),
+        ("tax reporting statement", 4),
+        ("this is not a bill", 3),
+        ("do not file", 3),
+        ("for your records", 3),
+        ("enclosed you will find", 3),
+        ("enclosed is your", 3),
+        ("dear client", 2),
+        ("dear investor", 2),
+        ("dear shareholder", 2),
+        ("dear account holder", 2),
+    ],
+    "continuation": [
+        ("continued from", 4),
+        ("continued on next page", 4),
+        ("continuation", 3),
+        ("see attached", 2),
+        ("see statement", 2),
+        ("additional detail", 2),
+        ("supplemental information", 2),
+        ("stmt", 1),
+    ],
+}
+
+# T1.5: Section-based extraction priority for progressive results.
+# Lower number = higher priority = extracted first.
+SECTION_PRIORITY = {
+    "summary": 1,       # Brokerage summary — totals, dividends, interest
+    "k1_1065": 2,       # K-1 partnership
+    "k1_1120s": 2,      # K-1 S-corp
+    "k1_1041": 2,       # K-1 estate/trust
+    "div": 3,           # 1099-DIV section
+    "int": 3,           # 1099-INT section
+    "oid": 4,           # 1099-OID section
+    "b_summary": 4,     # 1099-B totals
+    "unknown": 6,       # Unknown section type
+    "b_transactions": 7, # Individual trades (high volume, lower priority)
+    "cover": 8,         # Cover letters (low value)
+    "continuation": 9,  # Continuation pages (handled by multi-page batching)
+}
+
 
 REQUIRES_HUMAN_REVIEW = [
     "K-1 carryover from prior year (basis/at-risk limitations)",
@@ -202,6 +469,227 @@ class CostTracker:
 
 # Global tracker — set per run in main()
 _cost_tracker = None
+
+
+class PipelineTimer:
+    """Track wall-clock timing per pipeline phase.
+
+    Usage:
+        timer = PipelineTimer()
+        timer.start("ocr")       # starts timing "ocr" phase
+        ...work...
+        timer.start("classify")  # auto-stops "ocr", starts "classify"
+        ...work...
+        timer.stop()             # stops current phase
+        print(timer.summary())   # formatted timing table
+    """
+
+    def __init__(self):
+        self._phases = []       # [{"name": str, "start": float, "end": float|None}]
+        self._active = None
+        self._run_start = time.monotonic()
+
+    def start(self, name):
+        """Start a named phase. Auto-stops the previous phase if still running."""
+        now = time.monotonic()
+        if self._active and self._phases:
+            self._phases[-1]["end"] = now
+        self._phases.append({"name": name, "start": now, "end": None})
+        self._active = name
+
+    def stop(self):
+        """Stop the currently running phase."""
+        if self._active and self._phases:
+            self._phases[-1]["end"] = time.monotonic()
+            self._active = None
+
+    def elapsed(self, name):
+        """Get elapsed seconds for a completed phase."""
+        for p in self._phases:
+            if p["name"] == name and p["end"] is not None:
+                return p["end"] - p["start"]
+        return 0.0
+
+    def total_elapsed(self):
+        """Total elapsed time since timer creation."""
+        return time.monotonic() - self._run_start
+
+    def summary(self):
+        """Formatted timing table string."""
+        lines = []
+        for p in self._phases:
+            dur = (p["end"] or time.monotonic()) - p["start"]
+            lines.append(f"    {p['name']:<30s} {dur:6.2f}s")
+        lines.append(f"    {'TOTAL':<30s} {self.total_elapsed():6.2f}s")
+        return "\n".join(lines)
+
+    def to_dict(self):
+        """Serializable dict for JSON log: {phase_name_s: float, total_s: float}."""
+        d = {}
+        for p in self._phases:
+            d[f"{p['name']}_s"] = round((p["end"] or time.monotonic()) - p["start"], 3)
+        d["total_s"] = round(self.total_elapsed(), 3)
+        return d
+
+
+_pipeline_timer = None
+
+
+# ─── PAGE-LEVEL CACHE (T1.4) ────────────────────────────────────────────────
+CACHE_VERSION = 1
+CACHE_DIR = os.path.join("data", "cache")
+CACHE_MAX_AGE_DAYS = 30
+
+
+def _cache_key(pdf_path):
+    """Compute SHA-256 hash of PDF file content for cache keying."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _save_cache(pdf_path, dpi, page_texts, text_layer_stats,
+                b64_images, page_preprocessing, ocr_texts, ocr_confidences, routing_plan):
+    """Save Phase 0 outputs to disk cache for fast rerun."""
+    try:
+        h = _cache_key(pdf_path)
+        cache_dir = os.path.join(CACHE_DIR, h[:12])
+        img_dir = os.path.join(cache_dir, "images")
+        os.makedirs(img_dir, exist_ok=True)
+
+        manifest = {
+            "hash": h,
+            "dpi": dpi,
+            "page_count": len(b64_images) if b64_images else 0,
+            "created": datetime.now().isoformat(),
+            "cache_version": CACHE_VERSION,
+            "pdf_path": str(pdf_path),
+        }
+
+        with open(os.path.join(cache_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        with open(os.path.join(cache_dir, "page_texts.json"), "w") as f:
+            json.dump(page_texts, f)
+        with open(os.path.join(cache_dir, "text_layer_stats.json"), "w") as f:
+            json.dump(text_layer_stats, f)
+        with open(os.path.join(cache_dir, "preprocessing.json"), "w") as f:
+            json.dump(page_preprocessing, f, default=str)
+        with open(os.path.join(cache_dir, "ocr_texts.json"), "w") as f:
+            json.dump(ocr_texts, f)
+        with open(os.path.join(cache_dir, "ocr_confidences.json"), "w") as f:
+            json.dump(ocr_confidences, f)
+        with open(os.path.join(cache_dir, "routing_plan.json"), "w") as f:
+            json.dump(routing_plan, f)
+
+        # Write base64 images as individual files (avoids huge single JSON)
+        if b64_images:
+            for i, img_b64 in enumerate(b64_images):
+                img_path = os.path.join(img_dir, f"page_{i+1:03d}.b64")
+                with open(img_path, "w") as f:
+                    f.write(img_b64 if img_b64 else "")
+
+        print(f"  Cache saved: {cache_dir}")
+    except (IOError, OSError) as e:
+        print(f"  Cache save failed (non-fatal): {e}")
+
+
+def _load_cache(pdf_path, dpi):
+    """Load Phase 0 outputs from disk cache. Returns dict or None on miss."""
+    try:
+        h = _cache_key(pdf_path)
+        cache_dir = os.path.join(CACHE_DIR, h[:12])
+        manifest_path = os.path.join(cache_dir, "manifest.json")
+
+        if not os.path.exists(manifest_path):
+            return None
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        # Validate: hash, DPI, version, freshness
+        if manifest.get("hash") != h:
+            return None
+        if manifest.get("dpi") != dpi:
+            return None
+        if manifest.get("cache_version", 0) != CACHE_VERSION:
+            return None
+
+        created = manifest.get("created")
+        if created:
+            age_days = (datetime.now() - datetime.fromisoformat(created)).days
+            if age_days > CACHE_MAX_AGE_DAYS:
+                return None
+
+        # Load all cached data
+        with open(os.path.join(cache_dir, "page_texts.json")) as f:
+            page_texts = json.load(f)
+        with open(os.path.join(cache_dir, "text_layer_stats.json")) as f:
+            text_layer_stats = json.load(f)
+        with open(os.path.join(cache_dir, "preprocessing.json")) as f:
+            page_preprocessing = json.load(f)
+        with open(os.path.join(cache_dir, "ocr_texts.json")) as f:
+            ocr_texts = json.load(f)
+        with open(os.path.join(cache_dir, "ocr_confidences.json")) as f:
+            ocr_confidences = json.load(f)
+        with open(os.path.join(cache_dir, "routing_plan.json")) as f:
+            routing_plan = json.load(f)
+
+        # Load page images
+        page_count = manifest.get("page_count", 0)
+        b64_images = []
+        img_dir = os.path.join(cache_dir, "images")
+        for i in range(page_count):
+            img_path = os.path.join(img_dir, f"page_{i+1:03d}.b64")
+            if os.path.exists(img_path):
+                with open(img_path) as f:
+                    data = f.read()
+                b64_images.append(data if data else None)
+            else:
+                return None  # incomplete cache
+
+        return {
+            "page_texts": page_texts,
+            "text_layer_stats": text_layer_stats,
+            "b64_images": b64_images,
+            "page_preprocessing": page_preprocessing,
+            "ocr_texts": ocr_texts,
+            "ocr_confidences": ocr_confidences,
+            "routing_plan": routing_plan,
+        }
+    except (IOError, OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"  Cache load failed (non-fatal): {e}")
+        return None
+
+
+def _print_routing_summary(routing_plan):
+    """Print routing summary from cached data (same format as route_pages for app.py)."""
+    counts = {"text_layer": 0, "ocr": 0, "vision": 0, "skip_blank": 0}
+    print("\n── Per-Page Routing (from cache) ──")
+    for r in routing_plan:
+        m = r.get("method", "vision")
+        counts[m] = counts.get(m, 0) + 1
+        pnum = r.get("page_num", "?")
+        reason = r.get("reason", "")
+        tc = r.get("text_chars", 0)
+        oc = r.get("ocr_chars", 0)
+        conf = r.get("ocr_conf_avg")
+        if m == "skip_blank":
+            print(f"  Page {pnum}: skip_blank ({reason})")
+        elif m == "text_layer":
+            print(f"  Page {pnum}: text_layer ({reason}, {tc} chars)")
+        elif m == "ocr":
+            conf_str = f", conf {conf:.0f}%" if conf is not None else ""
+            print(f"  Page {pnum}: ocr ({reason}, {oc} chars{conf_str})")
+        else:
+            print(f"  Page {pnum}: vision ({reason}, text={tc}, ocr={oc})")
+    parts = []
+    for m in ("text_layer", "ocr", "vision", "skip_blank"):
+        if counts[m] > 0:
+            parts.append(f"{counts[m]} {m}")
+    print(f"  Routing summary: {', '.join(parts)}")
+
 
 # ─── DOC TYPE → CLASSIFICATION NARROWING ──────────────────────────────────────
 
@@ -714,9 +1202,10 @@ TEMPLATE_SECTIONS = [
         "id": "dividends",
         "header": "Dividends:",
         "match_types": ["1099-DIV", "_dividend_rollup"],
-        "columns": {"A": "_source_name", "B": "ordinary_dividends", "C": "qualified_dividends"},
-        "col_headers": {"B": "Total", "C": "Qualified"},
-        "sum_cols": ["B", "C"],
+        "columns": {"A": "_source_name", "B": "ordinary_dividends", "C": "qualified_dividends",
+                     "D": "capital_gain_distributions", "E": "section_199a"},
+        "col_headers": {"B": "Total Ord", "C": "Qualified", "D": "Cap Gain Dist", "E": "Sec 199A"},
+        "sum_cols": ["B", "C", "D", "E"],
     },
     {
         "id": "1099r",
@@ -763,9 +1252,10 @@ TEMPLATE_SECTIONS = [
         "id": "schedule_d",
         "header": "Schedule D:",
         "match_types": ["1099-B", "_brokerage_gains"],
-        "columns": {"A": "_source_name", "B": "short_term_gain_loss", "C": "long_term_gain_loss", "D": "total_gain_loss"},
-        "col_headers": {"B": "Short-Term", "C": "Long-Term", "D": "Total Gain/Loss"},
-        "sum_cols": ["B", "C", "D"],
+        "columns": {"A": "_source_name", "B": "total_proceeds", "C": "total_basis",
+                     "D": "wash_sale_loss", "E": "total_gain_loss"},
+        "col_headers": {"B": "Proceeds", "C": "Cost Basis", "D": "Wash Sale", "E": "Net Gain/Loss"},
+        "sum_cols": ["B", "C", "D", "E"],
         "flags": ["⚠ Check for capital loss carryover from prior year"],
     },
     {
@@ -810,6 +1300,8 @@ TEMPLATE_SECTIONS = [
         "columns": {"A": "payer_or_entity", "B": "mortgage_interest", "C": "property_tax", "D": "mortgage_insurance_premiums"},
         "col_headers": {"B": "Mortgage Int", "C": "Property Tax", "D": "PMI"},
         "sum_cols": ["B", "C", "D"],
+        "field_aliases": {"mortgage_interest": ["mortgage_interest_received"],
+                          "property_tax": ["real_estate_tax", "property_taxes_paid"]},
     },
     {
         "id": "1098t",
@@ -824,6 +1316,7 @@ TEMPLATE_SECTIONS = [
         "header": "Property Tax Bills:",
         "match_types": ["property_tax_bill"],
         "columns": {"A": "property_address", "B": "tax_amount"},
+        "field_aliases": {"tax_amount": ["total_due", "total_tax", "total_amount_due", "total_estimated_tax"]},
         "col_headers": {"B": "Tax Amount"},
         "sum_cols": ["B"],
     },
@@ -1020,104 +1513,857 @@ def get_str(fields, key):
     return str(v) if v is not None else None
 
 def auto_rotate(img):
-    """Detect and fix sideways/landscape pages. Returns corrected PIL image."""
+    """Detect and fix rotated pages. Returns corrected PIL image.
+
+    Strategy:
+    - Landscape pages (w > h * 1.15): always use OSD (any confidence)
+    - Portrait pages with 90/270 OSD: apply rotation (content is sideways)
+    - Portrait pages with 180 OSD: only rotate if conf >= 10 (180 on portrait
+      pages is usually a Tesseract false positive — upright text misread)
+
+    Performance: OSD runs on a downscaled thumbnail (~800px) for speed,
+    then rotation is applied to the full-resolution image."""
     w, h = img.size
-    if w > h * 1.15:
-        # Landscape — use Tesseract OSD to determine correct rotation
-        if HAS_TESSERACT:
-            try:
-                osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
-                angle = osd.get("rotate", 0)
-                if angle != 0:
+    is_landscape = w > h * 1.15
+    if HAS_TESSERACT:
+        try:
+            # Use downscaled image for fast OSD detection
+            max_dim = max(w, h)
+            if max_dim > 1000:
+                scale = 800 / max_dim
+                osd_img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            else:
+                osd_img = img
+            osd = pytesseract.image_to_osd(osd_img, output_type=pytesseract.Output.DICT)
+            if osd_img is not img:
+                osd_img.close()
+            angle = osd.get("rotate", 0)
+            conf = float(osd.get("orientation_conf", 0))
+            if angle != 0:
+                if is_landscape or angle in (90, 270) or conf >= 10:
                     img = img.rotate(-angle, expand=True)
                     return img
-                # Tesseract says angle=0 — page is already correct orientation (landscape)
-                return img
-            except Exception as e:
+                # Portrait + 180deg + low confidence: skip (likely false positive)
+            return img
+        except Exception as e:
+            if is_landscape:
                 print(f"  Auto-rotate: Tesseract OSD failed ({e}), rotating 90 CW as fallback")
-        # Fallback only if Tesseract unavailable or failed entirely
-        img = img.rotate(-90, expand=True)
+                img = img.rotate(-90, expand=True)
+    else:
+        if is_landscape:
+            img = img.rotate(-90, expand=True)
     return img
 
-def pdf_to_images(pdf_path, dpi=DPI):
-    """Convert PDF to base64 JPEG strings (for API). Auto-rotates sideways pages.
-    PIL images are freed after encoding to minimize memory usage."""
+
+# ─── PAGE PREPROCESSING (T1.1) ──────────────────────────────────────────────
+
+def _is_blank_page(img, page_text=None):
+    """Detect blank/near-blank pages by checking non-white pixel percentage.
+
+    Text override: If page_text is provided and contains meaningful content
+    (≥40 chars, or money patterns like $X,XXX.XX, or IRS keywords), the page
+    is NOT blank even if pixel density is low. This handles sparse-but-meaningful
+    pages like K-1 cover sheets or brokerage summaries with a few dollar amounts.
+
+    Returns (is_blank: bool, pct_non_white: float, blank_reason: str).
+    blank_reason: "blank_true" | "blank_low_value" | "not_blank" | "overridden_by_text"
+    """
+    try:
+        gray = img.convert("L")
+        # Downsample for speed — 400px wide is plenty for blank detection
+        w, h = gray.size
+        if w > 400:
+            scale = 400 / w
+            gray = gray.resize((400, int(h * scale)), Image.LANCZOS)
+        pixels = list(gray.getdata())
+        total = len(pixels)
+        if total == 0:
+            return True, 0.0, "blank_true"
+        # Count pixels darker than 240 (not white/near-white)
+        non_white = sum(1 for p in pixels if p < 240)
+        pct = (non_white / total) * 100
+        gray.close()
+
+        if pct >= BLANK_PAGE_THRESHOLD:
+            return False, pct, "not_blank"
+
+        # Below pixel threshold — check text override
+        if page_text and len(page_text.strip()) >= BLANK_MIN_OCR_CHARS:
+            return False, pct, "overridden_by_text"
+
+        # Check for money patterns or IRS keywords in page_text
+        if page_text:
+            text = page_text.strip()
+            money_pattern = re.compile(r'\$[\d,]+\.?\d*')
+            irs_keywords = {"1099", "W-2", "K-1", "Schedule", "Form", "Box",
+                            "income", "dividends", "interest", "withholding",
+                            "wages", "EIN", "SSN", "tax"}
+            has_money = bool(money_pattern.search(text))
+            has_irs = any(kw.lower() in text.lower() for kw in irs_keywords)
+            if has_money or has_irs:
+                return False, pct, "overridden_by_text"
+
+        # Truly blank or low-value page
+        if pct == 0:
+            return True, pct, "blank_true"
+        else:
+            return True, pct, "blank_low_value"
+
+    except Exception:
+        return False, 100.0, "not_blank"
+
+
+def _compute_quality_score(img):
+    """Compute a 0–1 quality score for a page image based on contrast and sharpness.
+
+    Uses pure PIL (no numpy required). Contrast is measured over the non-white
+    bounding box crop (masked std_dev) so that sparse text pages aren't penalized
+    by large white margins.
+
+    Factors:
+      - Masked std deviation (contrast within content area)
+      - Edge density (sharpness) — blurry pages have few edges via ImageFilter
+      - Text-area coverage estimate — mostly-white pages score lower
+
+    Returns (score: float, details: dict)."""
+    try:
+        gray = img.convert("L")
+        w, h = gray.size
+        # Downsample for speed
+        if w > 600:
+            scale = 600 / w
+            gray = gray.resize((600, int(h * scale)), Image.LANCZOS)
+
+        dw, dh = gray.size
+        pixels = list(gray.getdata())
+        total = len(pixels)
+        if total == 0:
+            gray.close()
+            return 0.0, {"error": "empty image"}
+
+        # Find non-white bounding box for masked std_dev
+        # Scan rows/cols to find extent of non-white content (< 240)
+        min_x, min_y, max_x, max_y = dw, dh, 0, 0
+        for y_idx in range(dh):
+            row_start = y_idx * dw
+            for x_idx in range(dw):
+                if pixels[row_start + x_idx] < 240:
+                    min_x = min(min_x, x_idx)
+                    min_y = min(min_y, y_idx)
+                    max_x = max(max_x, x_idx)
+                    max_y = max(max_y, y_idx)
+
+        has_content_box = max_x > min_x and max_y > min_y
+        if has_content_box:
+            # Compute std_dev over the content bounding box crop
+            crop_pixels = []
+            for y_idx in range(min_y, max_y + 1):
+                row_start = y_idx * dw
+                for x_idx in range(min_x, max_x + 1):
+                    crop_pixels.append(pixels[row_start + x_idx])
+            crop_total = len(crop_pixels)
+            crop_mean = sum(crop_pixels) / crop_total
+            crop_var = sum((p - crop_mean) ** 2 for p in crop_pixels) / crop_total
+            masked_std = crop_var ** 0.5
+        else:
+            # No content found — use whole-page
+            masked_std = 0.0
+
+        # Also compute whole-page std_dev (for reference/logging)
+        mean_val = sum(pixels) / total
+        variance = sum((p - mean_val) ** 2 for p in pixels) / total
+        whole_std = variance ** 0.5
+
+        # Use masked std_dev for scoring (more accurate for sparse pages)
+        std_dev = masked_std if has_content_box else whole_std
+        # Normalize: masked std_dev of 70+ is good (content area has real contrast),
+        # below 20 is poor (faded within the content region itself)
+        contrast_score = min(1.0, max(0.0, (std_dev - 15) / 60))
+
+        # Sharpness: edge density via PIL FIND_EDGES filter
+        from PIL import ImageFilter
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edge_pixels = list(edges.getdata())
+        edges.close()
+        edge_mean = sum(edge_pixels) / len(edge_pixels)
+        # Normalize: edge mean of 15+ is sharp, below 3 is blurry
+        sharpness_score = min(1.0, max(0.0, (edge_mean - 2) / 15))
+
+        # Content coverage: % of pixels in text range (30-200)
+        text_pixels = sum(1 for p in pixels if 30 < p < 200)
+        coverage = text_pixels / total
+        coverage_score = min(1.0, coverage * 5)  # 20% coverage = full score
+
+        gray.close()
+
+        # Weighted combination
+        score = 0.4 * contrast_score + 0.4 * sharpness_score + 0.2 * coverage_score
+
+        details = {
+            "std_dev_masked": round(std_dev, 1),
+            "std_dev_whole": round(whole_std, 1),
+            "edge_mean": round(edge_mean, 1),
+            "contrast_score": round(contrast_score, 3),
+            "sharpness_score": round(sharpness_score, 3),
+            "coverage_score": round(coverage_score, 3),
+            "content_coverage_pct": round(coverage * 100, 1),
+            "content_bbox": [min_x, min_y, max_x, max_y] if has_content_box else None,
+        }
+        return round(score, 3), details
+
+    except Exception as e:
+        return 0.5, {"error": str(e)}
+
+
+def _deskew_page(img):
+    """Detect and correct small skew angles (< DESKEW_MAX_ANGLE degrees).
+    Uses Tesseract OSD for angle detection on a downscaled thumbnail.
+    Returns (corrected_img, angle_applied, confidence)."""
+    if not HAS_TESSERACT:
+        return img, 0.0, 0.0
+
+    try:
+        w, h = img.size
+        # Downscale for OSD speed
+        max_dim = max(w, h)
+        if max_dim > 1000:
+            scale = 800 / max_dim
+            osd_img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        else:
+            osd_img = img
+
+        osd = pytesseract.image_to_osd(osd_img, output_type=pytesseract.Output.DICT)
+        if osd_img is not img:
+            osd_img.close()
+
+        # OSD reports rotation in 90-degree increments (handled by auto_rotate).
+        # For deskew, we look at the script orientation angle if available,
+        # or use pytesseract's detailed angle detection.
+        # Since standard OSD doesn't give sub-degree skew, we use image_to_osd
+        # "rotate" for coarse and rely on the confidence + angle for fine tuning.
+        angle = float(osd.get("rotate", 0))
+        conf = float(osd.get("orientation_conf", 0))
+
+        # Only handle small residual skew (not 90/180/270 — that's auto_rotate's job)
+        if angle in (0, 90, 180, 270):
+            # No sub-degree skew detected by OSD — this is expected
+            # For fine deskew, try a projection-profile approach
+            return img, 0.0, conf
+
+        # Small angle detected
+        if abs(angle) <= DESKEW_MAX_ANGLE and conf >= DESKEW_MIN_CONFIDENCE:
+            img = img.rotate(-angle, expand=True, fillcolor=(255, 255, 255))
+            return img, angle, conf
+
+        return img, 0.0, conf
+    except Exception:
+        return img, 0.0, 0.0
+
+
+def _enhance_contrast(img):
+    """Boost contrast on low-contrast pages. Returns (enhanced_img, was_enhanced).
+    Uses masked std_dev (non-white bounding box) so sparse-text pages with good
+    local contrast aren't falsely enhanced. Guardrail: pages with < 0.2% non-white
+    pixels skip enhancement (nearly blank — nothing meaningful to boost).
+    Uses pure PIL (no numpy required)."""
+    try:
+        gray = img.convert("L")
+        w, h = gray.size
+        # Quick check on downsampled version
+        if w > 600:
+            scale = 600 / w
+            check_img = gray.resize((600, int(h * scale)), Image.LANCZOS)
+        else:
+            check_img = gray
+
+        dw, dh = check_img.size
+        pixels = list(check_img.getdata())
+        if check_img is not gray:
+            check_img.close()
+        gray.close()
+
+        total = len(pixels)
+        if total == 0:
+            return img, False
+
+        # Guardrail: skip near-blank pages (< 0.2% non-white) — nothing to enhance
+        non_white_count = sum(1 for p in pixels if p < 240)
+        non_white_pct = (non_white_count / total) * 100
+        if non_white_pct < 0.2:
+            return img, False
+
+        # Masked std_dev: compute over non-white bounding box crop
+        min_x, min_y, max_x, max_y = dw, dh, 0, 0
+        for y_idx in range(dh):
+            row_start = y_idx * dw
+            for x_idx in range(dw):
+                if pixels[row_start + x_idx] < 240:
+                    min_x = min(min_x, x_idx)
+                    min_y = min(min_y, y_idx)
+                    max_x = max(max_x, x_idx)
+                    max_y = max(max_y, y_idx)
+
+        if max_x > min_x and max_y > min_y:
+            crop_pixels = []
+            for y_idx in range(min_y, max_y + 1):
+                row_start = y_idx * dw
+                for x_idx in range(min_x, max_x + 1):
+                    crop_pixels.append(pixels[row_start + x_idx])
+            crop_total = len(crop_pixels)
+            crop_mean = sum(crop_pixels) / crop_total
+            crop_var = sum((p - crop_mean) ** 2 for p in crop_pixels) / crop_total
+            std_dev = crop_var ** 0.5
+        else:
+            # No content bounding box — use whole-page
+            mean_val = sum(pixels) / total
+            variance = sum((p - mean_val) ** 2 for p in pixels) / total
+            std_dev = variance ** 0.5
+
+        if std_dev >= CONTRAST_MIN_STD:
+            return img, False  # Content area has good contrast
+
+        # Apply autocontrast enhancement using PIL
+        from PIL import ImageOps
+        enhanced = ImageOps.autocontrast(img, cutoff=1)
+        return enhanced, True
+
+    except Exception:
+        return img, False
+    except Exception:
+        return img, False
+
+
+def preprocess_page(img, page_num=None, page_text=None):
+    """Run full preprocessing on a single page image.
+
+    Steps (in order):
+      1. Blank page detection → skip if blank (with text override)
+      2. Deskew (small angle correction)
+      3. Contrast enhancement (if needed)
+      4. Quality score computation
+
+    Args:
+        img: PIL Image (already auto-rotated by auto_rotate())
+        page_num: 1-based page number (for logging)
+        page_text: Optional text from text-layer or OCR. Used to override
+                   blank detection on sparse-but-meaningful pages.
+
+    Returns:
+        (processed_img, metadata_dict)
+        metadata_dict keys:
+            is_blank, blank_reason, pct_non_white, deskew_angle, deskew_conf,
+            contrast_enhanced, quality_score, quality_details, dpi,
+            original_size, processed_size
+    """
+    tag = f"Page {page_num}" if page_num else "Page"
+    meta = {
+        "page_num": page_num,
+        "is_blank": False,
+        "blank_reason": "not_blank",
+        "pct_non_white": 0.0,
+        "deskew_angle": 0.0,
+        "deskew_conf": 0.0,
+        "contrast_enhanced": False,
+        "quality_score": 0.5,
+        "quality_details": {},
+        "original_size": list(img.size),
+    }
+
+    # 1. Blank detection (with text override for sparse-but-meaningful pages)
+    is_blank, pct_non_white, blank_reason = _is_blank_page(img, page_text=page_text)
+    meta["is_blank"] = is_blank
+    meta["blank_reason"] = blank_reason
+    meta["pct_non_white"] = round(pct_non_white, 2)
+    if is_blank:
+        meta["quality_score"] = 0.0
+        meta["processed_size"] = list(img.size)
+        return img, meta
+
+    # 2. Deskew
+    img, deskew_angle, deskew_conf = _deskew_page(img)
+    meta["deskew_angle"] = round(deskew_angle, 2)
+    meta["deskew_conf"] = round(deskew_conf, 1)
+
+    # 3. Contrast enhancement
+    img, was_enhanced = _enhance_contrast(img)
+    meta["contrast_enhanced"] = was_enhanced
+
+    # 4. Quality score
+    score, details = _compute_quality_score(img)
+    meta["quality_score"] = score
+    meta["quality_details"] = details
+    meta["processed_size"] = list(img.size)
+
+    return img, meta
+
+
+def extract_text_per_page(pdf_path):
+    """Extract embedded text layer from a PDF using PyMuPDF (fitz).
+    Returns a list of strings, one per page. Pages without text return ''.
+    This is instant (no OCR) and only works on digitally-generated PDFs."""
+    if not HAS_PYMUPDF:
+        return None
+    try:
+        doc = fitz.open(pdf_path)
+        page_texts = []
+        for page in doc:
+            page_texts.append(page.get_text("text") or "")
+        doc.close()
+        return page_texts
+    except Exception as e:
+        print(f"  PyMuPDF text extraction failed: {e}")
+        return None
+
+
+def has_meaningful_text(page_texts):
+    """Determine if the PDF has a usable embedded text layer.
+    Thresholds:
+      - Each page needs TEXT_MIN_CHARS_PER_PAGE (200) chars to count as "meaningful"
+      - At least min(2, ceil(n_pages * 0.25)) pages must be meaningful
+      - Total chars across meaningful pages >= TEXT_MIN_TOTAL_CHARS (800)
+    Returns (bool, stats_dict) — stats dict has counts for logging."""
+    if not page_texts:
+        return False, {"meaningful_pages": 0, "total_pages": 0, "total_chars": 0, "reason": "no_text_data"}
+
+    n_pages = len(page_texts)
+    meaningful_pages = 0
+    total_chars = 0
+    per_page_chars = []
+
+    for text in page_texts:
+        char_count = len(text.strip())
+        per_page_chars.append(char_count)
+        if char_count >= TEXT_MIN_CHARS_PER_PAGE:
+            meaningful_pages += 1
+            total_chars += char_count
+
+    min_required = min(2, math.ceil(n_pages * 0.25))
+    stats = {
+        "meaningful_pages": meaningful_pages,
+        "total_pages": n_pages,
+        "total_chars": total_chars,
+        "min_pages_required": min_required,
+        "per_page_chars": per_page_chars,
+    }
+
+    if meaningful_pages < min_required:
+        stats["reason"] = f"too_few_meaningful_pages ({meaningful_pages}/{min_required})"
+        return False, stats
+    if total_chars < TEXT_MIN_TOTAL_CHARS:
+        stats["reason"] = f"too_few_total_chars ({total_chars}/{TEXT_MIN_TOTAL_CHARS})"
+        return False, stats
+
+    stats["reason"] = "pass"
+    return True, stats
+
+
+def pdf_to_images(pdf_path, dpi=DPI, page_texts=None):
+    """Convert PDF to base64 JPEG strings (for API). Auto-rotates sideways pages,
+    then preprocesses each page (deskew, contrast, blank detection, quality scoring).
+    PIL images are freed after encoding to minimize memory usage.
+
+    Args:
+        pdf_path: Path to PDF file
+        dpi: Render DPI (default 250)
+        page_texts: Optional list[str] from extract_text_per_page(). Used to override
+                    blank detection on sparse-but-meaningful pages.
+
+    Returns:
+        (b64_images, page_preprocessing)
+        b64_images: list[str] — base64 JPEG per page (blank pages included but flagged)
+        page_preprocessing: list[dict] — per-page preprocessing metadata
+    """
     print(f"Converting PDF at {dpi} DPI...")
     raw_images = convert_from_path(pdf_path, dpi=dpi)
     b64_images = []
+    page_preprocessing = []
     rotated_count = 0
+    blank_count = 0
+    enhanced_count = 0
+    deskewed_count = 0
+    quality_scores = []
+
+    print(f"\n── Preprocessing ({len(raw_images)} pages) ──")
     for i, img in enumerate(raw_images):
+        page_num = i + 1
         orig_size = img.size
+
+        # Step 1: Auto-rotate (existing — handles 90/180/270)
         img = auto_rotate(img)
-        if img.size != orig_size:
+        was_rotated = img.size != orig_size
+        if was_rotated:
             rotated_count += 1
-            print(f"  Page {i+1}: auto-rotated ({orig_size[0]}x{orig_size[1]} -> {img.size[0]}x{img.size[1]})")
+
+        # Step 2: Preprocess (deskew, contrast, blank detection, quality score)
+        pt = page_texts[i] if page_texts and i < len(page_texts) else None
+        img, preprocess_meta = preprocess_page(img, page_num=page_num, page_text=pt)
+        preprocess_meta["dpi"] = dpi
+        preprocess_meta["was_rotated"] = was_rotated
+        if was_rotated:
+            preprocess_meta["rotation_from"] = list(orig_size)
+            preprocess_meta["rotation_to"] = list(img.size)
+
+        # Track stats
+        if preprocess_meta["is_blank"]:
+            blank_count += 1
+        if preprocess_meta["contrast_enhanced"]:
+            enhanced_count += 1
+        if preprocess_meta["deskew_angle"] != 0:
+            deskewed_count += 1
+        quality_scores.append(preprocess_meta["quality_score"])
+
+        # Encode to base64 JPEG (even blank pages — downstream uses page index)
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=85)
         b64_images.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
+        page_preprocessing.append(preprocess_meta)
         img.close()  # Free PIL image memory
+
+        # Per-page status line
+        flags = []
+        if preprocess_meta["is_blank"]:
+            flags.append("BLANK")
+        if was_rotated:
+            flags.append("rotated")
+        if preprocess_meta["deskew_angle"] != 0:
+            flags.append(f"deskew {preprocess_meta['deskew_angle']}°")
+        if preprocess_meta["contrast_enhanced"]:
+            flags.append("contrast+")
+        q = preprocess_meta["quality_score"]
+        if q < QUALITY_POOR:
+            flags.append(f"quality={q:.2f} LOW")
+        elif q < QUALITY_GOOD:
+            flags.append(f"quality={q:.2f}")
+
+        if flags:
+            print(f"  Page {page_num}: {', '.join(flags)}")
+
     del raw_images  # Release reference to all raw images
-    print(f"  {len(b64_images)} pages converted" + (f" ({rotated_count} auto-rotated)" if rotated_count else ""))
-    return b64_images
+
+    # Summary
+    parts = [f"{len(b64_images)} pages converted"]
+    if rotated_count:
+        parts.append(f"{rotated_count} rotated")
+    if blank_count:
+        parts.append(f"{blank_count} blank")
+    if deskewed_count:
+        parts.append(f"{deskewed_count} deskewed")
+    if enhanced_count:
+        parts.append(f"{enhanced_count} contrast-enhanced")
+    if quality_scores:
+        avg_q = sum(quality_scores) / len(quality_scores)
+        parts.append(f"avg quality={avg_q:.2f}")
+    print(f"  {' | '.join(parts)}")
+
+    return b64_images, page_preprocessing
 
 def ocr_page(pil_image, page_num=None):
-    """Run Tesseract OCR on a PIL image. Returns text or None."""
+    """Run Tesseract OCR on a PIL image. Returns (text, conf_avg) tuple.
+    text: OCR text string or None. conf_avg: average word confidence (0-100) or None.
+    Pages are already auto-rotated in pdf_to_images(), so we only need one pass."""
     if not HAS_TESSERACT:
-        return None
+        return None, None
     tag = f"[Page {page_num}] " if page_num else ""
     try:
-        # Try standard orientation first
         text = pytesseract.image_to_string(pil_image, config='--oem 3 --psm 6')
         if text and len(text.strip()) >= OCR_MIN_CHARS:
-            return text
-        # Try auto-orientation for sideways pages
+            conf_avg = _ocr_confidence(pil_image)
+            return text, conf_avg
+        # Fallback: try auto-orientation mode for pages that may have mixed orientations
         text2 = pytesseract.image_to_string(pil_image, config='--oem 3 --psm 1')
-        if text2 and len(text2.strip()) > len(text.strip()):
+        if text2 and len(text2.strip()) > len((text or "").strip()):
             text = text2
-        if text and len(text.strip()) >= OCR_MIN_CHARS:
-            return text
-        # Try rotated 90 degrees
-        rotated = pil_image.rotate(-90, expand=True)
-        text3 = pytesseract.image_to_string(rotated, config='--oem 3 --psm 6')
-        if text3 and len(text3.strip()) > len(text.strip()):
-            return text3
-        if text and len(text.strip()) > 30:  # Accept even short text
-            return text
+        if text and len(text.strip()) > 30:
+            conf_avg = _ocr_confidence(pil_image)
+            return text, conf_avg
         print(f"  {tag}OCR: too little text ({len(text.strip()) if text else 0} chars)")
-        return None
+        return None, None
     except Exception as e:
         print(f"  {tag}OCR error: {e}")
+        return None, None
+
+
+def _ocr_confidence(pil_image):
+    """Extract average per-word OCR confidence from Tesseract image_to_data.
+    Returns float (0-100) or None if unavailable."""
+    try:
+        data = pytesseract.image_to_data(pil_image, output_type=pytesseract.Output.DICT,
+                                          config='--oem 3 --psm 6')
+        confs = [c for c in data.get("conf", []) if isinstance(c, (int, float)) and c >= 0]
+        if confs:
+            return round(sum(confs) / len(confs), 1)
+        return None
+    except Exception:
         return None
 
 def ocr_all_pages(pil_images):
-    """OCR every page upfront using parallel threads. Returns list of text (or None for failed pages)."""
+    """OCR every page upfront using parallel threads.
+    Returns (ocr_texts, ocr_confidences) — two parallel lists.
+    ocr_texts[i]: text string or None. ocr_confidences[i]: avg confidence (0-100) or None.
+    Entries in pil_images may be None (blank pages) — these are skipped."""
     print("\n── OCR Pass (Tesseract) ──")
+    n = len(pil_images)
     if not HAS_TESSERACT:
         print("  Tesseract not available — all pages will use vision")
-        return [None] * len(pil_images)
+        return [None] * n, [None] * n
 
-    results = [None] * len(pil_images)
+    ocr_texts = [None] * n
+    ocr_confs = [None] * n
     good = 0
+    skipped = 0
 
     def _ocr_one(i, img):
-        return i, ocr_page(img, i + 1)
+        text, conf = ocr_page(img, i + 1)
+        return i, text, conf
 
-    with ThreadPoolExecutor(max_workers=min(4, len(pil_images))) as pool:
-        futures = {pool.submit(_ocr_one, i, img): i for i, img in enumerate(pil_images)}
+    # Only submit non-None images to the thread pool
+    ocr_tasks = [(i, img) for i, img in enumerate(pil_images) if img is not None]
+    if not ocr_tasks:
+        print("  No pages to OCR (all blank)")
+        return ocr_texts, ocr_confs
+
+    with ThreadPoolExecutor(max_workers=min(8, len(ocr_tasks))) as pool:
+        futures = {pool.submit(_ocr_one, i, img): i for i, img in ocr_tasks}
         for future in as_completed(futures):
-            i, text = future.result()
-            results[i] = text
+            i, text, conf = future.result()
+            ocr_texts[i] = text
+            ocr_confs[i] = conf
 
-    for i, text in enumerate(results):
-        if text:
+    for i, text in enumerate(ocr_texts):
+        if pil_images[i] is None:
+            skipped += 1
+            print(f"  Page {i+1}: ○ skipped (blank)")
+        elif text:
             good += 1
             chars = len(text.strip())
             nums = len(re.findall(r'\d+[,.]?\d*', text))
-            print(f"  Page {i+1}: ✓ {chars} chars, {nums} numbers found")
+            conf_str = f", conf {ocr_confs[i]:.0f}%" if ocr_confs[i] is not None else ""
+            print(f"  Page {i+1}: ✓ {chars} chars, {nums} numbers found{conf_str}")
         else:
             print(f"  Page {i+1}: ✗ OCR failed — will use vision")
-    print(f"  OCR success: {good}/{len(pil_images)} pages")
-    return results
+    total_non_blank = n - skipped
+    print(f"  OCR success: {good}/{total_non_blank} pages" + (f" ({skipped} blank skipped)" if skipped else ""))
+    return ocr_texts, ocr_confs
+
+
+# ─── PER-PAGE ROUTING (T1.2) ───────────────────────────────────────────────
+
+def route_pages(page_texts, ocr_texts, ocr_confidences, preproc_meta):
+    """Determine the optimal extraction method for each page independently.
+
+    Returns list[dict] — one routing entry per page:
+      {page_num, blank, text_chars, text_words, digit_ratio,
+       ocr_chars, ocr_conf_avg, method, reason}
+
+    Methods: "text_layer", "ocr", "vision", "skip_blank"
+    """
+    n = len(preproc_meta)
+    routing_plan = []
+    counts = {"text_layer": 0, "ocr": 0, "vision": 0, "skip_blank": 0}
+
+    print("\n── Per-Page Routing ──")
+
+    for i in range(n):
+        page_num = i + 1
+        meta = preproc_meta[i] if i < len(preproc_meta) else {}
+
+        # ─── Compute stats ───
+        pt = page_texts[i] if page_texts and i < len(page_texts) else None
+        ot = ocr_texts[i] if ocr_texts and i < len(ocr_texts) else None
+
+        text_chars = len(pt.strip()) if pt else 0
+        text_words = len(pt.split()) if pt else 0
+        ocr_chars = len(ot.strip()) if ot else 0
+        ocr_conf = ocr_confidences[i] if ocr_confidences and i < len(ocr_confidences) else None
+
+        # Digit ratio: fraction of digits in best available text
+        best_text = pt or ot or ""
+        total_len = len(best_text.strip())
+        digit_count = sum(1 for c in best_text if c.isdigit())
+        digit_ratio = round(digit_count / total_len, 3) if total_len > 0 else 0.0
+
+        entry = {
+            "page_num": page_num,
+            "blank": False,
+            "text_chars": text_chars,
+            "text_words": text_words,
+            "digit_ratio": digit_ratio,
+            "ocr_chars": ocr_chars,
+            "ocr_conf_avg": ocr_conf,
+            "method": "vision",      # default
+            "reason": "insufficient_text_and_ocr",
+        }
+
+        # ─── Blank check (from preprocessing) ───
+        if meta.get("is_blank"):
+            entry["blank"] = True
+            entry["method"] = "skip_blank"
+            reason = meta.get("blank_reason", "blank_true")
+            entry["reason"] = f"blank_{reason}" if not reason.startswith("blank_") else reason
+            counts["skip_blank"] += 1
+            print(f"  Page {page_num}: skip_blank ({entry['reason']})")
+            routing_plan.append(entry)
+            continue
+
+        # ─── Text-layer checks ───
+        if text_chars >= ROUTE_TEXT_MIN_CHARS:
+            entry["method"] = "text_layer"
+            entry["reason"] = f"text_chars>={ROUTE_TEXT_MIN_CHARS}"
+            counts["text_layer"] += 1
+            print(f"  Page {page_num}: text_layer ({entry['reason']}, {text_chars} chars)")
+            routing_plan.append(entry)
+            continue
+
+        if text_words >= ROUTE_TEXT_MIN_WORDS and text_chars >= ROUTE_TEXT_MIN_CHARS_ALT:
+            entry["method"] = "text_layer"
+            entry["reason"] = f"text_words>={ROUTE_TEXT_MIN_WORDS}+chars>={ROUTE_TEXT_MIN_CHARS_ALT}"
+            counts["text_layer"] += 1
+            print(f"  Page {page_num}: text_layer ({entry['reason']}, {text_words} words)")
+            routing_plan.append(entry)
+            continue
+
+        # ─── OCR checks ───
+        if ocr_chars >= ROUTE_OCR_MIN_CHARS:
+            entry["method"] = "ocr"
+            conf_str = f", conf {ocr_conf:.0f}%" if ocr_conf is not None else ""
+            entry["reason"] = f"ocr_chars>={ROUTE_OCR_MIN_CHARS}"
+            counts["ocr"] += 1
+            print(f"  Page {page_num}: ocr ({entry['reason']}, {ocr_chars} chars{conf_str})")
+            routing_plan.append(entry)
+            continue
+
+        if ocr_conf is not None and ocr_conf >= ROUTE_OCR_MIN_CONF:
+            entry["method"] = "ocr"
+            entry["reason"] = f"ocr_conf_avg>={ROUTE_OCR_MIN_CONF}"
+            counts["ocr"] += 1
+            print(f"  Page {page_num}: ocr ({entry['reason']}, conf {ocr_conf:.0f}%)")
+            routing_plan.append(entry)
+            continue
+
+        # ─── Fallback: vision ───
+        counts["vision"] += 1
+        print(f"  Page {page_num}: vision ({entry['reason']}, text={text_chars}, ocr={ocr_chars})")
+        routing_plan.append(entry)
+
+    parts = []
+    for m in ("text_layer", "ocr", "vision", "skip_blank"):
+        if counts[m] > 0:
+            parts.append(f"{counts[m]} {m}")
+    print(f"  Routing summary: {', '.join(parts)}")
+
+    return routing_plan
+
+
+# ─── PHASE 1.3: SECTION / FORM DETECTION ────────────────────────────────────
+
+def detect_sections(page_texts, routing_plan, ocr_texts=None):
+    """Classify each page by document section using keyword scoring.
+
+    Uses the best available text per page (text_layer or OCR, per routing_plan).
+    No external API calls — pure keyword matching.
+
+    Args:
+        page_texts: list[str|None] — PyMuPDF text-layer text per page
+        routing_plan: list[dict] — from route_pages(), one entry per page
+        ocr_texts: list[str|None] — Tesseract OCR text per page (optional)
+
+    Returns:
+        sections_by_page: dict[str, list[str]] — page number (str) → list of section labels
+            Example: {"1": ["cover"], "2": ["summary", "div"], "3": ["div"]}
+    """
+    n = len(routing_plan) if routing_plan else (len(page_texts) if page_texts else 0)
+    if n == 0:
+        return {}
+
+    sections_by_page = {}
+    label_counts = {}
+
+    print("\n── Section Detection ──")
+
+    for i in range(n):
+        page_num = i + 1
+        route = routing_plan[i] if routing_plan and i < len(routing_plan) else {}
+
+        # Skip blank pages
+        if route.get("blank") or route.get("method") == "skip_blank":
+            print(f"  Page {page_num}: (blank)")
+            continue
+
+        # Select best text source per routing decision
+        method = route.get("method", "vision")
+        if method == "text_layer":
+            text = page_texts[i] if page_texts and i < len(page_texts) else None
+        elif method == "ocr":
+            text = ocr_texts[i] if ocr_texts and i < len(ocr_texts) else None
+        else:
+            # Vision pages: try text_layer first, then OCR
+            text = None
+            if page_texts and i < len(page_texts) and page_texts[i]:
+                text = page_texts[i]
+            elif ocr_texts and i < len(ocr_texts) and ocr_texts[i]:
+                text = ocr_texts[i]
+
+        if not text or len(text.strip()) < 10:
+            sections_by_page[str(page_num)] = ["unknown"]
+            label_counts["unknown"] = label_counts.get("unknown", 0) + 1
+            print(f"  Page {page_num}: unknown (no text)")
+            continue
+
+        # Score against all section keyword lists
+        text_lower = text.lower()
+        scores = {}
+        hits = {}  # track which phrases matched for debugging
+
+        for section, phrases in SECTION_KEYWORDS.items():
+            section_score = 0.0
+            section_hits = []
+            for phrase, weight in phrases:
+                if phrase in text_lower:
+                    section_score += weight
+                    section_hits.append(phrase)
+            if section_score > 0:
+                scores[section] = section_score
+                hits[section] = section_hits
+
+        # Assign labels for sections above threshold
+        labels = []
+        for section, score in sorted(scores.items(), key=lambda x: -x[1]):
+            if score >= SECTION_SCORE_THRESHOLD:
+                labels.append(section)
+
+        if not labels:
+            labels = ["unknown"]
+
+        sections_by_page[str(page_num)] = labels
+
+        for lbl in labels:
+            label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
+        # Print details
+        if labels == ["unknown"]:
+            top_scores = sorted(scores.items(), key=lambda x: -x[1])[:2]
+            score_str = ", ".join(f"{s}={v:.0f}" for s, v in top_scores) if top_scores else "no hits"
+            print(f"  Page {page_num}: unknown ({score_str})")
+        else:
+            detail_parts = []
+            for lbl in labels:
+                s = scores.get(lbl, 0)
+                h = hits.get(lbl, [])
+                top_hit = h[0] if h else "?"
+                detail_parts.append(f"{lbl}={s:.0f}")
+            print(f"  Page {page_num}: {', '.join(labels)} ({', '.join(detail_parts)})")
+
+    # Summary line
+    parts = []
+    for lbl in ("summary", "div", "int", "oid", "b_summary", "b_transactions",
+                "k1_1065", "k1_1120s", "k1_1041", "cover", "continuation", "unknown"):
+        cnt = label_counts.get(lbl, 0)
+        if cnt > 0:
+            parts.append(f"{cnt} {lbl}")
+    print(f"  Section summary: {', '.join(parts) if parts else 'none'}")
+
+    return sections_by_page
+
 
 import time as _time
 
@@ -1463,14 +2709,106 @@ def group_pages(classifications):
     return groups
 
 
+# ─── T1.5: PRIORITY SCHEDULING ──────────────────────────────────────────────
+
+def build_priority_queue(groups, sections_by_page):
+    """Reorder groups by section importance for progressive extraction.
+
+    Uses SECTION_PRIORITY to sort groups so that summary/K-1/income pages
+    extract first, transaction/cover/continuation pages extract last.
+    Stable sort: same-priority groups maintain original document order.
+    """
+    if not sections_by_page:
+        return groups
+
+    def _group_priority(group):
+        all_pages = group.get("pages", []) + group.get("continuation_pages", [])
+        labels = []
+        for pnum in all_pages:
+            labels.extend(sections_by_page.get(str(pnum), []))
+        if not labels:
+            return 5  # default priority for pages with no section labels
+        return min(SECTION_PRIORITY.get(lbl, 5) for lbl in labels)
+
+    ordered = sorted(groups, key=_group_priority)
+
+    # Print priority summary
+    parts = []
+    for g in ordered:
+        dtype = g.get("document_type", "?")
+        pages = g.get("pages", [])
+        pri = _group_priority(g)
+        if len(pages) == 1:
+            parts.append(f"{dtype}(p.{pages[0]},pri={pri})")
+        else:
+            parts.append(f"{dtype}(pp.{pages[0]}-{pages[-1]},pri={pri})")
+    print(f"  Priority order: {' → '.join(parts)}")
+
+    return ordered
+
+
+def build_review_queue(extractions, sections_by_page=None):
+    """Sort fields by review importance for the operator.
+
+    Returns list of {page, field, priority, confidence} dicts sorted by
+    priority (most important to review first).
+
+    Priority order:
+      1 = needs_review / low confidence
+      2 = consensus disagreement (_consensus_top2 present)
+      3 = medium confidence
+      4 = high / verified_confirmed
+      5 = auto_verified (already verified — lowest review priority)
+    """
+    queue = []
+    for ext in extractions:
+        page = ext.get("_page")
+        if not page:
+            continue
+        fields = ext.get("fields", {})
+        for fname, fdata in fields.items():
+            if not isinstance(fdata, dict):
+                continue
+            val = fdata.get("value")
+            if val is None:
+                continue
+            conf = fdata.get("confidence", "medium")
+            has_disagreement = "_consensus_top2" in fdata
+
+            if conf in ("needs_review", "low"):
+                pri = 1
+            elif has_disagreement:
+                pri = 2
+            elif conf == "medium":
+                pri = 3
+            elif conf in ("high", "verified_confirmed", "verified_corrected",
+                          "dual_confirmed", "multipage_verified", "consensus_accepted"):
+                pri = 4
+            elif conf == "auto_verified":
+                pri = 5
+            else:
+                pri = 3  # default
+
+            queue.append({
+                "page": page,
+                "field": fname,
+                "priority": pri,
+                "confidence": conf,
+            })
+
+    queue.sort(key=lambda q: (q["priority"], q["page"]))
+    return queue
+
+
 # ─── PHASE 2: EXTRACT (Vision) ───────────────────────────────────────────────
 
-def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user_notes="", ai_instructions="", ocr_texts=None):
+def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user_notes="", ai_instructions="", ocr_texts=None, page_texts=None, routing_plan=None, sections_by_page=None, output_path=None):
     """
-    For each page, try OCR-text extraction first (cheap text call).
-    If OCR quality is poor or Claude flags needs_image_review, fall back to
-    vision extraction. PII redaction (if tokenizer provided) blacks out
-    sensitive data in images. Uses concurrent API calls for speed.
+    For each page, use routing_plan to select extraction method (text_layer/ocr/vision).
+    Falls back to original priority cascade if routing_plan is None.
+    Priority: PyMuPDF text layer (best) → Tesseract OCR (good) → Claude vision (expensive).
+    PII redaction (if tokenizer provided) blacks out sensitive data in images.
+    Uses concurrent API calls for speed.
     """
     print(f"\n── Phase 2: Extraction ({MAX_CONCURRENT} concurrent) ──")
 
@@ -1485,6 +2823,10 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
         print(f"  AI instructions: {ai_instructions[:100]}{'...' if len(ai_instructions) > 100 else ''}")
     if user_notes:
         extra_context += f"\n\nADDITIONAL CONTEXT: {user_notes}"
+
+    # T1.5: Priority reorder groups so high-value pages extract first
+    if sections_by_page:
+        groups = build_priority_queue(groups, sections_by_page)
 
     # Separate groups into single-page work items vs multi-page batches
     work_items = []       # (group, page_number) for single-page extraction
@@ -1508,8 +2850,15 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
             for pnum in all_pages:
                 work_items.append((group, pnum))
 
-    # ─── Process multi-page groups first (K-1 + continuations in one call) ───
+    # ─── T1.5: Batch extraction with partial writes ───
     extractions = []
+    extraction_start = time.monotonic()
+    first_values_time = None
+    batch_num = 0
+    # Count total batches: 1 per multipage group + ceil(single-pages / 3)
+    total_batches = len(multipage_groups) + ((len(work_items) + 2) // 3 if work_items else 0)
+
+    # ─── Process multi-page groups first (K-1 + continuations in one call) ───
     for group in multipage_groups:
         dtype = group["document_type"]
         ein = group.get("payer_ein", "")
@@ -1550,6 +2899,24 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
             print(f"    Multi-page failed — falling back to individual pages")
             for pnum in all_pages:
                 work_items.append((group, pnum))
+            # Recompute total_batches since work_items grew
+            total_batches = batch_num + len(multipage_groups) - (batch_num) + ((len(work_items) + 2) // 3 if work_items else 0)
+
+        # T1.5: Emit batch event after each multi-page group
+        batch_num += 1
+        if extractions and first_values_time is None:
+            first_values_time = round(time.monotonic() - extraction_start, 2)
+            print(f"FIRST_VALUES_READY:{first_values_time}")
+        if output_path:
+            write_partial_results(output_path, extractions, batch_num, total_batches,
+                                  time_to_first_values_s=first_values_time,
+                                  sections_by_page=sections_by_page)
+        # Count fields for progress event
+        total_fields = sum(
+            1 for e in extractions for f, fd in (e.get("fields") or {}).items()
+            if (fd.get("value") if isinstance(fd, dict) else fd) is not None
+        )
+        print(f"BATCH_COMPLETE:{batch_num}:{total_batches}:{total_fields}")
 
     # ─── Process single-page work items ───
 
@@ -1559,36 +2926,78 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
         is_brokerage = group.get("is_consolidated_brokerage", False)
         context = f"The document is classified as: {dtype}" + extra_context
 
-        # ─── OCR-first path: try cheap text call when OCR is good ───
-        ocr_text = ocr_texts[pnum - 1] if ocr_texts and pnum <= len(ocr_texts) else None
+        # ─── Routing-plan driven text source selection ───
+        text_source = None  # will be "text_layer" or "ocr"
+        best_text = None
+        route = routing_plan[pnum - 1] if routing_plan and pnum <= len(routing_plan) else None
+
+        if route and route.get("method") == "skip_blank":
+            return pnum, None  # blank page — skip extraction
+
+        planned = route.get("method") if route else None
+
+        if planned == "text_layer":
+            # Routing says text layer is best for this page
+            pt = page_texts[pnum - 1] if page_texts and pnum <= len(page_texts) else None
+            if pt and len(pt.strip()) > 0:
+                best_text = pt
+                text_source = "text_layer"
+        elif planned == "ocr":
+            # Routing says OCR is best for this page
+            ot = ocr_texts[pnum - 1] if ocr_texts and pnum <= len(ocr_texts) else None
+            if ot and len(ot.strip()) > 0:
+                best_text = ot
+                text_source = "ocr"
+        elif planned == "vision":
+            # Routing says go straight to vision
+            pass
+        else:
+            # No routing plan — original cascade logic (backward compat)
+            if page_texts and pnum <= len(page_texts):
+                pt = page_texts[pnum - 1]
+                if pt and len(pt.strip()) >= TEXT_MIN_CHARS_PER_PAGE:
+                    best_text = pt
+                    text_source = "text_layer"
+            if not best_text:
+                ocr_text = ocr_texts[pnum - 1] if ocr_texts and pnum <= len(ocr_texts) else None
+                if ocr_text and len(ocr_text.strip()) >= 200:
+                    best_text = ocr_text
+                    text_source = "ocr"
+
+        # ─── Text-first path: try cheap text call when text is good ───
         method = "vision"  # default
 
-        if ocr_text and len(ocr_text.strip()) >= 200:
+        if best_text:
             text_prompt = OCR_EXTRACTION_PROMPT.replace("{doc_type}", dtype)
             if extra_context:
                 text_prompt += extra_context
-            r = call_claude_text(client, ocr_text, text_prompt, pnum, tokenizer=tokenizer, phase="extract_text")
+            phase_tag = "extract_text_layer" if text_source == "text_layer" else "extract_text"
+            r = call_claude_text(client, best_text, text_prompt, pnum, tokenizer=tokenizer, phase=phase_tag)
             if r:
                 ocr_quality = r.get("ocr_quality", "partial")
                 needs_image = r.get("needs_image_review", False)
                 fields_needing_image = r.get("fields_needing_image", [])
 
                 if ocr_quality == "good" and not needs_image:
-                    method = "ocr_text"
-                    print(f"    Page {pnum}: OCR sufficient → text extraction (saved vision call)")
+                    method = "text_layer" if text_source == "text_layer" else "ocr_text"
+                    src_label = "text layer" if text_source == "text_layer" else "OCR"
+                    print(f"    Page {pnum}: {src_label} sufficient → text extraction (saved vision call)")
                 elif ocr_quality == "partial" and not needs_image and fields_needing_image:
-                    method = "ocr_partial"
+                    method = "text_layer_partial" if text_source == "text_layer" else "ocr_partial"
                     r["_ambiguous_fields"] = fields_needing_image
-                    print(f"    Page {pnum}: OCR partial — {len(fields_needing_image)} fields need image check")
+                    src_label = "text layer" if text_source == "text_layer" else "OCR"
+                    print(f"    Page {pnum}: {src_label} partial — {len(fields_needing_image)} fields need image check")
                 else:
                     r = None
-                    print(f"    Page {pnum}: OCR quality '{ocr_quality}' — falling back to vision")
+                    src_label = "text layer" if text_source == "text_layer" else "OCR"
+                    print(f"    Page {pnum}: {src_label} quality '{ocr_quality}' — falling back to vision")
 
                 if r:
                     r["_group"] = group
                     r["_page"] = pnum
                     r["_is_brokerage"] = is_brokerage
                     r["_extraction_method"] = method
+                    r["_text_source"] = text_source
                     r["payer_ein"] = ein or r.get("payer_ein", "")
                     return pnum, r
 
@@ -1600,37 +3009,79 @@ def extract_data(client, b64_images, groups, tokenizer=None, doc_type=None, user
             r["_page"] = pnum
             r["_is_brokerage"] = is_brokerage
             r["_extraction_method"] = "vision"
+            r["_text_source"] = "none"
             r["payer_ein"] = ein or r.get("payer_ein", "")
             print(f"    Page {pnum}: vision extracted")
         return pnum, r
 
     total = len(work_items)
+    text_layer_saved = 0
     ocr_saved = 0
 
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
-        futures = {pool.submit(_extract_one, grp, pn): pn for grp, pn in work_items}
-        for future in as_completed(futures):
-            pnum, r = future.result()
-            if r:
-                extractions.append(r)
-                m = r.get("_extraction_method", "vision")
-                if m in ("ocr_text", "ocr_partial"):
-                    ocr_saved += 1
-                for fname, fdata in r.get("fields", {}).items():
-                    val = fdata.get("value") if isinstance(fdata, dict) else fdata
-                    if val is not None and val != 0 and val != "0" and val != 0.0:
-                        conf = fdata.get("confidence", "?") if isinstance(fdata, dict) else "?"
-                        print(f"      {fname}: {val} ({conf})")
-            else:
-                print(f"    Page {pnum}: extraction failed")
+    # T1.5: Split single-page work into batches of 3 for progressive results
+    BATCH_SIZE = 3
+    for batch_start in range(0, len(work_items), BATCH_SIZE):
+        batch = work_items[batch_start:batch_start + BATCH_SIZE]
+        batch_num += 1
+
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+            futures = {pool.submit(_extract_one, grp, pn): pn for grp, pn in batch}
+            for future in as_completed(futures):
+                pnum, r = future.result()
+                if r:
+                    r["_batch"] = batch_num
+                    extractions.append(r)
+                    m = r.get("_extraction_method", "vision")
+                    if m in ("text_layer", "text_layer_partial"):
+                        text_layer_saved += 1
+                    elif m in ("ocr_text", "ocr_partial"):
+                        ocr_saved += 1
+                    for fname, fdata in r.get("fields", {}).items():
+                        val = fdata.get("value") if isinstance(fdata, dict) else fdata
+                        if val is not None and val != 0 and val != "0" and val != 0.0:
+                            conf = fdata.get("confidence", "?") if isinstance(fdata, dict) else "?"
+                            print(f"      {fname}: {val} ({conf})")
+                else:
+                    print(f"    Page {pnum}: extraction failed")
+
+        # T1.5: Emit batch event after each single-page batch
+        if extractions and first_values_time is None:
+            first_values_time = round(time.monotonic() - extraction_start, 2)
+            print(f"FIRST_VALUES_READY:{first_values_time}")
+        if output_path:
+            write_partial_results(output_path, extractions, batch_num, total_batches,
+                                  time_to_first_values_s=first_values_time,
+                                  sections_by_page=sections_by_page)
+        total_fields = sum(
+            1 for e in extractions for f, fd in (e.get("fields") or {}).items()
+            if (fd.get("value") if isinstance(fd, dict) else fd) is not None
+        )
+        print(f"BATCH_COMPLETE:{batch_num}:{total_batches}:{total_fields}")
+
+    print(f"FINALIZE_COMPLETE")
 
     # Sort by page number to maintain document order
     extractions.sort(key=lambda e: e.get("_page", 0))
 
+    # T1.5: Store streaming metadata for save_log
+    _streaming_meta = {
+        "time_to_first_values_s": first_values_time,
+        "batches_processed": batch_num,
+        "fields_streamed": sum(
+            1 for e in extractions for f, fd in (e.get("fields") or {}).items()
+            if (fd.get("value") if isinstance(fd, dict) else fd) is not None
+        ),
+    }
+
     print(f"\n  Extraction stats: {total} pages processed, {len(extractions)} successful")
+    if text_layer_saved:
+        print(f"  Text-layer: {text_layer_saved}/{total} pages used text layer (OCR + vision skipped)")
     if ocr_saved:
-        print(f"  OCR-first: {ocr_saved}/{total} pages used text extraction (vision calls saved)")
-    return extractions
+        print(f"  OCR-first: {ocr_saved}/{total} pages used OCR text (vision calls saved)")
+    vision_count = total - text_layer_saved - ocr_saved
+    if vision_count > 0 and (text_layer_saved > 0 or ocr_saved > 0):
+        print(f"  Vision: {vision_count}/{total} pages required vision fallback")
+    return extractions, _streaming_meta
 
 
 # ─── PHASE 3: VERIFY (cross-check OCR vs image for critical fields) ──────────
@@ -1670,6 +3121,9 @@ def verify_extractions(client, b64_images, extractions, tokenizer=None):
         for fname, fdata in fields.items():
             val = fdata.get("value") if isinstance(fdata, dict) else fdata
             if val is None: continue
+            # Skip fields already auto_verified by consensus layer (Phase 2.5)
+            if isinstance(fdata, dict) and fdata.get("confidence") == "auto_verified":
+                continue
             is_critical = fname in CRITICAL_FIELDS or fname in ambiguous_fields
             is_unclear = isinstance(fdata, dict) and not fdata.get("ocr_clear", True)
             is_low_conf = isinstance(fdata, dict) and fdata.get("confidence") == "low"
@@ -1702,6 +3156,16 @@ def verify_extractions(client, b64_images, extractions, tokenizer=None):
             for fname in fields:
                 if isinstance(fields[fname], dict) and fields[fname].get("confidence") in ("high", "medium"):
                     fields[fname]["confidence"] = "multipage_verified"
+            skip_indices.add(idx)
+            continue
+
+        # T1.4: Catch-all — if no fields need verification (all critical auto_verified
+        # by consensus or no critical fields at all), skip the vision call entirely.
+        if not has_critical and not fields_to_verify:
+            print(f"  Page {page}: {dtype} — all fields verified by consensus, skipping verification")
+            for fname in fields:
+                if isinstance(fields[fname], dict) and fields[fname].get("confidence") not in ("auto_verified",):
+                    fields[fname]["confidence"] = "consensus_accepted"
             skip_indices.add(idx)
             continue
 
@@ -1783,8 +3247,418 @@ def verify_extractions(client, b64_images, extractions, tokenizer=None):
             ext["_overall_confidence"] = "unverified"
             print(f"    Page {page}: Verification failed — keeping extraction as-is")
 
+    pages_verified = len(verify_work)
+    pages_skipped = len(skip_indices)
     print(f"\n  Verification: {confirmations} confirmed, {corrections} corrected, {total_fields} fields checked")
-    return extractions
+    print(f"  Verification: {pages_verified} pages verified, {pages_skipped} pages skipped")
+    return extractions, {"pages_verified": pages_verified, "pages_skipped": pages_skipped}
+
+
+# ─── PHASE 2.5: CONSENSUS VERIFICATION (T1.2.5) ────────────────────────────
+
+# Label patterns for finding amounts in raw text near known field labels.
+# Maps field_name → list of (regex_pattern, is_case_sensitive) pairs.
+_LABEL_PATTERNS = {
+    # 1099-DIV fields
+    "ordinary_dividends":       [r"(?:1a|ordinary\s+dividends)", r"total\s+ordinary\s+dividends"],
+    "div_ordinary_dividends":   [r"(?:1a|ordinary\s+dividends)", r"total\s+ordinary\s+dividends"],
+    "qualified_dividends":      [r"(?:1b|qualified\s+dividends)"],
+    "div_qualified_dividends":  [r"(?:1b|qualified\s+dividends)"],
+    "federal_wh":               [r"(?:4|federal\s+(?:income\s+)?tax\s+w(?:ith)?h(?:eld)?)"],
+    "div_federal_wh":           [r"(?:4|federal\s+(?:income\s+)?tax\s+w(?:ith)?h(?:eld)?)"],
+    "foreign_tax_paid":         [r"(?:7|foreign\s+tax\s+paid)"],
+    "div_foreign_tax_paid":     [r"(?:7|foreign\s+tax\s+paid)"],
+    # 1099-INT fields
+    "interest_income":          [r"(?:1|interest\s+income)", r"box\s*1"],
+    "int_interest_income":      [r"(?:1|interest\s+income)", r"box\s*1"],
+    "us_savings_bonds_and_treasury": [r"(?:3|u\.?s\.?\s+savings)", r"treasury"],
+    "int_us_savings_bonds_and_treasury": [r"(?:3|u\.?s\.?\s+savings)", r"treasury"],
+    "int_federal_wh":           [r"(?:4|federal\s+(?:income\s+)?tax\s+w(?:ith)?h(?:eld)?)"],
+    "int_foreign_tax_paid":     [r"(?:6|foreign\s+tax\s+paid)"],
+    # 1099-B / Schedule D
+    "b_total_gain_loss":        [r"(?:total\s+gain|net\s+gain)"],
+    "b_short_term_gain_loss":   [r"short.?term"],
+    "b_long_term_gain_loss":    [r"long.?term"],
+    "total_gain_loss":          [r"(?:total\s+gain|net\s+gain)"],
+    "short_term_gain_loss":     [r"short.?term"],
+    "long_term_gain_loss":      [r"long.?term"],
+    # K-1 boxes 1–9
+    "box1_ordinary_income":     [r"(?:box\s*1\b|ordinary\s+(?:business\s+)?income)", r"line\s*1\b"],
+    "box2_rental_real_estate":  [r"(?:box\s*2\b|net\s+rental\s+real\s+estate)", r"line\s*2\b"],
+    "box3_other_rental":        [r"(?:box\s*3\b|other\s+net\s+rental)", r"line\s*3\b"],
+    "box4a_guaranteed_services": [r"(?:box\s*4a|guaranteed\s+payments?\s+for\s+services)"],
+    "box5_interest":            [r"(?:box\s*5\b|interest\s+income)", r"line\s*5\b"],
+    "box6a_ordinary_dividends": [r"(?:box\s*6a|ordinary\s+dividends)"],
+    "box6b_qualified_dividends": [r"(?:box\s*6b|qualified\s+dividends)"],
+    "box7_royalties":           [r"(?:box\s*7\b|royalties)", r"line\s*7\b"],
+    "box8_short_term_capital_gain": [r"(?:box\s*8\b|net\s+short.?term\s+capital)", r"line\s*8\b"],
+    "box9a_long_term_capital_gain": [r"(?:box\s*9a|net\s+long.?term\s+capital)"],
+    # K-1 coded box amounts
+    "box10_net_1231_gain":      [r"(?:box\s*10|net\s+section\s+1231)", r"line\s*10\b"],
+    "box11_other_income":       [r"(?:box\s*11|other\s+income)", r"line\s*11\b"],
+    "box12_section_179":        [r"(?:box\s*12|section\s+179)", r"line\s*12\b"],
+    "box13_other_deductions":   [r"(?:box\s*13|other\s+deductions)", r"line\s*13\b"],
+}
+
+# Amount regex: matches dollar amounts like $1,234.56 or 1234.56 or (1,234.56) for negatives
+_AMOUNT_RE = re.compile(
+    r'[\$]?\s*'                     # optional $
+    r'[\(\-]?'                      # optional ( or - for negative
+    r'(\d{1,3}(?:,\d{3})*'         # digits with optional comma grouping
+    r'(?:\.\d{1,2})?)'             # optional decimal
+    r'\)?'                          # optional closing )
+)
+
+
+def _parse_amount_from_text(text, field_name, label_hint=None, method_tag="text_anchor"):
+    """Search raw text for a dollar amount near a known label.
+
+    Returns candidate dict or None. Pure regex — no API call.
+    {value_num, method, label_anchor_found, parse_ok}
+    """
+    if not text or not field_name:
+        return None
+
+    # Get label patterns for this field
+    patterns = _LABEL_PATTERNS.get(field_name)
+    if not patterns and label_hint:
+        # Build a simple pattern from the label hint
+        escaped = re.escape(label_hint.strip())
+        if len(escaped) >= 3:
+            patterns = [escaped]
+    if not patterns:
+        return None
+
+    text_lower = text.lower()
+    best_match = None
+    label_found = False
+
+    for pat in patterns:
+        for m in re.finditer(pat, text_lower):
+            label_found = True
+            # Search for the nearest amount AFTER the label (within 200 chars)
+            search_start = m.end()
+            search_region = text[search_start:search_start + 200]
+            amount_match = _AMOUNT_RE.search(search_region)
+            if amount_match:
+                raw = amount_match.group(1).replace(",", "")
+                try:
+                    value = float(raw)
+                    # Check for negative indicator
+                    prefix = search_region[:amount_match.start()].strip()
+                    full_match = search_region[max(0, amount_match.start()-2):amount_match.end()+1]
+                    if "(" in full_match or "-" in prefix[-2:]:
+                        value = -value
+                    # Prefer the match closest to the label
+                    dist = amount_match.start()
+                    if best_match is None or dist < best_match["_dist"]:
+                        best_match = {
+                            "value_num": value,
+                            "method": method_tag,
+                            "label_anchor_found": True,
+                            "parse_ok": True,
+                            "_dist": dist,
+                        }
+                except (ValueError, TypeError):
+                    continue
+
+    if best_match:
+        del best_match["_dist"]
+        return best_match
+
+    # Label found but no amount nearby
+    if label_found:
+        return {"value_num": None, "method": method_tag, "label_anchor_found": True, "parse_ok": False}
+
+    return None
+
+
+def _values_match(a, b, tolerance=0.01):
+    """Check if two numeric values match within tolerance."""
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) <= tolerance
+    except (ValueError, TypeError):
+        return False
+
+
+def _validate_candidate(field_name, value, extraction_fields):
+    """Check brokerage/K-1 validation rules for a candidate value.
+    Returns (passes: bool, violation: str|None)."""
+    if value is None:
+        return False, "no_value"
+
+    try:
+        v = float(value)
+    except (ValueError, TypeError):
+        return False, "not_numeric"
+
+    # Brokerage: qualified ≤ ordinary
+    if field_name in ("qualified_dividends", "div_qualified_dividends"):
+        ord_val = get_val(extraction_fields, "ordinary_dividends") or get_val(extraction_fields, "div_ordinary_dividends")
+        if ord_val is not None and v > ord_val + 0.01:
+            return False, "qualified > ordinary"
+
+    # Withholding ≥ 0
+    if "wh" in field_name or "withholding" in field_name:
+        if v < 0:
+            return False, "negative withholding"
+
+    # Foreign tax ≤ income
+    if "foreign_tax" in field_name:
+        income = get_val(extraction_fields, "interest_income") or \
+                 get_val(extraction_fields, "int_interest_income") or \
+                 get_val(extraction_fields, "ordinary_dividends") or \
+                 get_val(extraction_fields, "div_ordinary_dividends")
+        if income is not None and v > income + 0.01:
+            return False, "foreign_tax > income"
+
+    return True, None
+
+
+def _score_candidate(candidate, others, extraction_fields, field_name):
+    """Score a field candidate for consensus selection. Returns float score."""
+    score = 0.0
+    val = candidate.get("value_num")
+
+    if val is None:
+        return -10.0  # unusable candidate
+
+    # Strong positive: label anchor found in text
+    if candidate.get("label_anchor_found"):
+        score += 3.0
+
+    # Strong positive: value parsed successfully
+    if candidate.get("parse_ok"):
+        score += 2.0
+
+    # Strong positive: bbox coordinates exist
+    if candidate.get("bbox_px"):
+        score += 1.0
+
+    # Strong positive: agrees with at least one other candidate
+    for other in others:
+        if other is candidate:
+            continue
+        other_val = other.get("value_num")
+        if _values_match(val, other_val):
+            score += 4.0
+            break
+
+    # Validation rules
+    passes, violation = _validate_candidate(field_name, val, extraction_fields)
+    if passes:
+        score += 2.0
+        candidate["validation_pass"] = True
+    else:
+        score -= 5.0
+        candidate["rule_violation"] = violation
+        candidate["validation_pass"] = False
+
+    # OCR confidence bonus
+    conf = candidate.get("ocr_conf_avg")
+    if conf is not None:
+        if conf >= 80:
+            score += 1.5
+        elif conf >= 60:
+            score += 0.5
+
+    # Negative: conflicts with ALL other valid candidates
+    valid_others = [o for o in others if o is not candidate and o.get("value_num") is not None]
+    if valid_others and all(not _values_match(val, o["value_num"]) for o in valid_others):
+        score -= 2.0
+
+    # Improbable value check (extremely large amounts)
+    try:
+        if abs(float(val)) > 100_000_000:  # $100M seems improbable for a single field
+            score -= 3.0
+            candidate["improbable"] = True
+    except (ValueError, TypeError):
+        pass
+
+    return round(score, 2)
+
+
+def build_consensus(extractions, page_texts, ocr_texts, ocr_confidences=None):
+    """Multi-pass verification for CONSENSUS_FIELDS (brokerage + K-1).
+
+    For each in-scope extraction, generates up to 3 candidates per critical field
+    (Claude extraction + text-layer anchor + OCR anchor), scores them, and picks
+    the best with confidence scoring.
+
+    Zero additional API calls — uses existing text/OCR data + regex parsing.
+    Returns (modified extractions, consensus_data dict for logging).
+    """
+    print("\n── Phase 2.5: Consensus Verification ──")
+
+    consensus_log = {
+        "fields_checked": 0,
+        "auto_verified": 0,
+        "needs_review": 0,
+        "per_extraction": [],
+    }
+
+    in_scope = 0
+    for ext in extractions:
+        dtype = str(ext.get("document_type", ""))
+        # Check if this doc type is in scope for consensus
+        is_in_scope = any(t in dtype for t in CONSENSUS_DOC_TYPES)
+        if not is_in_scope:
+            continue
+
+        in_scope += 1
+        page = ext.get("_page")
+        entity = ext.get("payer_or_entity", "")
+        fields = ext.get("fields", {})
+        method = ext.get("_extraction_method", "unknown")
+
+        ext_log = {
+            "page": page,
+            "doc_type": dtype,
+            "entity": entity,
+            "fields": {},
+        }
+
+        # Get raw text sources for this page
+        pt = page_texts[page - 1] if page_texts and page and page <= len(page_texts) else None
+        ot = ocr_texts[page - 1] if ocr_texts and page and page <= len(ocr_texts) else None
+        page_conf = ocr_confidences[page - 1] if ocr_confidences and page and page <= len(ocr_confidences) else None
+
+        fields_checked = 0
+        fields_verified = 0
+        fields_review = 0
+
+        for fname in CONSENSUS_FIELDS:
+            if fname not in fields:
+                continue
+
+            fdata = fields[fname]
+
+            # T1.5: Never downgrade — skip fields already verified in a previous batch
+            if isinstance(fdata, dict) and fdata.get("confidence") == "auto_verified":
+                fields_checked += 1
+                fields_verified += 1
+                continue
+
+            claude_val = fdata.get("value") if isinstance(fdata, dict) else fdata
+            label_hint = fdata.get("label_on_form", "") if isinstance(fdata, dict) else ""
+
+            if claude_val is None:
+                continue
+
+            fields_checked += 1
+            candidates = []
+
+            # Candidate 1: Claude extraction (already paid — Phase 2 result)
+            try:
+                claude_num = float(claude_val)
+                c1 = {
+                    "value_num": claude_num,
+                    "method": "claude_extraction",
+                    "label_anchor_found": True,  # Claude is instructed to find labels
+                    "parse_ok": True,
+                    "page": page,
+                }
+                if page_conf is not None:
+                    c1["ocr_conf_avg"] = page_conf
+                candidates.append(c1)
+            except (ValueError, TypeError):
+                # Non-numeric field (string) — skip consensus for this field
+                continue
+
+            # Candidate 2: Text-layer anchor (free regex parse)
+            if pt:
+                c2 = _parse_amount_from_text(pt, fname, label_hint, method_tag="text_anchor")
+                if c2 and c2.get("value_num") is not None:
+                    c2["page"] = page
+                    candidates.append(c2)
+
+            # Candidate 3: OCR anchor (free regex parse)
+            if ot and ot != pt:  # skip if OCR text is same as text layer
+                c3 = _parse_amount_from_text(ot, fname, label_hint, method_tag="ocr_anchor")
+                if c3 and c3.get("value_num") is not None:
+                    c3["page"] = page
+                    if page_conf is not None:
+                        c3["ocr_conf_avg"] = page_conf
+                    candidates.append(c3)
+
+            # Score all candidates
+            for c in candidates:
+                c["score"] = _score_candidate(c, candidates, fields, fname)
+
+            # Sort by score descending
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+            top = candidates[0]
+            runner_up = candidates[1] if len(candidates) > 1 else None
+
+            # Decision policy
+            # Margin check only applies when top and runner-up DISAGREE on value.
+            # If they agree (same value), auto-accept regardless of score gap.
+            runner_agrees = runner_up is not None and _values_match(top["value_num"], runner_up["value_num"])
+            if top["score"] >= CONSENSUS_ACCEPT_THRESHOLD:
+                if runner_up is None or runner_agrees or (top["score"] - runner_up["score"]) >= CONSENSUS_MARGIN:
+                    status = "auto_verified"
+                    fields_verified += 1
+                    if isinstance(fdata, dict):
+                        fdata["confidence"] = "auto_verified"
+                        fdata["value"] = top["value_num"]
+                else:
+                    status = "needs_review"
+                    fields_review += 1
+                    if isinstance(fdata, dict):
+                        fdata["_consensus_top2"] = [
+                            {"value": top["value_num"], "method": top["method"], "score": top["score"]},
+                            {"value": runner_up["value_num"], "method": runner_up["method"], "score": runner_up["score"]},
+                        ]
+            else:
+                status = "needs_review"
+                fields_review += 1
+                if isinstance(fdata, dict):
+                    fdata["_consensus_top2"] = [
+                        {"value": c["value_num"], "method": c["method"], "score": c["score"]}
+                        for c in candidates[:2]
+                    ]
+
+            # Store consensus metadata on the field
+            if isinstance(fdata, dict):
+                fdata["_consensus"] = {
+                    "status": status,
+                    "chosen_method": top["method"],
+                    "score": top["score"],
+                    "num_candidates": len(candidates),
+                }
+
+            # Log entry for this field
+            ext_log["fields"][fname] = {
+                "status": status,
+                "chosen_value": top["value_num"],
+                "chosen_method": top["method"],
+                "score": top["score"],
+                "candidates": [
+                    {"value": c["value_num"], "method": c["method"], "score": c["score"],
+                     "label_found": c.get("label_anchor_found", False),
+                     "validation_pass": c.get("validation_pass", True)}
+                    for c in candidates
+                ],
+            }
+
+        consensus_log["fields_checked"] += fields_checked
+        consensus_log["auto_verified"] += fields_verified
+        consensus_log["needs_review"] += fields_review
+        if fields_checked > 0:
+            consensus_log["per_extraction"].append(ext_log)
+            print(f"  {dtype} — {entity} (p.{page}): {fields_checked} fields, "
+                  f"{fields_verified} auto_verified, {fields_review} needs_review")
+
+    if in_scope == 0:
+        print("  No brokerage/K-1 documents — consensus skipped")
+    else:
+        print(f"\n  Consensus: {consensus_log['auto_verified']} auto_verified, "
+              f"{consensus_log['needs_review']} needs_review "
+              f"({consensus_log['fields_checked']} fields across {in_scope} documents)")
+
+    return extractions, consensus_log
 
 
 # ─── PHASE 4: NORMALIZE ──────────────────────────────────────────────────────
@@ -1857,6 +3731,9 @@ def normalize_brokerage_data(extractions):
                     if "short_term" in kl and "gain" in kl: sched_d["short_term_gain_loss"] = v
                     elif "long_term" in kl and "gain" in kl: sched_d["long_term_gain_loss"] = v
                     elif "total_gain" in kl or kl == "gain_loss": sched_d["total_gain_loss"] = v
+                    elif "total_proceeds" in kl or kl == "proceeds": sched_d["total_proceeds"] = v
+                    elif "total_basis" in kl or kl == "basis" or "cost_basis" in kl: sched_d["total_basis"] = v
+                    elif "wash" in kl: sched_d["wash_sale_loss"] = v
                     else: sched_d[k] = v
                 normalized.append({**base, "document_type": "1099-B", "payer_or_entity": entity, "fields": sched_d})
                 print(f"  Brokerage → 1099-B: {entity}")
@@ -2265,33 +4142,27 @@ def validate(extractions, prior_year_context=None):
 # ─── PHASE 6: EXCEL OUTPUT ───────────────────────────────────────────────────
 
 BOLD = Font(bold=True)
-SECTION_FONT = Font(bold=True, size=11, color="1A252F")
-COL_HEADER_FONT = Font(bold=True, size=9, color="FFFFFF")
-COL_HEADER_FILL = PatternFill("solid", fgColor="2C3E50")
-MONEY_FMT = '#,##0.00'
+SECTION_FONT = Font(bold=True, size=11, color="000000")
+SECTION_FILL = PatternFill("solid", fgColor="D9D9D9")     # Light gray — section header rows
+COL_HEADER_FONT = Font(size=11, color="000000")            # Normal weight, matches section row
+COL_HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")   # Same gray as section header
+MONEY_FMT = '#,##0.00_);(#,##0.00)'                        # Accounting: parentheses for negatives
 PCT_FMT = '0.00%'
 DATE_FMT = 'MM/DD/YYYY'
-SUM_FONT = Font(bold=True, size=10, color="1A252F")
-SUM_FILL = PatternFill("solid", fgColor="D5D8DC")
-FLAG_FILL = PatternFill("solid", fgColor="FFFDE7")        # Soft yellow — low confidence
+SUM_FONT = Font(bold=True, size=11, color="000000")
+SUM_FILL = PatternFill()                                    # No fill on total rows
+FLAG_FILL = PatternFill("solid", fgColor="FFFDE7")         # Soft yellow — low confidence
 CORRECTED_FILL = PatternFill("solid", fgColor="C8E6C9")   # Green — corrected
 REVIEW_FILL = PatternFill("solid", fgColor="FFE0B2")      # Orange — needs human
 CONFIRMED_FILL = PatternFill("solid", fgColor="E8F5E9")   # Light green — confirmed
 DUAL_FILL = PatternFill("solid", fgColor="A5D6A7")        # Darker green — OCR + image agree
 FLAG_FONT = Font(italic=True, color="CC0000")
-ALT_ROW_FILL = PatternFill("solid", fgColor="F8F9FA")     # Alternating row background
+ALT_ROW_FILL = PatternFill()                               # No alternating rows
 DARK_HEADER_FILL = PatternFill("solid", fgColor="2C3E50")
 DARK_HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
-THIN_BORDER = openpyxl.styles.Border(
-    bottom=openpyxl.styles.Side(style="thin", color="DEE2E6"),
-)
-SECTION_BORDER = openpyxl.styles.Border(
-    bottom=openpyxl.styles.Side(style="medium", color="2C3E50"),
-)
-SUM_BORDER = openpyxl.styles.Border(
-    top=openpyxl.styles.Side(style="double", color="2C3E50"),
-    bottom=openpyxl.styles.Side(style="thin", color="999999"),
-)
+THIN_BORDER = openpyxl.styles.Border()                     # No cell borders on data rows
+SECTION_BORDER = openpyxl.styles.Border()                  # No border on section headers
+SUM_BORDER = openpyxl.styles.Border()                      # No border on totals
 
 def populate_template(extractions, template_path, output_path, year, output_format="tax_review"):
     """Router: create workbook, delegate to format-specific function, save."""
@@ -2428,15 +4299,13 @@ def _dedup_by_ein(exts):
 def _write_title(ws, title, year):
     """Write title rows, return next row number."""
     ws["A1"] = f"{title} — {year}"
-    ws["A1"].font = Font(bold=True, size=16, color="1A252F")
-    ws.merge_cells("A1:G1")
-    ws["A2"] = f"Extracted {datetime.now().strftime('%m/%d/%Y %I:%M %p')} — Bearden Tax Intake v5"
+    ws["A1"].font = Font(bold=True, size=14, color="000000")
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.merge_cells("A1:F1")
+    ws["A2"] = f"Extracted {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
     ws["A2"].font = Font(italic=True, color="999999", size=9)
-    ws.merge_cells("A2:G2")
-    # Thin line under header area
-    for col_letter in ["A", "B", "C", "D", "E", "F", "G"]:
-        ws[f"{col_letter}3"].border = openpyxl.styles.Border(
-            bottom=openpyxl.styles.Side(style="thin", color="DEE2E6"))
+    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.merge_cells("A2:F2")
     return 4
 
 def _write_cell_value(ws, col, row, fields, field_name, ext, matched):
@@ -2477,26 +4346,15 @@ def _write_cell_value(ws, col, row, fields, field_name, ext, matched):
         if isinstance(val, (int, float)):
             cell.number_format = MONEY_FMT
             cell.alignment = Alignment(horizontal="right")
-        # Confidence coloring
+        # Confidence comments (no cell coloring — keeps spreadsheet clean)
         fdata = fields.get(field_name)
         if isinstance(fdata, dict):
             conf = fdata.get("confidence", "")
-            if conf == "dual_confirmed":
-                cell.fill = DUAL_FILL
-                cell.comment = Comment("DUAL CONFIRMED: OCR + image agree", "System")
-            elif conf == "verified_corrected":
-                cell.fill = CORRECTED_FILL
-                cell.comment = Comment(f"CORRECTED: was {fdata.get('original_value','?')}. {fdata.get('correction_note','')}", "System")
-            elif conf in ("verified_confirmed", "ocr_accepted"):
-                cell.fill = CONFIRMED_FILL
+            if conf == "verified_corrected":
+                cell.comment = Comment(f"Corrected: was {fdata.get('original_value','?')}. {fdata.get('correction_note','')}", "System")
             elif conf == "low":
-                cell.fill = FLAG_FILL
-                cell.comment = Comment("LOW CONFIDENCE — check source", "System")
-            elif conf in ("found_in_verification", "from_continuation"):
-                cell.fill = CORRECTED_FILL
-                cell.comment = Comment(f"Source: {conf}", "System")
+                cell.comment = Comment("Low confidence — check source", "System")
             elif conf == "operator_corrected":
-                cell.fill = PatternFill("solid", fgColor="B3E5FC")
                 cell.comment = Comment(f"Operator corrected (was {fdata.get('_original_value','?')})", "Operator")
 
 
@@ -2513,15 +4371,15 @@ def _populate_tax_review(ws, extractions, year):
             if k1_extras:
                 ws[f"A{row}"] = section["header"]
                 ws[f"A{row}"].font = SECTION_FONT
-                ws[f"A{row}"].border = SECTION_BORDER
+                ws[f"A{row}"].fill = SECTION_FILL
                 for hcol, hlabel in [("B", "Line Ref"), ("C", "Description"), ("D", "Amount")]:
                     cell = ws[f"{hcol}{row}"]
                     cell.value = hlabel
                     cell.font = COL_HEADER_FONT
                     cell.fill = COL_HEADER_FILL
-                    cell.border = SECTION_BORDER
-                    if hcol == "D":
-                        cell.alignment = Alignment(horizontal="right")
+                    cell.alignment = Alignment(horizontal="center")
+                for c in ["E", "F"]:
+                    ws[f"{c}{row}"].fill = SECTION_FILL
                 row += 1
                 for item in k1_extras:
                     ws[f"A{row}"] = item.get("entity", "")
@@ -2550,14 +4408,17 @@ def _populate_tax_review(ws, extractions, year):
 
         ws[f"A{row}"] = section["header"]
         ws[f"A{row}"].font = SECTION_FONT
-        ws[f"A{row}"].border = SECTION_BORDER
+        ws[f"A{row}"].fill = SECTION_FILL
         for col, label in col_headers.items():
             cell = ws[f"{col}{row}"]
             cell.value = label
             cell.font = COL_HEADER_FONT
             cell.fill = COL_HEADER_FILL
-            cell.alignment = Alignment(horizontal="right")
-            cell.border = SECTION_BORDER
+            cell.alignment = Alignment(horizontal="center")
+        # Fill remaining columns in header row with gray
+        for c in ["A", "B", "C", "D", "E", "F"]:
+            if c not in col_headers:
+                ws[f"{c}{row}"].fill = SECTION_FILL
         row += 1
 
         if not matched:
@@ -2567,20 +4428,36 @@ def _populate_tax_review(ws, extractions, year):
             continue
 
         matched = _dedup_by_ein(matched)
+
+        # Filter out zero-value entries for interest/dividend sections
+        if sid in ("interest", "dividends"):
+            matched = [e for e in matched if any(
+                (get_val(e.get("fields", {}), fn) or 0) != 0
+                for fn in columns.values() if not fn.startswith("_")
+            )]
+            if not matched:
+                ws[f"A{row}"] = "(no documents found)"
+                ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
+                row += 2
+                continue
+
         data_start = row
         all_cols = list(columns.keys())
 
+        field_aliases = section.get("field_aliases", {})
+
         for ext_idx, ext in enumerate(matched):
             fields = ext.get("fields", {})
+            # Resolve field aliases: if primary field not found, try alternates
+            if field_aliases:
+                for primary, alternates in field_aliases.items():
+                    if primary not in fields:
+                        for alt in alternates:
+                            if alt in fields:
+                                fields[primary] = fields[alt]
+                                break
             for col, field_name in columns.items():
                 _write_cell_value(ws, col, row, fields, field_name, ext, matched)
-
-            # Alternating row fill (only for cells without confidence coloring)
-            if ext_idx % 2 == 1:
-                for bcol in all_cols:
-                    cell = ws[f"{bcol}{row}"]
-                    if cell.fill == PatternFill() or cell.fill is None:
-                        cell.fill = ALT_ROW_FILL
 
             # K-1 extras
             if sid == "k1":
@@ -2636,11 +4513,8 @@ def _populate_tax_review(ws, extractions, year):
                     cell = ws[f"{col}{row}"]
                     cell.value = "=" + "+".join([f"{p}{row}" for p in parts])
                     cell.font = SUM_FONT
-                    cell.fill = SUM_FILL
                     cell.number_format = MONEY_FMT
                     cell.alignment = Alignment(horizontal="right")
-                    cell.border = SUM_BORDER
-                    cell.border = openpyxl.styles.Border(top=openpyxl.styles.Side(style="thin", color="999999"))
             row += 1
 
         for flag in flags:
@@ -2649,80 +4523,232 @@ def _populate_tax_review(ws, extractions, year):
             row += 1
         row += 1
 
-    # Schedule A
+    # Schedule A — cross-references extracted data
     ws[f"A{row}"] = "Schedule A:"
     ws[f"A{row}"].font = SECTION_FONT
-    ws[f"A{row}"].border = SECTION_BORDER
-    note_cell = ws[f"C{row}"]
-    note_cell.value = "NOT ENOUGH TO ITEMIZE"
-    note_cell.font = Font(italic=True, color="999999", size=9)
+    ws[f"A{row}"].fill = SECTION_FILL
+    # Column headers for Schedule A
+    ws[f"C{row}"] = "Total"
+    ws[f"C{row}"].font = COL_HEADER_FONT
+    ws[f"C{row}"].fill = COL_HEADER_FILL
+    ws[f"C{row}"].alignment = Alignment(horizontal="center")
+    ws[f"E{row}"] = "Allowed"
+    ws[f"E{row}"].font = COL_HEADER_FONT
+    ws[f"E{row}"].fill = COL_HEADER_FILL
+    ws[f"E{row}"].alignment = Alignment(horizontal="center")
+    for c in ["B", "D", "F"]:
+        ws[f"{c}{row}"].fill = SECTION_FILL
     row += 1
-    total_state_wh = sum(get_val(e.get("fields",{}), "state_wh") or 0
+
+    # Medical
+    ws[f"A{row}"] = "Medical:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
+    row += 1
+    total_medical = 0
+    medical_exts = [e for e in extractions if e.get("document_type") in ("receipt",)
+                    and get_str(e.get("fields", {}), "category") == "medical"]
+    for mext in medical_exts:
+        mfields = mext.get("fields", {})
+        mamt = get_val(mfields, "total_amount") or 0
+        ws[f"A{row}"] = get_str(mfields, "vendor_name") or mext.get("payer_or_entity", "")
+        mcell = ws[f"C{row}"]
+        mcell.value = mamt
+        mcell.number_format = MONEY_FMT
+        mcell.alignment = Alignment(horizontal="right")
+        total_medical += mamt
+        row += 1
+    if not medical_exts:
+        ws[f"A{row}"] = "(none found)"
+        ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
+        row += 1
+    ws[f"A{row}"] = "Total Medical"
+    ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].fill = SUM_FILL
+    mcell = ws[f"D{row}"]
+    mcell.value = total_medical
+    mcell.number_format = MONEY_FMT
+    mcell.alignment = Alignment(horizontal="right")
+    mcell.font = SUM_FONT
+    mcell.fill = SUM_FILL
+    row += 1
+
+    # Taxes
+    ws[f"A{row}"] = "Taxes:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
+    row += 1
+
+    # Income Taxes — State WH from W-2s
+    total_state_wh = sum(get_val(e.get("fields", {}), "state_wh") or 0
                          for e in extractions if e.get("document_type") == "W-2")
-    for label, val in [("Medical:", None), ("Medical Expenses", 0), ("Total Medical", 0),
-                       ("Taxes:", None), ("Income Taxes:", None),
-                       ("State Withholding", total_state_wh), ("Total State Tax", total_state_wh),
-                       ("Real Estate Taxes:", None), ("", 0), ("Total Real Estate Tax", 0),
-                       ("Total Taxes:", total_state_wh),
-                       ("Mortgage Interest:", None), ("", 0), ("Total Mortgage Interest", 0),
-                       ("Donations:", None), ("Various", 0), ("Total Donations", 0)]:
-        ws[f"A{row}"] = label
-        if val is not None:
-            if "Total" in str(label):
-                cell = ws[f"D{row}"]
-                cell.value = val
-                if isinstance(val, (int, float)):
-                    cell.number_format = MONEY_FMT
-                    cell.alignment = Alignment(horizontal="right")
-                cell.font = SUM_FONT
-                cell.fill = SUM_FILL
-                ws[f"A{row}"].font = SUM_FONT
-                ws[f"A{row}"].fill = SUM_FILL
-            else:
-                cell = ws[f"C{row}"]
-                cell.value = val
-                if isinstance(val, (int, float)):
-                    cell.number_format = MONEY_FMT
-                    cell.alignment = Alignment(horizontal="right")
-        elif label.endswith(":"):
-            ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
-        row += 1
+    ws[f"A{row}"] = "Income Taxes:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
+    row += 1
+    ws[f"A{row}"] = "State Withholding"
+    tcell = ws[f"C{row}"]
+    tcell.value = total_state_wh
+    tcell.number_format = MONEY_FMT
+    tcell.alignment = Alignment(horizontal="right")
+    row += 1
+    ws[f"A{row}"] = "Total State Tax"
+    ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].fill = SUM_FILL
+    tcell = ws[f"D{row}"]
+    tcell.value = total_state_wh
+    tcell.number_format = MONEY_FMT
+    tcell.alignment = Alignment(horizontal="right")
+    tcell.font = SUM_FONT
+    tcell.fill = SUM_FILL
+    row += 1
 
+    # Real Estate Taxes — from 1098 property_tax + property_tax_bill
+    ws[f"A{row}"] = "Real Estate Taxes:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
     row += 1
-    ws[f"A{row}"] = "⚠ ITEMS REQUIRING PRIOR YEAR DATA / PREPARER JUDGMENT:"
-    ws[f"A{row}"].font = Font(bold=True, color="CC0000", size=11)
-    ws.merge_cells(f"A{row}:G{row}")
-    row += 1
-    for item in REQUIRES_HUMAN_REVIEW:
-        ws[f"A{row}"] = f"  • {item}"
-        ws[f"A{row}"].font = Font(color="CC0000", size=9)
+    total_re_tax = 0
+    for rext in extractions:
+        if rext.get("document_type") == "1098":
+            prop_tax = (get_val(rext.get("fields", {}), "property_tax")
+                        or get_val(rext.get("fields", {}), "real_estate_tax") or 0)
+            if prop_tax:
+                rentity = rext.get("payer_or_entity", "1098")
+                ws[f"A{row}"] = f"{rentity} (1098)"
+                rcell = ws[f"C{row}"]
+                rcell.value = prop_tax
+                rcell.number_format = MONEY_FMT
+                rcell.alignment = Alignment(horizontal="right")
+                total_re_tax += prop_tax
+                row += 1
+    for rext in extractions:
+        if rext.get("document_type") == "property_tax_bill":
+            tax_amt = (get_val(rext.get("fields", {}), "tax_amount")
+                       or get_val(rext.get("fields", {}), "total_due")
+                       or get_val(rext.get("fields", {}), "total_tax")
+                       or get_val(rext.get("fields", {}), "total_estimated_tax") or 0)
+            if tax_amt:
+                addr = get_str(rext.get("fields", {}), "property_address") or "Property"
+                ws[f"A{row}"] = addr
+                rcell = ws[f"C{row}"]
+                rcell.value = tax_amt
+                rcell.number_format = MONEY_FMT
+                rcell.alignment = Alignment(horizontal="right")
+                total_re_tax += tax_amt
+                row += 1
+    if total_re_tax == 0:
+        ws[f"A{row}"] = "(none found)"
+        ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
         row += 1
+    ws[f"A{row}"] = "Total Real Estate Tax"
+    ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].fill = SUM_FILL
+    rcell = ws[f"D{row}"]
+    rcell.value = total_re_tax
+    rcell.number_format = MONEY_FMT
+    rcell.alignment = Alignment(horizontal="right")
+    rcell.font = SUM_FONT
+    rcell.fill = SUM_FILL
+    row += 1
 
-    row += 2
-    ws[f"A{row}"] = "Color Legend:"
-    ws[f"A{row}"].font = Font(bold=True, size=10, color="1A252F")
+    # Total Taxes
+    total_taxes = total_state_wh + total_re_tax
+    ws[f"A{row}"] = "Total Taxes:"
+    ws[f"A{row}"].font = SUM_FONT
+    tcell = ws[f"D{row}"]
+    tcell.value = total_taxes
+    tcell.number_format = MONEY_FMT
+    tcell.alignment = Alignment(horizontal="right")
+    tcell.font = SUM_FONT
+    ecell = ws[f"E{row}"]
+    ecell.value = total_taxes
+    ecell.number_format = MONEY_FMT
+    ecell.alignment = Alignment(horizontal="right")
+    ecell.font = SUM_FONT
     row += 1
-    legend_items = [
-        (DUAL_FILL, "Dark green", "OCR + image both agree (highest confidence)"),
-        (CONFIRMED_FILL, "Light green", "Verified confirmed"),
-        (CORRECTED_FILL, "Bright green", "Corrected / found during verification"),
-        (PatternFill("solid", fgColor="B3E5FC"), "Blue", "Operator corrected"),
-        (FLAG_FILL, "Yellow", "Low confidence — check source document"),
-        (REVIEW_FILL, "Orange", "Requires manual entry / preparer judgment"),
-        (ALT_ROW_FILL, "Gray stripe", "Alternating row (no special meaning)"),
-    ]
-    for fill, label, desc in legend_items:
-        ws[f"A{row}"] = label
-        ws[f"A{row}"].fill = fill
-        ws[f"A{row}"].font = Font(bold=True, size=9)
-        ws[f"B{row}"] = desc
-        ws[f"B{row}"].font = Font(size=9, color="666666")
+
+    # Mortgage Interest — from 1098
+    ws[f"A{row}"] = "Mortgage Interest:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
+    row += 1
+    total_mortgage = 0
+    for mext in extractions:
+        if mext.get("document_type") == "1098":
+            mort_int = (get_val(mext.get("fields", {}), "mortgage_interest")
+                        or get_val(mext.get("fields", {}), "mortgage_interest_received") or 0)
+            if mort_int:
+                mentity = mext.get("payer_or_entity", "1098")
+                ws[f"A{row}"] = mentity
+                mcell = ws[f"C{row}"]
+                mcell.value = mort_int
+                mcell.number_format = MONEY_FMT
+                mcell.alignment = Alignment(horizontal="right")
+                total_mortgage += mort_int
+                row += 1
+    if total_mortgage == 0:
+        ws[f"A{row}"] = "(none found)"
+        ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
         row += 1
+    ws[f"A{row}"] = "Total Mortgage Interest"
+    ws[f"A{row}"].font = SUM_FONT
+    mcell = ws[f"D{row}"]
+    mcell.value = total_mortgage
+    mcell.number_format = MONEY_FMT
+    mcell.alignment = Alignment(horizontal="right")
+    mcell.font = SUM_FONT
+    ecell = ws[f"E{row}"]
+    ecell.value = total_mortgage
+    ecell.number_format = MONEY_FMT
+    ecell.alignment = Alignment(horizontal="right")
+    ecell.font = SUM_FONT
+    row += 1
+
+    # Charitable Contributions
+    ws[f"A{row}"] = "Donations:"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color="333333")
+    row += 1
+    total_donations = 0
+    for dext in extractions:
+        if dext.get("document_type") == "charitable_receipt":
+            damt = get_val(dext.get("fields", {}), "donation_amount") or 0
+            if damt:
+                dorg = get_str(dext.get("fields", {}), "organization_name") or dext.get("payer_or_entity", "")
+                ws[f"A{row}"] = dorg
+                dcell = ws[f"C{row}"]
+                dcell.value = damt
+                dcell.number_format = MONEY_FMT
+                dcell.alignment = Alignment(horizontal="right")
+                total_donations += damt
+                row += 1
+    if total_donations == 0:
+        ws[f"A{row}"] = "(none found)"
+        ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
+        row += 1
+    ws[f"A{row}"] = "Total Donations"
+    ws[f"A{row}"].font = SUM_FONT
+    dcell = ws[f"D{row}"]
+    dcell.value = total_donations
+    dcell.number_format = MONEY_FMT
+    dcell.alignment = Alignment(horizontal="right")
+    dcell.font = SUM_FONT
+    ecell = ws[f"E{row}"]
+    ecell.value = total_donations
+    ecell.number_format = MONEY_FMT
+    ecell.alignment = Alignment(horizontal="right")
+    ecell.font = SUM_FONT
+    row += 1
+
+    # Schedule A grand total
+    sched_a_total = total_taxes + total_mortgage + total_donations
+    row += 1
+    gcell = ws[f"E{row}"]
+    gcell.value = sched_a_total
+    gcell.number_format = MONEY_FMT
+    gcell.alignment = Alignment(horizontal="right")
+    gcell.font = SUM_FONT
+    row += 1
 
     # Column widths
-    ws.column_dimensions["A"].width = 42
-    for col in ["B", "C", "D", "E", "F", "G"]:
-        ws.column_dimensions[col].width = 18
+    ws.column_dimensions["A"].width = 33
+    for col in ["B", "C", "D", "E", "F"]:
+        ws.column_dimensions[col].width = 15
 
 
 # ─── JOURNAL ENTRIES FORMAT ──────────────────────────────────────────────────
@@ -3377,14 +5403,17 @@ def _populate_account_balances(ws, extractions, year):
 
         ws[f"A{row}"] = section["header"]
         ws[f"A{row}"].font = SECTION_FONT
-        ws[f"A{row}"].border = SECTION_BORDER
+        ws[f"A{row}"].fill = SECTION_FILL
         for col, label in col_headers.items():
             cell = ws[f"{col}{row}"]
             cell.value = label
             cell.font = COL_HEADER_FONT
             cell.fill = COL_HEADER_FILL
-            cell.alignment = Alignment(horizontal="right")
-            cell.border = SECTION_BORDER
+            cell.alignment = Alignment(horizontal="center")
+        # Fill remaining columns in header row with gray
+        for c in ["A", "B", "C", "D", "E", "F"]:
+            if c not in col_headers:
+                ws[f"{c}{row}"].fill = SECTION_FILL
         row += 1
 
         if not matched:
@@ -3854,26 +5883,106 @@ def _tr_col_widths(ws):
 
 # ─── LOG + SUMMARY ───────────────────────────────────────────────────────────
 
-def save_log(extractions, classifications, warnings, output_path, output_format="tax_review", user_notes="", ai_instructions="", cost_data=None):
+def save_log(extractions, classifications, warnings, output_path, output_format="tax_review", user_notes="", ai_instructions="", cost_data=None, text_layer_stats=None, page_preprocessing=None, routing_plan=None, consensus_data=None, sections_by_page=None, timing_data=None, throughput_stats=None, streaming_stats=None):
     global _cost_tracker
     log_path = output_path.replace(".xlsx", "_log.json")
+
+    # Build per-page method summary
+    per_page_method = {}
+    methods_used = set()
+    for e in extractions:
+        page = e.get("_page")
+        method = e.get("_extraction_method", "unknown")
+        methods_used.add(method)
+        if page is not None:
+            per_page_method[str(page)] = {
+                "method": method,
+                "text_source": e.get("_text_source", "unknown"),
+            }
+
     log = {
         "version": "v6",
-        "architecture": "ocr_first_vision_fallback",
+        "architecture": "text_layer_ocr_vision",
         "output_format": output_format,
         "user_notes": user_notes,
         "ai_instructions": ai_instructions,
         "timestamp": datetime.now().isoformat(),
         "model": MODEL,
+        "extraction_methods_used": sorted(methods_used),
+        "per_page_method": per_page_method,
         "classifications": classifications,
         "extractions": [{k: v for k, v in e.items() if not k.startswith("_")} | {
             "_page": e.get("_page"),
             "_extraction_method": e.get("_extraction_method"),
+            "_text_source": e.get("_text_source"),
             "_overall_confidence": e.get("_overall_confidence"),
         } for e in extractions],
         "warnings": warnings,
         "human_review_required": REQUIRES_HUMAN_REVIEW,
     }
+    if text_layer_stats:
+        log["text_layer_stats"] = {
+            "text_chars_total": text_layer_stats.get("total_chars", 0),
+            "meaningful_pages": text_layer_stats.get("meaningful_pages", 0),
+            "total_pages": text_layer_stats.get("total_pages", 0),
+            "result": text_layer_stats.get("reason", "unknown"),
+        }
+    if page_preprocessing:
+        blank_pages = [m["page_num"] for m in page_preprocessing if m.get("is_blank")]
+        quality_scores = [m["quality_score"] for m in page_preprocessing if not m.get("is_blank")]
+        log["preprocessing"] = {
+            "total_pages": len(page_preprocessing),
+            "blank_pages": blank_pages,
+            "blank_count": len(blank_pages),
+            "pages_rotated": sum(1 for m in page_preprocessing if m.get("was_rotated")),
+            "pages_deskewed": sum(1 for m in page_preprocessing if m.get("deskew_angle", 0) != 0),
+            "pages_contrast_enhanced": sum(1 for m in page_preprocessing if m.get("contrast_enhanced")),
+            "avg_quality_score": round(sum(quality_scores) / len(quality_scores), 3) if quality_scores else 0,
+            "min_quality_score": round(min(quality_scores), 3) if quality_scores else 0,
+            "per_page": [{
+                "page": m.get("page_num"),
+                "is_blank": m.get("is_blank", False),
+                "blank_reason": m.get("blank_reason", "not_blank"),
+                "quality_score": m.get("quality_score", 0),
+                "dpi": m.get("dpi", DPI),
+                "original_size": m.get("original_size"),
+                "processed_size": m.get("processed_size"),
+                "rotated": m.get("was_rotated", False),
+                "deskew_angle": m.get("deskew_angle", 0),
+                "contrast_enhanced": m.get("contrast_enhanced", False),
+            } for m in page_preprocessing],
+        }
+    if routing_plan:
+        method_counts = {}
+        for r in routing_plan:
+            m = r.get("method", "unknown")
+            method_counts[m] = method_counts.get(m, 0) + 1
+        log["routing"] = {
+            "total_pages": len(routing_plan),
+            "text_layer_pages": method_counts.get("text_layer", 0),
+            "ocr_pages": method_counts.get("ocr", 0),
+            "vision_pages": method_counts.get("vision", 0),
+            "blank_pages": method_counts.get("skip_blank", 0),
+            "per_page": routing_plan,
+        }
+    if sections_by_page:
+        label_counts = {}
+        for labels in sections_by_page.values():
+            for lbl in labels:
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+        log["sections"] = {
+            "total_pages_labeled": len(sections_by_page),
+            "label_counts": label_counts,
+            "per_page": sections_by_page,
+        }
+    if consensus_data:
+        log["consensus"] = consensus_data
+    if timing_data:
+        log["timing"] = timing_data
+    if throughput_stats:
+        log["throughput"] = throughput_stats
+    if streaming_stats:
+        log["streaming"] = streaming_stats
     if cost_data:
         log["cost"] = cost_data
     elif _cost_tracker:
@@ -3902,7 +6011,7 @@ def save_checkpoint(output_path, phase, classifications=None, extractions=None, 
         data["groups"] = [{k: v for k, v in g.items()} for g in groups]
     if extractions is not None:
         data["extractions"] = [{k: v for k, v in e.items() if not k.startswith("_") or k in (
-            "_page", "_extraction_method", "_overall_confidence", "_is_brokerage", "_ambiguous_fields"
+            "_page", "_extraction_method", "_text_source", "_overall_confidence", "_is_brokerage", "_ambiguous_fields"
         )} for e in extractions]
     with open(ckpt_path, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -3929,6 +6038,65 @@ def clear_checkpoint(output_path):
     ckpt_path = output_path.replace(".xlsx", "_checkpoint.json")
     if os.path.exists(ckpt_path):
         os.remove(ckpt_path)
+
+
+# ─── T1.5: PARTIAL RESULTS (for mid-run review) ─────────────────────────────
+
+def write_partial_results(output_path, extractions, batch_num, total_batches,
+                          time_to_first_values_s=None, sections_by_page=None):
+    """Write accumulated extraction results for mid-run review.
+
+    File: {stem}_partial_results.json
+    Written atomically (tmp file + os.replace) after each batch.
+    app.py reads this file to serve partial results during extraction.
+    """
+    partial_path = output_path.replace(".xlsx", "_partial_results.json")
+    tmp_path = partial_path + ".tmp"
+    try:
+        # Count total fields across all extractions
+        total_fields = 0
+        for ext in extractions:
+            for fname, fdata in (ext.get("fields") or {}).items():
+                val = fdata.get("value") if isinstance(fdata, dict) else fdata
+                if val is not None:
+                    total_fields += 1
+
+        data = {
+            "version": "v6",
+            "partial": True,
+            "batch_num": batch_num,
+            "total_batches": total_batches,
+            "timestamp": datetime.now().isoformat(),
+            "time_to_first_values_s": time_to_first_values_s,
+            "fields_count": total_fields,
+            "extractions": [{k: v for k, v in e.items()
+                             if not k.startswith("_") or k in (
+                                 "_page", "_extraction_method", "_text_source",
+                                 "_overall_confidence", "_is_brokerage",
+                                 "_ambiguous_fields", "_batch",
+                             )} for e in extractions],
+        }
+        if sections_by_page:
+            data["sections_by_page"] = sections_by_page
+
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp_path, partial_path)
+    except (IOError, OSError) as e:
+        print(f"  Partial results write failed (non-fatal): {e}")
+        # Clean up tmp file if it exists
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def clear_partial_results(output_path):
+    """Remove partial results file after successful completion."""
+    partial_path = output_path.replace(".xlsx", "_partial_results.json")
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
 
 
 def print_summary(extractions):
@@ -3982,6 +6150,8 @@ def main():
                         help="Resume from checkpoint if available (crash recovery)")
     parser.add_argument("--no-ocr-first", action="store_true",
                         help="Disable OCR-first optimization (force vision-only, more expensive)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip page cache (force full reprocessing)")
     args = parser.parse_args()
 
     # ─── Regen-only mode: read log JSON → populate_template → done ───
@@ -4015,35 +6185,128 @@ def main():
     # Initialize PII tokenizer
     tokenizer = None if args.no_pii else PIITokenizer()
 
-    # Initialize cost tracker
-    global _cost_tracker
+    # Initialize cost tracker + pipeline timer
+    global _cost_tracker, _pipeline_timer
     _cost_tracker = CostTracker()
+    _pipeline_timer = PipelineTimer()
 
     print("=" * 60)
     print("  Document Intake Extractor v6")
-    print("  OCR-first | Vision fallback | Checkpointing | Cost tracking")
+    print("  Text-layer | OCR-first | Vision fallback | Checkpointing")
     print("=" * 60)
     print(f"  PDF:      {args.pdf}")
     print(f"  Year:     {args.year}")
     print(f"  Output:   {output}")
+    print(f"  PyMuPDF:  {'YES (text layer extraction)' if HAS_PYMUPDF else 'NOT INSTALLED'}")
     print(f"  OCR-first:{'YES (cheap text when readable)' if not args.no_ocr_first else 'DISABLED (vision-only)'}")
     print(f"  PII:      {'TOKENIZED (Tesseract for SSN detection)' if tokenizer and HAS_TESSERACT else 'TOKENIZED (no Tesseract — text only)' if tokenizer else 'DISABLED (raw data sent)'}")
     print(f"  Verify:   {'YES' if not args.skip_verify else 'SKIPPED'}")
+    print(f"  Cache:    {'ON' if not args.no_cache else 'DISABLED'}")
 
     client = anthropic.Anthropic()
-    b64_images = pdf_to_images(args.pdf, args.dpi)
 
-    # Run OCR on all pages upfront (free, local — enables OCR-first extraction)
+    # ─── Page cache check (T1.4) ───
+    cache_hit = False
+    page_texts = None
+    text_layer_stats = {}
+    b64_images = None
+    page_preprocessing = []
     ocr_texts = None
-    if not args.no_ocr_first and HAS_TESSERACT:
-        ocr_texts = ocr_all_pages([
-            Image.open(BytesIO(base64.b64decode(b))) for b in b64_images
-        ])
-    elif args.no_ocr_first:
-        print("\n  OCR-first: DISABLED (--no-ocr-first, all pages use vision)")
-    else:
-        print("\n  OCR-first: unavailable (Tesseract not installed)")
-        ocr_texts = None
+    ocr_confidences = None
+    routing_plan = []
+    blank_pages = set()
+    ocr_skipped_tl = 0
+
+    if not args.no_cache:
+        _pipeline_timer.start("cache_check")
+        cached = _load_cache(args.pdf, args.dpi)
+        if cached:
+            print(f"\n  Cache HIT — skipping preprocessing, OCR, routing")
+            page_texts = cached["page_texts"]
+            text_layer_stats = cached["text_layer_stats"]
+            b64_images = cached["b64_images"]
+            page_preprocessing = cached["page_preprocessing"]
+            ocr_texts = cached["ocr_texts"]
+            ocr_confidences = cached["ocr_confidences"]
+            routing_plan = cached["routing_plan"]
+            blank_pages = {m["page_num"] for m in page_preprocessing if m.get("is_blank")}
+            cache_hit = True
+            # Print routing summary from cache (so app.py progress parsing works)
+            _print_routing_summary(routing_plan)
+        _pipeline_timer.stop()
+
+    if not cache_hit:
+        # ─── Phase 0a: Text-layer extraction (PyMuPDF — instant, no OCR) ───
+        _pipeline_timer.start("text_layer")
+        # Always extract text layer per page (never discard — routing decides per-page)
+        if HAS_PYMUPDF:
+            print("\n── Text-Layer Extraction (PyMuPDF) ──")
+            page_texts = extract_text_per_page(args.pdf)
+            if page_texts:
+                _tl_usable, text_layer_stats = has_meaningful_text(page_texts)
+                mp = text_layer_stats.get("meaningful_pages", 0)
+                tp = text_layer_stats.get("total_pages", 0)
+                tc = text_layer_stats.get("total_chars", 0)
+                print(f"  Text layer: {mp}/{tp} pages have ≥{TEXT_MIN_CHARS_PER_PAGE} chars, {tc:,} total chars")
+            else:
+                print(f"  ✗ No text layer found")
+        else:
+            print("\n  PyMuPDF not installed — no text layer available")
+
+        # ─── Phase 0b: PDF → images + preprocessing ───
+        _pipeline_timer.start("images_preprocess")
+        b64_images, page_preprocessing = pdf_to_images(args.pdf, args.dpi, page_texts=page_texts)
+        blank_pages = {m["page_num"] for m in page_preprocessing if m.get("is_blank")}
+        if blank_pages:
+            print(f"  Blank pages detected: {sorted(blank_pages)} — will skip OCR/vision")
+
+        # ─── Phase 0c: OCR — lazy per-page skip (T1.4) ───
+        _pipeline_timer.start("ocr")
+        if not args.no_ocr_first and HAS_TESSERACT:
+            n_total = len(b64_images)
+            n_non_blank = n_total - len(blank_pages)
+
+            # Count pages with good text-layer coverage
+            tl_good_pages = set()
+            if page_texts:
+                for i, pt in enumerate(page_texts):
+                    if pt and len(pt.strip()) >= ROUTE_TEXT_MIN_CHARS and (i + 1) not in blank_pages:
+                        tl_good_pages.add(i + 1)
+
+            # Build PIL images for OCR — skip blank AND per-page text-layer-good pages
+            # (T1.4: each page decides independently, no global threshold)
+            pil_for_ocr = []
+            ocr_skipped_tl = 0
+            for i, b in enumerate(b64_images):
+                pnum = i + 1
+                if pnum in blank_pages:
+                    pil_for_ocr.append(None)  # skip blank
+                elif pnum in tl_good_pages:
+                    pil_for_ocr.append(None)  # skip — this page has good text layer
+                    ocr_skipped_tl += 1
+                else:
+                    pil_for_ocr.append(Image.open(BytesIO(base64.b64decode(b))))
+
+            if ocr_skipped_tl > 0:
+                pages_to_ocr = n_non_blank - ocr_skipped_tl
+                print(f"\n  Text-layer fast-path: {ocr_skipped_tl}/{n_non_blank} pages have good text layer — OCR skipped")
+                if pages_to_ocr > 0:
+                    print(f"  OCR running on {pages_to_ocr} remaining pages")
+
+            ocr_texts, ocr_confidences = ocr_all_pages(pil_for_ocr)
+        elif args.no_ocr_first:
+            print("\n  OCR-first: DISABLED (--no-ocr-first, all pages use vision)")
+        else:
+            print("\n  OCR: unavailable (Tesseract not installed)")
+
+        # ─── Phase 0d: Per-page routing ───
+        _pipeline_timer.start("routing")
+        routing_plan = route_pages(page_texts, ocr_texts, ocr_confidences, page_preprocessing)
+
+        # ─── Save cache for future runs ───
+        if not args.no_cache:
+            _save_cache(args.pdf, args.dpi, page_texts, text_layer_stats,
+                        b64_images, page_preprocessing, ocr_texts, ocr_confidences, routing_plan)
 
     # Load prior-year context if provided
     context_summary = ""
@@ -4086,12 +6349,17 @@ def main():
         print(f"\n  ⟳ Resuming from checkpoint (completed: {resume_phase})")
 
     # Phase 1: Classify (vision — need to see layout)
+    _pipeline_timer.start("classify")
     if resume_phase in ("classify", "group", "extract", "verify"):
         classifications = checkpoint.get("classifications", [])
         print(f"\n── Phase 1: Classification (restored {len(classifications)} from checkpoint) ──")
     else:
         classifications = classify_pages(client, b64_images, tokenizer=tokenizer, doc_type=args.doc_type, user_notes=args.user_notes, ai_instructions=effective_instructions)
         save_checkpoint(output, "classify", classifications=classifications)
+
+    # Phase 1.3: Section / form detection (keyword-based, no API calls)
+    _pipeline_timer.start("sections")
+    sections_by_page = detect_sections(page_texts, routing_plan, ocr_texts=ocr_texts)
 
     # Phase 1.5: Group
     if resume_phase in ("group", "extract", "verify"):
@@ -4108,21 +6376,41 @@ def main():
         print(f"    {g['document_type']}: {g['payer_or_entity']} (EIN: {g.get('payer_ein','?')}) pp. {g['pages']}{f' + {cont}' if cont else ''}{brok}")
 
     # Phase 2: Extract (OCR-first with vision fallback)
+    _pipeline_timer.start("extract")
+    streaming_meta = {"time_to_first_values_s": None, "batches_processed": 0, "fields_streamed": 0}
     if resume_phase in ("extract", "verify"):
         extractions = checkpoint.get("extractions", [])
         print(f"\n── Phase 2: Extraction (restored {len(extractions)} from checkpoint) ──")
     else:
-        extractions = extract_data(client, b64_images, groups, tokenizer=tokenizer,
+        extractions, streaming_meta = extract_data(client, b64_images, groups, tokenizer=tokenizer,
                                     doc_type=args.doc_type, user_notes=args.user_notes,
-                                    ai_instructions=effective_instructions, ocr_texts=ocr_texts)
+                                    ai_instructions=effective_instructions, ocr_texts=ocr_texts,
+                                    page_texts=page_texts, routing_plan=routing_plan,
+                                    sections_by_page=sections_by_page, output_path=output)
         save_checkpoint(output, "extract", classifications=classifications, groups=groups, extractions=extractions)
 
+    # Phase 2.5: Consensus verification (brokerage + K-1 only)
+    _pipeline_timer.start("consensus")
+    consensus_data = None
+    if not args.skip_verify and resume_phase not in ("verify",):
+        extractions, consensus_data = build_consensus(
+            extractions, page_texts, ocr_texts, ocr_confidences=ocr_confidences)
+
     # Phase 3: Verify (cross-check critical fields against image)
+    # Fields already auto_verified by consensus are skipped
+    _pipeline_timer.start("verify")
+    verify_stats = {"pages_verified": 0, "pages_skipped": 0}
     if resume_phase == "verify":
         print(f"\n── Phase 3: Verification (already done in checkpoint) ──")
+        verify_stats = {"pages_verified": 0, "pages_skipped": len(extractions)}
     elif not args.skip_verify:
-        extractions = verify_extractions(client, b64_images, extractions, tokenizer=tokenizer)
+        extractions, verify_stats = verify_extractions(client, b64_images, extractions, tokenizer=tokenizer)
         save_checkpoint(output, "verify", classifications=classifications, groups=groups, extractions=extractions)
+    else:
+        verify_stats = {"pages_verified": 0, "pages_skipped": len(extractions)}
+
+    # Phases 4-6: Normalize, Validate, Output
+    _pipeline_timer.start("normalize_validate_export")
 
     # Phase 4: Normalize
     extractions = normalize_brokerage_data(extractions)
@@ -4145,18 +6433,49 @@ def main():
         else:
             print(f"\n  🔒 PII: tokenizer active, no SSN patterns detected")
 
+    _pipeline_timer.stop()
+
+    # Throughput stats for logging
+    n_total = len(b64_images) if b64_images else 0
+    n_blank = len(blank_pages)
+    n_ocr_run = n_total - n_blank - ocr_skipped_tl if not cache_hit else 0
+    throughput = {
+        "pages_total": n_total,
+        "pages_blank": n_blank,
+        "pages_ocr": max(n_ocr_run, 0),
+        "pages_ocr_skipped": ocr_skipped_tl,
+        "pages_vision_verified": verify_stats.get("pages_verified", 0),
+        "pages_vision_skipped": verify_stats.get("pages_skipped", 0),
+        "cache_hit": cache_hit,
+    }
+
     # Save
     save_log(extractions, classifications, warnings, output,
              output_format=args.output_format, user_notes=args.user_notes,
-             ai_instructions=effective_instructions, cost_data=_cost_tracker.to_dict())
+             ai_instructions=effective_instructions, cost_data=_cost_tracker.to_dict(),
+             text_layer_stats=text_layer_stats if text_layer_stats else None,
+             page_preprocessing=page_preprocessing,
+             routing_plan=routing_plan, consensus_data=consensus_data,
+             sections_by_page=sections_by_page,
+             timing_data=_pipeline_timer.to_dict(),
+             throughput_stats=throughput,
+             streaming_stats=streaming_meta)
     if not args.log_only:
         populate_template(extractions, args.template, output, args.year, output_format=args.output_format)
 
-    # Clean up checkpoint on success
+    # Clean up checkpoint + partial results on success
     clear_checkpoint(output)
+    clear_partial_results(output)
+
+    # Timing summary
+    print("\n── Timing ──")
+    print(_pipeline_timer.summary())
 
     print("\n" + "=" * 60)
     print("  COMPLETE")
+    tl_pages = sum(1 for e in extractions if e.get("_text_source") == "text_layer")
+    if tl_pages > 0:
+        print(f"  📄 Text layer: {tl_pages}/{len(extractions)} pages (OCR skipped)")
     if warnings:
         print(f"  ⚠ {len(warnings)} items flagged")
     print(f"  ⚠ {len(REQUIRES_HUMAN_REVIEW)} PY/judgment items need manual entry")
