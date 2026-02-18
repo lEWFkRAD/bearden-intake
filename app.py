@@ -29,13 +29,19 @@ import glob
 import subprocess
 import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 try:
-    from flask import Flask, render_template_string, request, jsonify, send_file, abort
+    from flask import (Flask, render_template_string, render_template, request,
+                       jsonify, send_file, abort, session, redirect)
 except ImportError:
     sys.exit("Install Flask: pip3 install flask")
+
+try:
+    from werkzeug.security import generate_password_hash, check_password_hash
+except ImportError:
+    sys.exit("Install Werkzeug: pip3 install werkzeug")
 
 try:
     from pdf2image import convert_from_path
@@ -55,11 +61,15 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 CLIENTS_DIR = BASE_DIR / "clients"
 PAGES_DIR = DATA_DIR / "page_images"
+EVIDENCE_DIR = DATA_DIR / "evidence"
 VERIFY_DIR = BASE_DIR / "verifications"
 JOBS_FILE = DATA_DIR / "jobs_history.json"
 
-for d in [DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, CLIENTS_DIR, PAGES_DIR, VERIFY_DIR]:
+for d in [DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, CLIENTS_DIR, PAGES_DIR, EVIDENCE_DIR, VERIFY_DIR]:
     d.mkdir(exist_ok=True)
+
+# Guided review lock timeout (seconds)
+REVIEW_LOCK_TIMEOUT_SECONDS = 300
 
 VENDOR_CATEGORIES_FILE = DATA_DIR / "vendor_categories.json"
 DB_PATH = DATA_DIR / "bearden.db"
@@ -109,7 +119,126 @@ def _init_db():
                 data TEXT NOT NULL,
                 updated TEXT DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS verified_fields (
+                job_id TEXT NOT NULL,
+                field_key TEXT NOT NULL,
+                canonical_value TEXT,
+                original_value TEXT,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                category TEXT DEFAULT '',
+                vendor_desc TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                reviewer TEXT DEFAULT '',
+                verified_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (job_id, field_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vf_job ON verified_fields(job_id);
+
+            CREATE TABLE IF NOT EXISTS client_canonical_values (
+                client_name TEXT NOT NULL,
+                year TEXT NOT NULL,
+                document_type TEXT NOT NULL,
+                payer_key TEXT NOT NULL,
+                payer_display TEXT DEFAULT '',
+                field_name TEXT NOT NULL,
+                canonical_value TEXT,
+                original_value TEXT,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                source_job_id TEXT NOT NULL,
+                reviewer TEXT DEFAULT '',
+                verified_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (client_name, year, document_type, payer_key, field_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ccv_client_year
+                ON client_canonical_values(client_name, year);
         """)
+        # T1.6: Extend client_canonical_values for workpaper support
+        for col, col_type in [("evidence_ref", "TEXT DEFAULT ''"),
+                               ("source_doc", "TEXT DEFAULT ''"),
+                               ("page_number", "INTEGER")]:
+            try:
+                conn.execute(
+                    f"ALTER TABLE client_canonical_values ADD COLUMN {col} {col_type}"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # T1.6.2: Unified facts table — single source of truth
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                tax_year INTEGER,
+                fact_key TEXT NOT NULL,
+                value_num REAL,
+                value_text TEXT,
+                status TEXT NOT NULL DEFAULT 'extracted',
+                confidence REAL,
+                source_method TEXT,
+                source_doc TEXT,
+                source_page INTEGER,
+                evidence_ref TEXT,
+                locked INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, tax_year, fact_key)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_job ON facts(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_client_year ON facts(client_id, tax_year)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key)")
+
+        # Sprint 2: Users table — PIN-based auth, role-based access
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'reviewer',
+                pin_hash TEXT NOT NULL DEFAULT '',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_login TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+
+        # Sprint 2: Audit events — immutable by default, no delete endpoint
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                user_id INTEGER,
+                user_display TEXT DEFAULT '',
+                job_id TEXT DEFAULT '',
+                details_json TEXT DEFAULT '',
+                ip_addr TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON app_events(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON app_events(event_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_level ON app_events(level)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_job ON app_events(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON app_events(user_id)")
+
+        # Guided review: concurrency locks
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_locks (
+                job_id TEXT NOT NULL,
+                field_id TEXT NOT NULL,
+                locked_by TEXT NOT NULL,
+                locked_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, field_id)
+            )
+        """)
+
         conn.commit()
         _secure_file(DB_PATH)
         _migrate_from_json(conn)
@@ -204,8 +333,415 @@ def _client_dir(client_name, doc_type, year):
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB
 
+# Sprint 2: Session secret — persisted so sessions survive restarts
+_secret_path = DATA_DIR / ".flask_secret"
+if _secret_path.exists():
+    app.secret_key = _secret_path.read_bytes()
+else:
+    import secrets as _secrets
+    _sk = _secrets.token_bytes(32)
+    _secret_path.write_bytes(_sk)
+    _secure_file(_secret_path)
+    app.secret_key = _sk
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
 _start_time = datetime.now()
-_app_version = "5.1"
+_app_version = "5.2"
+
+# ─── Sprint 2: Auth Constants ────────────────────────────────────────────────
+
+SESSION_IDLE_SECONDS = 45 * 60       # 45 minute idle timeout
+LOGIN_LOCKOUT_SECONDS = 120           # 2 minute lockout after max failures
+MAX_FAILED_ATTEMPTS = 5               # lockout threshold
+VALID_ROLES = frozenset({"admin", "partner", "reviewer"})
+
+_failed_logins = {}  # key=(username, ip) -> {"count": int, "locked_until": epoch}
+
+
+# ─── Sprint 2: User DB Functions ─────────────────────────────────────────────
+
+def _seed_default_users():
+    """Create default firm users if users table is empty. Called once at startup."""
+    conn = _get_db()
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if count > 0:
+            return  # Already seeded
+        now = datetime.now().isoformat()
+        default_pin = generate_password_hash("000000")  # Temp PIN — must be reset
+        seed_users = [
+            ("jeff",    "Jeffrey Watts",  "admin"),
+            ("susan",   "Susan",          "partner"),
+            ("charles", "Charles",        "partner"),
+            ("chris",   "Chris",          "partner"),
+            ("ashley",  "Ashley",         "reviewer"),
+            ("leigh",   "Leigh",          "reviewer"),
+            ("molly",   "Molly",          "reviewer"),
+        ]
+        for username, display_name, role in seed_users:
+            conn.execute(
+                """INSERT OR IGNORE INTO users
+                   (username, display_name, role, pin_hash, is_active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                (username, display_name, role, default_pin, now, now)
+            )
+        conn.commit()
+        print(f"  Seeded {len(seed_users)} default users (temp PIN: 000000)")
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id):
+    """Fetch a single user by ID. Returns dict or None."""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """SELECT id, username, display_name, role, pin_hash,
+                      is_active, last_login, created_at, updated_at
+               FROM users WHERE id = ?""", (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return _user_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def get_user_by_username(username):
+    """Fetch a single user by username. Returns dict or None."""
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """SELECT id, username, display_name, role, pin_hash,
+                      is_active, last_login, created_at, updated_at
+               FROM users WHERE username = ?""", (username,)
+        ).fetchone()
+        if not row:
+            return None
+        return _user_row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def list_all_users():
+    """List all users (for admin user management)."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, username, display_name, role, pin_hash,
+                      is_active, last_login, created_at, updated_at
+               FROM users ORDER BY role, username"""
+        ).fetchall()
+        return [_user_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_active_users():
+    """List active users (for login dropdown)."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, username, display_name, role, pin_hash,
+                      is_active, last_login, created_at, updated_at
+               FROM users WHERE is_active = 1 ORDER BY display_name"""
+        ).fetchall()
+        return [_user_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_last_login(user_id):
+    """Update last_login timestamp for a user."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "UPDATE users SET last_login = ?, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), datetime.now().isoformat(), user_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_pin_hash(user_id, pin_hash):
+    """Set the pin_hash for a user (admin reset)."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "UPDATE users SET pin_hash = ?, updated_at = ? WHERE id = ?",
+            (pin_hash, datetime.now().isoformat(), user_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_active(user_id, is_active):
+    """Enable or disable a user."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?",
+            (1 if is_active else 0, datetime.now().isoformat(), user_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_user(username, display_name, role, pin_hash):
+    """Create a new user. Returns user ID."""
+    if role not in VALID_ROLES:
+        raise ValueError(f"Invalid role: {role}")
+    conn = _get_db()
+    try:
+        now = datetime.now().isoformat()
+        cursor = conn.execute(
+            """INSERT INTO users
+               (username, display_name, role, pin_hash, is_active, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 1, ?, ?)""",
+            (username, display_name, role, pin_hash, now, now)
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def generate_6_digit_pin():
+    """Generate a random 6-digit PIN string."""
+    import secrets as _secrets
+    return str(_secrets.randbelow(900000) + 100000)
+
+
+def _user_row_to_dict(row):
+    """Convert a users table row to a dict."""
+    return {
+        "id": row[0],
+        "username": row[1],
+        "display_name": row[2],
+        "role": row[3],
+        "pin_hash": row[4],
+        "is_active": bool(row[5]),
+        "last_login": row[6] or "",
+        "created_at": row[7],
+        "updated_at": row[8],
+    }
+
+
+# ─── Sprint 2: Auth Helpers ──────────────────────────────────────────────────
+
+def current_user():
+    """Get the currently logged-in user from session. Returns dict or None."""
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    return get_user_by_id(uid)
+
+
+def require_login(fn):
+    """Decorator: redirect to /login if not authenticated or session expired."""
+    import functools
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        import time as _time
+        uid = session.get("user_id")
+        last = session.get("last_seen")
+        now = int(_time.time())
+        if not uid:
+            return redirect("/login")
+        if last and now - last > SESSION_IDLE_SECONDS:
+            log_event("info", "session_expired", "Session timed out",
+                      user_id=uid)
+            session.clear()
+            return redirect("/login")
+        session["last_seen"] = now
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def require_role(*roles):
+    """Decorator: abort 403 if current user's role not in allowed roles."""
+    def deco(fn):
+        import functools
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            u = current_user()
+            if not u or u["role"] not in roles:
+                abort(403)
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+# ─── Sprint 2: Event Logging ─────────────────────────────────────────────────
+
+def log_event(level, event_type, message, user_id=None, job_id=None,
+              details=None, ip_addr=None):
+    """Write an immutable audit event to app_events. Thread-safe."""
+    conn = _get_db()
+    try:
+        now = datetime.now().isoformat()
+        user_display = ""
+        if user_id:
+            u = get_user_by_id(user_id)
+            if u:
+                user_display = u["display_name"]
+        details_json = json.dumps(details, default=str) if details else ""
+        conn.execute(
+            """INSERT INTO app_events
+               (ts, level, event_type, message, user_id, user_display,
+                job_id, details_json, ip_addr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (now, level, event_type, message, user_id, user_display,
+             job_id or "", details_json, ip_addr or "")
+        )
+        conn.commit()
+    except Exception:
+        pass  # Never let logging failure crash the app
+    finally:
+        conn.close()
+
+
+def query_events(level=None, event_type=None, job_id=None, user_id=None,
+                 limit=200):
+    """Query audit events with optional filters. Returns list of dicts."""
+    conn = _get_db()
+    try:
+        sql = "SELECT id, ts, level, event_type, message, user_id, user_display, job_id, details_json, ip_addr FROM app_events WHERE 1=1"
+        params = []
+        if level:
+            sql += " AND level = ?"
+            params.append(level)
+        if event_type:
+            sql += " AND event_type = ?"
+            params.append(event_type)
+        if job_id:
+            sql += " AND job_id = ?"
+            params.append(job_id)
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(int(user_id))
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        return [_event_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _event_row_to_dict(row):
+    """Convert an app_events row to a dict."""
+    return {
+        "id": row[0],
+        "ts": row[1],
+        "level": row[2],
+        "event_type": row[3],
+        "message": row[4],
+        "user_id": row[5],
+        "user_display": row[6] or "",
+        "job_id": row[7] or "",
+        "details_json": row[8] or "",
+        "ip_addr": row[9] or "",
+    }
+
+
+# ─── Sprint 2: Admin Summary Builder ─────────────────────────────────────────
+
+def build_admin_summary():
+    """Build the admin dashboard summary: health, KPIs, recent jobs, recent events."""
+    import shutil as _shutil
+    import time as _time
+
+    now = datetime.now()
+    uptime_s = (now - _start_time).total_seconds()
+    today_str = now.strftime("%Y-%m-%d")
+
+    # Health
+    tesseract_ok = _shutil.which("tesseract") is not None
+    extract_ok = (BASE_DIR / "extract.py").exists()
+    api_key_set = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    all_ok = tesseract_ok and extract_ok and api_key_set
+    health_state = "good" if all_ok else ("warn" if (tesseract_ok and extract_ok) else "bad")
+    health_label = "Healthy" if all_ok else ("Degraded" if health_state == "warn" else "Unhealthy")
+
+    # KPIs from jobs
+    jobs_today = 0
+    failures_today = 0
+    runtimes = []
+    ttfv_values = []
+    running_count = 0
+    for j in jobs.values():
+        created = j.get("created", "")
+        if created and created[:10] == today_str:
+            jobs_today += 1
+            if j.get("status") in ("error", "failed"):
+                failures_today += 1
+        if j.get("status") == "running":
+            running_count += 1
+        # Compute runtimes from log metadata
+        log_path_str = j.get("log_path", "")
+        if log_path_str and os.path.exists(log_path_str):
+            try:
+                with open(log_path_str) as _lf:
+                    log_data = json.load(_lf)
+                rt = log_data.get("timing", {}).get("total_s")
+                if rt:
+                    runtimes.append(rt)
+                tf = log_data.get("streaming", {}).get("time_to_first_values_s")
+                if tf:
+                    ttfv_values.append(tf)
+            except (json.JSONDecodeError, IOError, KeyError):
+                pass
+
+    avg_runtime = round(sum(runtimes) / len(runtimes), 1) if runtimes else 0
+    avg_ttfv = round(sum(ttfv_values) / len(ttfv_values), 1) if ttfv_values else 0
+
+    # Disk free
+    try:
+        usage = _shutil.disk_usage(str(DATA_DIR))
+        disk_free_gb = round(usage.free / (1024**3), 1)
+    except Exception:
+        disk_free_gb = 0
+
+    # Recent jobs (last 10)
+    sorted_jobs = sorted(jobs.items(), key=lambda kv: kv[1].get("created", ""), reverse=True)[:10]
+    recent_jobs = []
+    for jid, j in sorted_jobs:
+        status = j.get("status", "unknown")
+        status_class = {"done": "good", "error": "bad", "failed": "bad", "running": "warn"}.get(status, "")
+        recent_jobs.append({
+            "job_id": jid[:12],
+            "client_name": j.get("client_name", ""),
+            "status": status,
+            "status_class": status_class,
+            "started": j.get("created", "")[:16].replace("T", " "),
+            "runtime_s": j.get("runtime_s", "-"),
+        })
+
+    # Recent events (last 15)
+    recent_events = query_events(limit=15)
+
+    return {
+        "health": {
+            "version": _app_version,
+            "uptime_h": round(uptime_s / 3600, 1),
+            "state": health_state,
+            "label": health_label,
+        },
+        "kpis": {
+            "jobs_today": jobs_today,
+            "failures_today": failures_today,
+            "avg_runtime_s": avg_runtime,
+            "time_to_first_values_s": avg_ttfv,
+            "disk_free_gb": disk_free_gb,
+            "running_jobs": running_count,
+        },
+        "recent_jobs": recent_jobs,
+        "recent_events": recent_events,
+    }
 
 VALID_DOC_TYPES = {"tax_returns", "bank_statements", "trust_documents", "bookkeeping", "payroll", "other"}
 
@@ -259,8 +795,250 @@ def save_jobs():
         finally:
             conn.close()
 
+def _backfill_verified_fields():
+    """One-time backfill: populate verified_fields from existing verifications blobs.
+
+    Runs once on first startup after the verified_fields table is added.
+    Resolves original values from extraction logs on disk.
+    """
+    conn = _get_db()
+    try:
+        vf_count = conn.execute("SELECT COUNT(*) FROM verified_fields").fetchone()[0]
+        if vf_count > 0:
+            return  # Already populated
+
+        rows = conn.execute("SELECT job_id, data FROM verifications").fetchall()
+        if not rows:
+            return
+
+        migrated = 0
+        for job_id, data_json in rows:
+            try:
+                vdata = json.loads(data_json)
+            except json.JSONDecodeError:
+                continue
+
+            fields_dict = vdata.get("fields", {})
+            if not fields_dict:
+                continue
+
+            # Load extraction log for this job to get original values
+            job = jobs.get(job_id)
+            log_data = None
+            if job:
+                log_path = job.get("output_log")
+                if log_path and os.path.exists(log_path):
+                    try:
+                        with open(log_path) as f:
+                            log_data = json.load(f)
+                    except (json.JSONDecodeError, IOError):
+                        pass
+
+            for field_key, decision in fields_dict.items():
+                status = decision.get("status", "")
+                if status not in ("confirmed", "corrected", "flagged"):
+                    continue
+
+                canonical = None
+                original = None
+
+                if log_data:
+                    # Inline resolution of field value from extraction log
+                    parts = field_key.split(":")
+                    if len(parts) == 3:
+                        try:
+                            pn = int(parts[0])
+                            ei = int(parts[1])
+                            fn = parts[2]
+                            page_exts = [e for e in log_data.get("extractions", []) if e.get("_page") == pn]
+                            if ei < len(page_exts):
+                                fdata = page_exts[ei].get("fields", {}).get(fn)
+                                if fdata is not None:
+                                    original = fdata.get("value") if isinstance(fdata, dict) else fdata
+                        except (ValueError, TypeError):
+                            pass
+
+                if status == "corrected":
+                    canonical = decision.get("corrected_value")
+                elif status == "confirmed":
+                    canonical = original
+                # flagged: canonical stays None
+
+                conn.execute(
+                    """INSERT OR IGNORE INTO verified_fields
+                       (job_id, field_key, canonical_value, original_value, status,
+                        category, vendor_desc, note, reviewer, verified_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (job_id, field_key,
+                     json.dumps(canonical) if canonical is not None else None,
+                     json.dumps(original) if original is not None else None,
+                     status,
+                     decision.get("category", ""),
+                     decision.get("vendor_desc", ""),
+                     decision.get("note", ""),
+                     decision.get("reviewer", vdata.get("reviewer", "")),
+                     decision.get("timestamp", vdata.get("updated", datetime.now().isoformat())))
+                )
+                migrated += 1
+
+        conn.commit()
+        if migrated:
+            print(f"  Backfilled {migrated} verified fields from verifications blob")
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not backfill verified_fields: {e}")
+    finally:
+        conn.close()
+
+
+def _normalize_payer_key(ext):
+    """Derive a stable payer key from an extraction dict.
+
+    Uses EIN when available (prefixed 'ein:'), else normalized payer name (prefixed 'name:').
+    The prefix prevents collisions between EIN strings and name strings.
+    """
+    # Try top-level payer_ein first
+    ein = ext.get("payer_ein") or ""
+    if not ein:
+        # Try inside fields
+        fields = ext.get("fields", {})
+        for ek in ("employer_ein", "partnership_ein", "payer_ein"):
+            fdata = fields.get(ek)
+            if fdata:
+                ein = fdata.get("value") if isinstance(fdata, dict) else fdata
+                if ein:
+                    break
+    # Clean EIN: keep digits and dashes
+    if ein:
+        ein = re.sub(r'[^0-9\-]', '', str(ein))
+        if len(ein) >= 5:
+            return f"ein:{ein}"
+
+    # Fallback: normalize payer name
+    name = str(ext.get("payer_or_entity") or "unknown").upper().strip()
+    # Strip common suffixes
+    for suffix in (", LLC", " LLC", ", INC", " INC", ", CORP", " CORP",
+                   ", LP", " LP", ", LLP", " LLP", " CO", ", CO",
+                   " COMPANY", ", COMPANY", " CORPORATION", ", CORPORATION"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].rstrip(" ,")
+    # Strip trailing store numbers like #1234
+    name = re.sub(r'\s*#\d+$', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return f"name:{name}" if name else "name:UNKNOWN"
+
+
+def _backfill_client_canonicals():
+    """One-time backfill: populate client_canonical_values from existing verified_fields.
+
+    For each verified field with status confirmed/corrected, resolves its extraction's
+    document_type, payer, and field name, then upserts into the client-level store.
+    """
+    conn = _get_db()
+    try:
+        cc_count = conn.execute("SELECT COUNT(*) FROM client_canonical_values").fetchone()[0]
+        if cc_count > 0:
+            return  # Already populated
+
+        # Get all verified fields that have a canonical value
+        rows = conn.execute(
+            "SELECT job_id, field_key, canonical_value, original_value, status, reviewer, verified_at "
+            "FROM verified_fields WHERE status IN ('confirmed', 'corrected') AND canonical_value IS NOT NULL"
+        ).fetchall()
+        if not rows:
+            return
+
+        migrated = 0
+        # Cache loaded logs to avoid re-reading the same file for each field
+        log_cache = {}
+
+        for job_id, field_key, canon_json, orig_json, status, reviewer, verified_at in rows:
+            job = jobs.get(job_id)
+            if not job:
+                continue
+            client_name = job.get("client_name", "")
+            year = job.get("year", "")
+            if not client_name or not year:
+                continue
+
+            # Load log (cached) — inline to avoid dependency on _load_extraction_log
+            if job_id not in log_cache:
+                log_path = job.get("output_log")
+                if log_path and os.path.exists(log_path):
+                    try:
+                        with open(log_path) as f:
+                            log_cache[job_id] = json.load(f)
+                    except (json.JSONDecodeError, IOError):
+                        log_cache[job_id] = None
+                else:
+                    log_cache[job_id] = None
+            log_data = log_cache[job_id]
+            if not log_data:
+                continue
+
+            # Resolve extraction for this field
+            parts = field_key.split(":")
+            if len(parts) != 3:
+                continue
+            try:
+                page_num = int(parts[0])
+                ext_idx = int(parts[1])
+                fn = parts[2]
+            except ValueError:
+                continue
+
+            page_exts = [e for e in log_data.get("extractions", []) if e.get("_page") == page_num]
+            if ext_idx >= len(page_exts):
+                continue
+            ext = page_exts[ext_idx]
+            doc_type = ext.get("document_type", "")
+            if not doc_type:
+                continue
+
+            payer_key = _normalize_payer_key(ext)
+            payer_display = ext.get("payer_or_entity", "")
+
+            canonical = None
+            if canon_json is not None:
+                try:
+                    canonical = json.loads(canon_json)
+                except (json.JSONDecodeError, ValueError):
+                    canonical = canon_json
+
+            original = None
+            if orig_json is not None:
+                try:
+                    original = json.loads(orig_json)
+                except (json.JSONDecodeError, ValueError):
+                    original = orig_json
+
+            conn.execute(
+                """INSERT OR IGNORE INTO client_canonical_values
+                   (client_name, year, document_type, payer_key, payer_display,
+                    field_name, canonical_value, original_value, status,
+                    source_job_id, reviewer, verified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (client_name, year, doc_type, payer_key, payer_display,
+                 fn,
+                 json.dumps(canonical) if canonical is not None else None,
+                 json.dumps(original) if original is not None else None,
+                 status, job_id, reviewer or "", verified_at or "")
+            )
+            migrated += 1
+
+        conn.commit()
+        if migrated:
+            print(f"  Backfilled {migrated} client canonical values from verified fields")
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not backfill client_canonical_values: {e}")
+    finally:
+        conn.close()
+
+
 _init_db()
+_seed_default_users()
 load_jobs()
+_backfill_verified_fields()
+_backfill_client_canonicals()
 
 # ─── Chart of Accounts + Vendor Memory ────────────────────────────────────────
 
@@ -826,22 +1604,26 @@ def _gather_uncategorized(job_ids=None, client_name=None):
     return items
 
 def auto_rotate_page(img):
-    """Detect and fix sideways/landscape pages for the review viewer."""
+    """Detect and fix rotated pages for the review viewer.
+
+    - Landscape pages: always use OSD rotation
+    - Portrait + 90/270 OSD: rotate (content is sideways in portrait frame)
+    - Portrait + 180 OSD: only rotate if conf >= 10 (180 is usually false positive)"""
     w, h = img.size
-    if w > h * 1.15:
-        # Landscape — use Tesseract OSD to determine correct rotation
-        try:
-            import pytesseract
-            osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
-            angle = osd.get("rotate", 0)
-            if angle != 0:
+    is_landscape = w > h * 1.15
+    try:
+        import pytesseract
+        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        angle = osd.get("rotate", 0)
+        conf = float(osd.get("orientation_conf", 0))
+        if angle != 0:
+            if is_landscape or angle in (90, 270) or conf >= 10:
                 return img.rotate(-angle, expand=True)
-            # Tesseract says angle=0 — page is already correct orientation (landscape)
-            return img
-        except Exception as e:
+        return img
+    except Exception as e:
+        if is_landscape:
             print(f"  Auto-rotate: Tesseract OSD failed ({e}), rotating 90 CW as fallback")
-        # Fallback only if Tesseract failed entirely
-        return img.rotate(-90, expand=True)
+            return img.rotate(-90, expand=True)
     return img
 
 def generate_page_images(job_id, pdf_path):
@@ -870,6 +1652,12 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
     job["stage"] = "starting"
     job["progress"] = 0
     job["start_time"] = datetime.now().isoformat()
+
+    # Sprint 2: Log job start
+    log_event("info", "job_started",
+              f"Job started: {job.get('filename', '')} for {job.get('client_name', '')}",
+              job_id=job_id,
+              details={"doc_type": doc_type, "year": year})
 
     # Generate page images for the side-by-side viewer
     job["stage"] = "rendering"
@@ -941,14 +1729,34 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             if "converting pdf" in ll:
                 job["stage"] = "scanning"
                 job["progress"] = 5
+            elif "preprocessing" in ll and "pages" in ll:
+                job["stage"] = "preprocessing"
+                job["progress"] = 6
+            elif "blank pages detected" in ll:
+                job["progress"] = 7
+            elif "pages converted" in ll:
+                job["progress"] = 7
             elif "ocr pass" in ll:
                 job["stage"] = "ocr"
                 job["progress"] = 8
             elif "ocr success" in ll:
+                job["progress"] = 11
+            elif "cache hit" in ll:
+                job["stage"] = "cache_restore"
                 job["progress"] = 12
+            elif "per-page routing" in ll:
+                job["stage"] = "routing"
+                job["progress"] = 12
+            elif "routing summary" in ll:
+                job["progress"] = 13
             elif "phase 1:" in ll or "classification" in ll or "classify" in ll:
                 job["stage"] = "classifying"
                 job["progress"] = 15
+            elif "section detection" in ll:
+                job["stage"] = "section_detect"
+                job["progress"] = 17
+            elif "section summary" in ll:
+                job["progress"] = 18
             elif "document group" in ll:
                 job["progress"] = 25
             elif "phase 2:" in ll or "── extraction" in ll:
@@ -959,8 +1767,35 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                 job["progress"] = min(job["progress"] + 3, 72)
             elif ("page" in ll and "extracted" in ll) or ("multi-page extracted" in ll):
                 job["progress"] = min(job["progress"] + 3, 72)
+            elif ll.startswith("batch_complete:"):
+                parts = ll.split(":")
+                if len(parts) >= 4:
+                    try:
+                        bn, tb, fc = int(parts[1]), int(parts[2]), int(parts[3])
+                        job["stage"] = "extracting"
+                        job["progress"] = 30 + int(45 * bn / max(tb, 1))
+                        job["batches_complete"] = bn
+                        job["total_batches"] = tb
+                        job["fields_streamed"] = fc
+                        job["partial_results_ready"] = True
+                    except (ValueError, IndexError):
+                        pass
+            elif ll.startswith("first_values_ready:"):
+                try:
+                    job["time_to_first_values_s"] = float(ll.split(":")[1])
+                    job["partial_results_ready"] = True
+                except (ValueError, IndexError):
+                    pass
+            elif ll.startswith("finalize_complete"):
+                job["progress"] = 75
+                job["stage"] = "finalizing"
             elif "extraction stats" in ll:
                 job["progress"] = 75
+            elif "phase 2.5" in ll or ("consensus" in ll and "verification" in ll):
+                job["stage"] = "consensus"
+                job["progress"] = 76
+            elif "consensus:" in ll and ("auto_verified" in ll or "needs_review" in ll):
+                job["progress"] = 77
             elif "phase 3:" in ll or "── verification" in ll:
                 job["stage"] = "verifying"
                 job["progress"] = 78
@@ -991,6 +1826,10 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
             job["progress"] = 100
             job["stage"] = "done"
             job["end_time"] = datetime.now().isoformat()
+            # Sprint 2: Log job completion
+            log_event("info", "job_completed",
+                      f"Job completed: {job.get('client_name', '')}",
+                      job_id=job_id)
             job["output_xlsx"] = str(output_path) if output_path.exists() else None
             job["output_log"] = str(log_path) if log_path.exists() else None
             if job["output_xlsx"]:
@@ -1055,20 +1894,268 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                     if cost:
                         job["stats"]["cost"] = cost
                         job["cost_usd"] = cost.get("estimated_cost_usd", 0)
+
+                    # T1.6: Populate fact store from extraction results
+                    try:
+                        _populate_facts_from_extraction(job)
+                    except Exception as fact_err:
+                        job["log"].append(f"  Warning: Fact population failed: {fact_err}")
                 except (json.JSONDecodeError, KeyError, TypeError, IOError) as e:
                     job["log"].append(f"  Warning: Could not parse log stats: {e}")
         else:
             job["status"] = "error"
             job["end_time"] = datetime.now().isoformat()
             job["error"] = f"extract.py exited with code {proc.returncode}"
+            # Sprint 2: Log job failure
+            log_event("error", "job_failed",
+                      f"Job failed: {job.get('client_name', '')} (exit code {proc.returncode})",
+                      job_id=job_id)
 
     except Exception as e:
         job["status"] = "error"
         job["end_time"] = datetime.now().isoformat()
         job["error"] = str(e)
         _active_procs.pop(job_id, None)
+        # Sprint 2: Log job error
+        log_event("error", "job_failed",
+                  f"Job error: {job.get('client_name', '')} — {e}",
+                  job_id=job_id)
 
     save_jobs()
+
+
+# ─── Sprint 2: Login / Logout Routes ─────────────────────────────────────────
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    users = list_active_users()
+    return render_template("login.html", users=users, error=None)
+
+
+@app.route("/login", methods=["POST"])
+def login_post():
+    import time as _time
+    username = request.form.get("username", "").strip().lower()
+    pin = request.form.get("pin", "").strip()
+    ip = request.remote_addr or "unknown"
+    key = (username, ip)
+    st = _failed_logins.get(key, {"count": 0, "locked_until": 0})
+    now_epoch = int(_time.time())
+
+    # Lockout check
+    if st["locked_until"] > now_epoch:
+        log_event("warn", "login_lockout",
+                  f"Login locked out for {username}", ip_addr=ip)
+        return render_template("login.html", users=list_active_users(),
+                               error="Too many attempts. Try again shortly.")
+
+    u = get_user_by_username(username)
+    if not u or not u["is_active"] or not pin.isdigit() or len(pin) != 6:
+        st["count"] += 1
+        if st["count"] >= MAX_FAILED_ATTEMPTS:
+            st["locked_until"] = now_epoch + LOGIN_LOCKOUT_SECONDS
+        _failed_logins[key] = st
+        log_event("warn", "login_failed",
+                  f"Login failed for {username}",
+                  user_id=u["id"] if u else None, ip_addr=ip)
+        return render_template("login.html", users=list_active_users(),
+                               error="Invalid credentials.")
+
+    if not check_password_hash(u["pin_hash"], pin):
+        st["count"] += 1
+        if st["count"] >= MAX_FAILED_ATTEMPTS:
+            st["locked_until"] = now_epoch + LOGIN_LOCKOUT_SECONDS
+        _failed_logins[key] = st
+        log_event("warn", "login_failed",
+                  f"Login failed for {username}",
+                  user_id=u["id"], ip_addr=ip)
+        return render_template("login.html", users=list_active_users(),
+                               error="Invalid credentials.")
+
+    # Successful login
+    _failed_logins.pop(key, None)
+    session.clear()
+    session["user_id"] = u["id"]
+    session["last_seen"] = now_epoch
+    update_last_login(u["id"])
+    log_event("info", "login_success",
+              f"{u['display_name']} logged in",
+              user_id=u["id"], ip_addr=ip)
+    return redirect("/admin", code=303)
+
+
+@app.route("/logout", methods=["POST"])
+@require_login
+def logout():
+    u = current_user()
+    if u:
+        log_event("info", "logout",
+                  f"{u['display_name']} logged out",
+                  user_id=u["id"],
+                  ip_addr=request.remote_addr or "")
+    session.clear()
+    return redirect("/login", code=303)
+
+
+# ─── Sprint 2: Admin Routes ─────────────────────────────────────────────────
+
+@app.route("/admin")
+@require_login
+def admin_home():
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    summary = build_admin_summary()
+    return render_template("admin_home.html",
+        active="overview", header="Overview",
+        current_user=u,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+        kpis=summary["kpis"],
+        recent_jobs=summary["recent_jobs"],
+        recent_events=summary["recent_events"],
+    )
+
+
+@app.route("/admin/events")
+@require_login
+def admin_events():
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    level = request.args.get("level") or None
+    job_id = request.args.get("job_id") or None
+    user_id = request.args.get("user_id") or None
+    events = query_events(level=level, job_id=job_id, user_id=user_id, limit=200)
+    summary = build_admin_summary()
+    return render_template("admin_events.html",
+        active="events", header="Events",
+        current_user=u,
+        level=level, job_id=job_id, user_id=user_id,
+        events=events,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+
+@app.route("/admin/users")
+@require_login
+@require_role("admin")
+def admin_users():
+    u = current_user()
+    users = list_all_users()
+    summary = build_admin_summary()
+    return render_template("admin_users.html",
+        active="users", header="Users",
+        current_user=u, users=users, temp_pin=None,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+
+@app.route("/admin/users/create", methods=["POST"])
+@require_login
+@require_role("admin")
+def admin_create_user():
+    username = request.form.get("username", "").strip().lower()
+    display_name = request.form.get("display_name", "").strip()
+    role = request.form.get("role", "reviewer").strip()
+
+    if not username or not display_name:
+        abort(400)
+    if role not in VALID_ROLES:
+        abort(400)
+
+    # Check for duplicate
+    existing = get_user_by_username(username)
+    if existing:
+        summary = build_admin_summary()
+        return render_template("admin_users.html",
+            active="users", header="Users",
+            current_user=current_user(), users=list_all_users(),
+            temp_pin=None,
+            version=summary["health"]["version"],
+            uptime_h=summary["health"]["uptime_h"],
+            health_state=summary["health"]["state"],
+            health_label=summary["health"]["label"],
+            error=f"Username '{username}' already exists.",
+        )
+
+    temp_pin = generate_6_digit_pin()
+    pin_hash = generate_password_hash(temp_pin)
+    new_id = create_user(username, display_name, role, pin_hash)
+    log_event("info", "user_create",
+              f"Created user '{display_name}' ({username}, {role})",
+              user_id=current_user()["id"],
+              details={"new_user_id": new_id, "username": username, "role": role})
+
+    summary = build_admin_summary()
+    return render_template("admin_users.html",
+        active="users", header="Users",
+        current_user=current_user(), users=list_all_users(),
+        temp_pin=temp_pin,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+
+@app.route("/admin/users/<int:user_id>/reset_pin", methods=["POST"])
+@require_login
+@require_role("admin")
+def admin_reset_pin(user_id):
+    temp_pin = generate_6_digit_pin()
+    set_user_pin_hash(user_id, generate_password_hash(temp_pin))
+    target = get_user_by_id(user_id)
+    target_name = target["display_name"] if target else f"user_id={user_id}"
+    log_event("warn", "pin_reset",
+              f"PIN reset for {target_name}",
+              user_id=current_user()["id"],
+              details={"target_user_id": user_id})
+
+    summary = build_admin_summary()
+    return render_template("admin_users.html",
+        active="users", header="Users",
+        current_user=current_user(), users=list_all_users(),
+        temp_pin=temp_pin,
+        version=summary["health"]["version"],
+        uptime_h=summary["health"]["uptime_h"],
+        health_state=summary["health"]["state"],
+        health_label=summary["health"]["label"],
+    )
+
+
+@app.route("/admin/users/<int:user_id>/toggle", methods=["POST"])
+@require_login
+@require_role("admin")
+def admin_toggle_user(user_id):
+    target = get_user_by_id(user_id)
+    if not target:
+        abort(404)
+    new_state = not target["is_active"]
+    set_user_active(user_id, new_state)
+    action = "enabled" if new_state else "disabled"
+    log_event("warn", f"user_{action}",
+              f"User {target['display_name']} {action}",
+              user_id=current_user()["id"],
+              details={"target_user_id": user_id})
+    return redirect("/admin/users", code=303)
+
+
+@app.route("/api/admin/summary")
+@require_login
+def api_admin_summary():
+    u = current_user()
+    if u["role"] not in ("admin", "partner"):
+        abort(403)
+    return jsonify(build_admin_summary())
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -1143,6 +2230,15 @@ def upload():
     }
     save_jobs()
 
+    # Sprint 2: Log upload event
+    upload_user = current_user()
+    log_event("info", "upload_received",
+              f"Upload: {f.filename} for {resolved_client} ({doc_type})",
+              user_id=upload_user["id"] if upload_user else None,
+              job_id=job_id,
+              details={"filename": f.filename, "client": resolved_client,
+                       "doc_type": doc_type, "year": year})
+
     t = threading.Thread(target=run_extraction, args=(job_id, pdf_path, year, skip_verify, doc_type, output_format, user_notes, ai_instructions, disable_pii, False, use_ocr_first))
     t.daemon = True
     t.start()
@@ -1159,36 +2255,106 @@ def status(job_id):
     out["log_length"] = len(job.get("log", []))
     return jsonify(out)
 
+# ─── T1.5: Helpers for partial/progressive results ──────────────────────────
+
+def _build_page_map(extractions):
+    """Build page_map dict from extractions for the review UI."""
+    page_map = {}
+    for ext in extractions:
+        p = ext.get("_page")
+        if p:
+            if p not in page_map:
+                page_map[p] = []
+            page_map[p].append({
+                "document_type": ext.get("document_type", ""),
+                "entity": ext.get("payer_or_entity", ""),
+                "method": ext.get("_extraction_method", ""),
+                "confidence": ext.get("_overall_confidence", ""),
+                "fields": {k: {
+                    "value": v.get("value") if isinstance(v, dict) else v,
+                    "confidence": v.get("confidence", "") if isinstance(v, dict) else "",
+                    "label": v.get("label_on_form", "") if isinstance(v, dict) else "",
+                } for k, v in (ext.get("fields") or {}).items()
+                if (v.get("value") if isinstance(v, dict) else v) is not None}
+            })
+    return page_map
+
+
+def _get_partial_path(job_id):
+    """Derive partial results file path for a job."""
+    job = jobs.get(job_id)
+    if not job:
+        return None
+    pdf_path = job.get("pdf_path", "")
+    stem = Path(pdf_path).stem if pdf_path else job_id
+    return str(OUTPUT_DIR / (stem + "_intake_partial_results.json"))
+
+
+def _apply_locks(partial_data, vdata):
+    """Overlay user corrections onto partial extraction data.
+
+    Locked fields (user-edited) keep the user's value, not the extraction's.
+    Later batches may attach more evidence but cannot change locked values.
+    """
+    corrections = vdata.get("fields", {})
+    if not corrections:
+        return partial_data
+
+    for ext in partial_data.get("extractions", []):
+        page = ext.get("_page")
+        if not page:
+            continue
+        fields = ext.get("fields", {})
+        for field_key, decision in corrections.items():
+            parts = field_key.split(":")
+            if len(parts) != 3:
+                continue
+            try:
+                fpage = int(parts[0])
+            except (ValueError, TypeError):
+                continue
+            fname = parts[2]
+            if fpage != page:
+                continue
+            if fname in fields and decision.get("status") == "corrected":
+                if isinstance(fields[fname], dict):
+                    fields[fname]["value"] = decision.get("corrected_value", fields[fname].get("value"))
+                    fields[fname]["_locked"] = True
+
+    return partial_data
+
+
 @app.route("/api/results/<job_id>")
 def results(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
+
+    # T1.5: Support partial results during extraction
+    if job.get("status") == "running":
+        partial_path = _get_partial_path(job_id)
+        if partial_path and os.path.exists(partial_path):
+            try:
+                with open(partial_path) as f:
+                    data = json.load(f)
+                # Merge user corrections (locked fields)
+                vdata = _load_verifications(job_id)
+                data = _apply_locks(data, vdata)
+                data["page_map"] = _build_page_map(data.get("extractions", []))
+                data["total_pages"] = job.get("total_pages") or max(
+                    (int(k) for k in data["page_map"].keys()), default=1)
+                return jsonify(data)
+            except (IOError, json.JSONDecodeError):
+                pass
+        return jsonify({"error": "Results not ready", "partial": False}), 404
+
+    # Complete results from log file
     log_path = job.get("output_log")
     if log_path and os.path.exists(log_path):
         with open(log_path) as f:
             data = json.load(f)
-        # Attach page mapping: which pages have which extractions
-        page_map = {}
-        for ext in data.get("extractions", []):
-            p = ext.get("_page")
-            if p:
-                if p not in page_map:
-                    page_map[p] = []
-                page_map[p].append({
-                    "document_type": ext.get("document_type", ""),
-                    "entity": ext.get("payer_or_entity", ""),
-                    "method": ext.get("_extraction_method", ""),
-                    "confidence": ext.get("_overall_confidence", ""),
-                    "fields": {k: {
-                        "value": v.get("value") if isinstance(v, dict) else v,
-                        "confidence": v.get("confidence", "") if isinstance(v, dict) else "",
-                        "label": v.get("label_on_form", "") if isinstance(v, dict) else "",
-                    } for k, v in (ext.get("fields") or {}).items()
-                    if (v.get("value") if isinstance(v, dict) else v) is not None}
-                })
-        data["page_map"] = page_map
-        data["total_pages"] = job.get("total_pages") or max((int(k) for k in page_map.keys()), default=1)
+        data["page_map"] = _build_page_map(data.get("extractions", []))
+        data["total_pages"] = job.get("total_pages") or max((int(k) for k in data["page_map"].keys()), default=1)
         return jsonify(data)
     return jsonify({"error": "Results not ready"}), 404
 
@@ -1347,13 +2513,11 @@ def ai_chat(job_id):
     except ImportError:
         return jsonify({"error": "Anthropic library not available"}), 500
 
-    # Build context from the extraction log
-    log_path = job.get("output_log")
+    # Build context from verified extraction data (includes confirmed/corrected values)
     extraction_context = ""
-    if log_path and os.path.exists(log_path):
-        with open(log_path) as f:
-            log_data = json.load(f)
-        exts = log_data.get("extractions", [])
+    verified_log = get_verified_extractions(job_id)
+    if verified_log:
+        exts = verified_log.get("extractions", [])
         if page_num:
             page_exts = [e for e in exts if e.get("_page") == page_num]
             if page_exts:
@@ -1406,6 +2570,564 @@ def page_image(job_id, page_num):
         return send_file(str(img_path), mimetype="image/jpeg")
     abort(404)
 
+# ─── Guided Review: Backend Functions ────────────────────────────────────────
+
+def _get_page_word_data(job_id, page_num):
+    """Get Tesseract word-level bounding boxes for a review page image.
+
+    Runs OCR once and caches results as JSON alongside the page image.
+    Returns list of {text, left, top, width, height, conf} dicts.
+    """
+    cache_path = PAGES_DIR / job_id / f"page_{page_num}_words.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    img_path = PAGES_DIR / job_id / f"page_{page_num}.jpg"
+    if not img_path.exists():
+        return []
+    try:
+        import pytesseract
+        img = Image.open(str(img_path))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT,
+                                          config='--oem 3 --psm 6')
+        words = []
+        for i in range(len(data['text'])):
+            txt = data['text'][i].strip()
+            if txt and int(data['conf'][i]) >= 0:
+                words.append({
+                    'text': txt,
+                    'left': int(data['left'][i]),
+                    'top': int(data['top'][i]),
+                    'width': int(data['width'][i]),
+                    'height': int(data['height'][i]),
+                    'conf': int(data['conf'][i]),
+                })
+        with open(cache_path, 'w') as f:
+            json.dump(words, f)
+        return words
+    except Exception:
+        return []
+
+
+def _normalize_num_str(s):
+    """Normalize a string to a canonical numeric form for matching.
+    Strips $, commas, spaces. Returns '1234.56' form or None if not numeric."""
+    s = re.sub(r'[$,\s()]', '', str(s).strip())
+    # Handle negatives in parens like (1234.56)
+    neg = s.startswith('-')
+    s = s.lstrip('-')
+    try:
+        val = float(s)
+        if neg:
+            val = -val
+        return f"{val:.2f}"
+    except (ValueError, TypeError):
+        return None
+
+
+def _find_value_bboxes(words, value):
+    """Find bounding boxes of OCR words matching a field value.
+
+    Strategies:
+    1. Exact single-word numeric match
+    2. Multi-word numeric assembly (consecutive words forming a number)
+    3. Case-insensitive text sequence match
+    Returns list of word dicts with bounding box info.
+    """
+    if value is None:
+        return []
+    value_str = str(value).strip()
+    if not value_str:
+        return []
+
+    norm_val = _normalize_num_str(value_str)
+
+    # Strategy 1: Exact single-word numeric match
+    if norm_val:
+        for w in words:
+            w_norm = _normalize_num_str(w['text'])
+            if w_norm and w_norm == norm_val:
+                return [w]
+
+    # Strategy 2: Multi-word numeric assembly
+    if norm_val:
+        for i in range(len(words)):
+            running = ""
+            group = []
+            for j in range(i, min(i + 10, len(words))):
+                running += words[j]['text']
+                group.append(words[j])
+                r_norm = _normalize_num_str(running)
+                if r_norm and r_norm == norm_val:
+                    return group
+
+    # Strategy 3: Case-insensitive text sequence match
+    val_upper = value_str.upper()
+    val_words = val_upper.split()
+    if val_words:
+        for i in range(len(words)):
+            if words[i]['text'].upper().startswith(val_words[0]) or val_words[0].startswith(words[i]['text'].upper()):
+                if len(val_words) == 1 and words[i]['text'].upper() == val_words[0]:
+                    return [words[i]]
+                match = True
+                group = [words[i]]
+                for k in range(1, len(val_words)):
+                    if i + k < len(words) and words[i + k]['text'].upper() == val_words[k]:
+                        group.append(words[i + k])
+                    else:
+                        match = False
+                        break
+                if match and len(group) == len(val_words):
+                    return group
+
+    return []
+
+
+def _generate_uncertain_evidence(img, cache_path):
+    """Generate full-page evidence with 'location uncertain' banner."""
+    from PIL import ImageDraw, ImageFont
+    result = img.convert("RGB")
+    draw = ImageDraw.Draw(result)
+    banner_h = 36
+    draw.rectangle([0, 0, result.width, banner_h], fill=(255, 200, 0))
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((12, 8), "EXACT LOCATION UNCERTAIN", fill=(120, 0, 0), font=font)
+    result.save(str(cache_path), "PNG", optimize=True)
+    return str(cache_path)
+
+
+def _generate_evidence_image(job_id, page_num, field_value, field_id):
+    """Generate a highlighted evidence PNG showing where a value appears on the page.
+
+    Returns the path to the generated PNG, or None if generation fails.
+    Caches results in data/evidence/<job_id>/<field_id>.png.
+    """
+    from PIL import ImageDraw
+    evidence_dir = EVIDENCE_DIR / job_id
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    safe_field_id = re.sub(r'[^\w\-.]', '_', str(field_id))
+    cache_path = evidence_dir / f"{safe_field_id}.png"
+    if cache_path.exists():
+        return str(cache_path)
+
+    img_path = PAGES_DIR / job_id / f"page_{page_num}.jpg"
+    if not img_path.exists():
+        return None
+
+    img = Image.open(str(img_path)).convert("RGBA")
+    words = _get_page_word_data(job_id, page_num)
+    if not words:
+        return _generate_uncertain_evidence(img, cache_path)
+
+    bboxes = _find_value_bboxes(words, field_value)
+    if not bboxes:
+        return _generate_uncertain_evidence(img, cache_path)
+
+    # Draw highlight overlay
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    PADDING = 5
+    MIN_SIZE = 20
+    for bbox in bboxes:
+        x0 = max(0, bbox['left'] - PADDING)
+        y0 = max(0, bbox['top'] - PADDING)
+        x1 = min(img.width, bbox['left'] + bbox['width'] + PADDING)
+        y1 = min(img.height, bbox['top'] + bbox['height'] + PADDING)
+        # Enforce minimum highlight size
+        if (x1 - x0) < MIN_SIZE:
+            cx = (x0 + x1) // 2
+            x0, x1 = cx - MIN_SIZE // 2, cx + MIN_SIZE // 2
+        if (y1 - y0) < MIN_SIZE:
+            cy = (y0 + y1) // 2
+            y0, y1 = cy - MIN_SIZE // 2, cy + MIN_SIZE // 2
+        draw.rectangle([x0, y0, x1, y1], fill=(255, 230, 0, 80))
+        draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 0), width=3)
+
+    result = Image.alpha_composite(img, overlay).convert("RGB")
+    result.save(str(cache_path), "PNG", optimize=True)
+    return str(cache_path)
+
+
+# ── Guided Review: Queue Builder ──
+
+# Field type priority for review ordering (lower = reviewed first)
+_FIELD_TYPE_PRIORITY = {
+    'payer_or_entity': 10, 'payer_ein': 10, 'recipient_name': 10,
+    'employer_name': 10, 'employer_ein': 10,
+    'total_income': 20, 'total_wages': 20, 'taxable_income': 20,
+    'total_tax': 20, 'total_deposits': 20, 'total_debits': 20,
+    'total_credits': 20, 'total_withdrawals': 20,
+    'ending_balance': 20, 'beginning_balance': 20,
+    'wages': 25, 'federal_tax_withheld': 25, 'federal_wh': 25,
+    'state_tax_withheld': 25, 'state_wh': 25,
+    'social_security_wages': 25, 'ss_wages': 25,
+    'medicare_wages': 25, 'medicare_wh': 25,
+    'ordinary_dividends': 30, 'qualified_dividends': 30,
+    'interest_income': 30, 'capital_gain_distributions': 30,
+    'total_gain_loss': 30, 'b_total_gain_loss': 30,
+    'gross_distribution': 30, 'taxable_amount': 30,
+}
+
+# Fields to skip in guided review (better in grid view)
+_GUIDED_REVIEW_SKIP_PATTERNS = re.compile(
+    r'^(txn_\d+|_|line_\d+|continuation_)'
+)
+
+
+def _field_display_name(doc_type, field_name):
+    """Generate a human-readable display name for a field."""
+    # Convert snake_case to Title Case
+    display = field_name.replace('_', ' ').title()
+    # Add box numbers for well-known W-2/1099 fields
+    box_labels = {
+        'wages': 'Box 1 - Wages',
+        'federal_wh': 'Box 2 - Federal Tax Withheld',
+        'federal_tax_withheld': 'Box 2 - Federal Tax Withheld',
+        'ss_wages': 'Box 3 - Social Security Wages',
+        'social_security_wages': 'Box 3 - Social Security Wages',
+        'ss_tax': 'Box 4 - Social Security Tax',
+        'medicare_wages': 'Box 5 - Medicare Wages',
+        'medicare_wh': 'Box 6 - Medicare Tax Withheld',
+        'ordinary_dividends': 'Box 1a - Ordinary Dividends',
+        'qualified_dividends': 'Box 1b - Qualified Dividends',
+        'capital_gain_distributions': 'Box 2a - Capital Gain Distributions',
+        'interest_income': 'Box 1 - Interest Income',
+        'gross_distribution': 'Box 1 - Gross Distribution',
+        'taxable_amount': 'Box 2a - Taxable Amount',
+        'beginning_balance': 'Beginning Balance',
+        'ending_balance': 'Ending Balance',
+        'total_deposits': 'Total Deposits',
+        'total_withdrawals': 'Total Withdrawals',
+    }
+    return box_labels.get(field_name, display)
+
+
+def _build_guided_queue(job_id):
+    """Build prioritized review queue for guided review.
+
+    Reads from the extraction log (same source as grid review), filters out
+    already-verified fields, and orders by importance.
+    """
+    log_data = _load_extraction_log(job_id)
+    if not log_data:
+        return [], 0
+
+    # Load already-verified fields
+    conn = _get_db()
+    verified = set()
+    try:
+        rows = conn.execute(
+            "SELECT field_key FROM verified_fields WHERE job_id = ? AND status IN ('confirmed', 'corrected')",
+            (job_id,)
+        ).fetchall()
+        verified = {r[0] for r in rows}
+    finally:
+        conn.close()
+
+    extractions = log_data.get("extractions", [])
+    queue = []
+    total_fields = 0
+
+    # Group by page for stable ordering
+    page_groups = {}
+    for ext in extractions:
+        p = ext.get("_page")
+        if p is not None:
+            page_groups.setdefault(p, []).append(ext)
+
+    for page_num in sorted(page_groups.keys()):
+        for ext_idx, ext in enumerate(page_groups[page_num]):
+            fields = ext.get("fields") or {}
+            doc_type = ext.get("document_type", "")
+            entity = ext.get("payer_or_entity", "") or ext.get("employer_name", "") or ""
+
+            for field_name, fdata in fields.items():
+                if not isinstance(fdata, dict):
+                    continue
+                if field_name.startswith("_"):
+                    continue
+                if _GUIDED_REVIEW_SKIP_PATTERNS.match(field_name):
+                    continue
+
+                field_id = f"{page_num}:{ext_idx}:{field_name}"
+                total_fields += 1
+
+                if field_id in verified:
+                    continue
+
+                value = fdata.get("value")
+                confidence = fdata.get("confidence", "")
+
+                # Priority scoring (lower = first)
+                priority = _FIELD_TYPE_PRIORITY.get(field_name, 50)
+                if confidence in ('low', 'needs_review', 'unverified'):
+                    priority -= 20
+
+                queue.append({
+                    'field_id': field_id,
+                    'field_name': field_name,
+                    'display_name': _field_display_name(doc_type, field_name),
+                    'value': value,
+                    'page_num': page_num,
+                    'document_type': doc_type,
+                    'entity': entity,
+                    'confidence': confidence,
+                    'method': ext.get("_extraction_method", ""),
+                    'status': 'needs_review' if confidence in ('low', 'needs_review', 'unverified') else 'extracted',
+                    '_priority': priority,
+                })
+
+    queue.sort(key=lambda x: (x['_priority'], x['page_num'], x['field_name']))
+    # Strip internal priority from output
+    for item in queue:
+        item.pop('_priority', None)
+
+    reviewed_count = total_fields - len(queue)
+    return queue, reviewed_count
+
+
+# ── Guided Review: Concurrency Locks ──
+
+def _acquire_review_lock(job_id, field_id, reviewer):
+    """Acquire or extend a review lock. Returns (success, lock_holder)."""
+    conn = _get_db()
+    try:
+        now = datetime.now().isoformat()
+        # Clean expired locks
+        conn.execute("DELETE FROM review_locks WHERE expires_at < ?", (now,))
+        # Check existing lock by different reviewer
+        existing = conn.execute(
+            "SELECT locked_by, expires_at FROM review_locks WHERE job_id = ? AND field_id = ?",
+            (job_id, field_id)
+        ).fetchone()
+        if existing and existing[0] != reviewer:
+            return False, existing[0]
+        # Acquire or extend
+        expires = (datetime.now() + timedelta(seconds=REVIEW_LOCK_TIMEOUT_SECONDS)).isoformat()
+        conn.execute(
+            """INSERT INTO review_locks (job_id, field_id, locked_by, locked_at, expires_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(job_id, field_id) DO UPDATE SET
+                   locked_by = excluded.locked_by,
+                   locked_at = excluded.locked_at,
+                   expires_at = excluded.expires_at""",
+            (job_id, field_id, reviewer, now, expires)
+        )
+        conn.commit()
+        return True, reviewer
+    finally:
+        conn.close()
+
+
+def _release_review_lock(job_id, field_id):
+    """Release a review lock."""
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM review_locks WHERE job_id = ? AND field_id = ?",
+                      (job_id, field_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Guided Review: API Routes ──
+
+@app.route("/api/guided-review/queue/<job_id>")
+def guided_review_queue(job_id):
+    """Return ordered review queue for guided review."""
+    queue, reviewed_count = _build_guided_queue(job_id)
+    return jsonify({
+        "queue": queue,
+        "total": len(queue) + reviewed_count,
+        "reviewed": reviewed_count,
+        "remaining": len(queue),
+    })
+
+
+@app.route("/api/guided-review/item/<job_id>/<path:field_id>")
+def guided_review_item(job_id, field_id):
+    """Return full detail for one field, triggering evidence generation."""
+    # Parse field_id: "page:extIdx:fieldName"
+    parts = field_id.split(":")
+    if len(parts) < 3:
+        return jsonify({"error": "Invalid field_id"}), 400
+    try:
+        page_num = int(parts[0])
+    except ValueError:
+        return jsonify({"error": "Invalid page number"}), 400
+    field_name = ":".join(parts[2:])
+
+    # Load field data from extraction log
+    log_data = _load_extraction_log(job_id)
+    if not log_data:
+        return jsonify({"error": "No extraction data"}), 404
+
+    extractions = log_data.get("extractions", [])
+    ext_idx = int(parts[1])
+    target_ext = None
+    # Find extraction for this page + index
+    page_exts = [e for e in extractions if e.get("_page") == page_num]
+    if ext_idx < len(page_exts):
+        target_ext = page_exts[ext_idx]
+
+    if not target_ext:
+        return jsonify({"error": "Extraction not found"}), 404
+
+    fdata = (target_ext.get("fields") or {}).get(field_name)
+    if not fdata or not isinstance(fdata, dict):
+        return jsonify({"error": "Field not found"}), 404
+
+    value = fdata.get("value")
+    entity = target_ext.get("payer_or_entity", "") or target_ext.get("employer_name", "") or ""
+    doc_type = target_ext.get("document_type", "")
+
+    # Generate evidence image
+    evidence_path = _generate_evidence_image(job_id, page_num, value, field_id)
+    safe_field_id = re.sub(r'[^\w\-.]', '_', str(field_id))
+    evidence_url = f"/api/guided-review/evidence/{job_id}/{safe_field_id}.png" if evidence_path else None
+
+    # Queue position
+    queue, reviewed = _build_guided_queue(job_id)
+    position = next((i for i, q in enumerate(queue) if q['field_id'] == field_id), -1)
+
+    return jsonify({
+        "field_id": field_id,
+        "field_name": field_name,
+        "display_name": _field_display_name(doc_type, field_name),
+        "value": value,
+        "page_num": page_num,
+        "document_type": doc_type,
+        "entity": entity,
+        "confidence": fdata.get("confidence", ""),
+        "method": target_ext.get("_extraction_method", ""),
+        "evidence_url": evidence_url,
+        "evidence_available": evidence_path is not None,
+        "page_url": f"/api/page-image/{job_id}/{page_num}",
+        "position_in_queue": position,
+        "queue_total": len(queue) + reviewed,
+    })
+
+
+@app.route("/api/guided-review/evidence/<job_id>/<filename>")
+def guided_review_evidence(job_id, filename):
+    """Serve a cached evidence highlight image."""
+    # Sanitize filename to prevent path traversal
+    safe_name = re.sub(r'[^\w\-.]', '_', filename)
+    path = EVIDENCE_DIR / job_id / safe_name
+    if path.exists():
+        return send_file(str(path), mimetype="image/png")
+    abort(404)
+
+
+@app.route("/api/guided-review/action/<job_id>/<path:field_id>", methods=["POST"])
+def guided_review_action(job_id, field_id):
+    """Process a guided review action on a single field.
+
+    Body: { action: confirm|correct|not_present|skip, corrected_value?, note?, reviewer? }
+    Returns: { ok: true, next: <next_item_or_null> }
+    """
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action", "")
+    reviewer = payload.get("reviewer", "")
+
+    if action not in ("confirm", "correct", "not_present", "skip"):
+        return jsonify({"error": "Invalid action"}), 400
+
+    # Release the lock on this field
+    _release_review_lock(job_id, field_id)
+
+    if action != "skip":
+        # Map guided review action to the existing verification format
+        status_map = {
+            "confirm": "confirmed",
+            "correct": "corrected",
+            "not_present": "flagged",
+        }
+        status = status_map[action]
+        field_decision = {
+            "status": status,
+            "reviewer": reviewer,
+            "note": payload.get("note", ""),
+        }
+        if action == "correct":
+            field_decision["corrected_value"] = payload.get("corrected_value")
+            # Delete cached evidence for this field (value changed)
+            safe_fid = re.sub(r'[^\w\-.]', '_', str(field_id))
+            evidence_file = EVIDENCE_DIR / job_id / f"{safe_fid}.png"
+            if evidence_file.exists():
+                try:
+                    evidence_file.unlink()
+                except OSError:
+                    pass
+        if action == "not_present":
+            field_decision["note"] = payload.get("note", "") or "Value not present on document"
+
+        # Reuse existing verification infrastructure
+        incoming = {field_id: field_decision}
+
+        # Write to legacy verifications JSON
+        data = _load_verifications(job_id)
+        data["reviewer"] = reviewer
+        for key, decision in incoming.items():
+            decision["timestamp"] = datetime.now().isoformat()
+            data["fields"][key] = decision
+        _save_verifications(job_id, data)
+
+        # Write to normalized tables + facts + client canonicals
+        _upsert_verified_fields(job_id, incoming)
+
+        # Auto-regenerate Excel
+        _regen_excel(job_id)
+
+        # Audit log
+        verify_user = current_user()
+        log_event("info", "fact_verified",
+                  f"Guided review: {action} {field_id} on job {job_id[:12]}",
+                  user_id=verify_user["id"] if verify_user else None,
+                  job_id=job_id,
+                  details={"reviewer": reviewer, "action": action,
+                           "field_id": field_id, "mode": "guided"})
+
+    # Return next item in queue
+    queue, reviewed = _build_guided_queue(job_id)
+    next_item = queue[0] if queue else None
+    return jsonify({
+        "ok": True,
+        "next": next_item,
+        "remaining": len(queue),
+        "reviewed": reviewed,
+        "total": len(queue) + reviewed,
+    })
+
+
+@app.route("/api/guided-review/lock/<job_id>/<path:field_id>", methods=["POST"])
+def guided_review_lock(job_id, field_id):
+    """Acquire or extend a review lock on a field."""
+    payload = request.get_json(silent=True) or {}
+    reviewer = payload.get("reviewer", "")
+    if not reviewer:
+        return jsonify({"error": "Reviewer required"}), 400
+    success, holder = _acquire_review_lock(job_id, field_id, reviewer)
+    if success:
+        return jsonify({"ok": True, "locked_by": holder})
+    return jsonify({"error": f"Field locked by {holder}"}), 409
+
+
+@app.route("/api/guided-review/lock/<job_id>/<path:field_id>", methods=["DELETE"])
+def guided_review_unlock(job_id, field_id):
+    """Release a review lock."""
+    _release_review_lock(job_id, field_id)
+    return jsonify({"ok": True})
+
+
+# ─── End Guided Review Backend ───────────────────────────────────────────────
+
 @app.route("/api/download/<job_id>")
 def download_xlsx(job_id):
     job = jobs.get(job_id)
@@ -1454,7 +3176,26 @@ def list_jobs():
             continue
         if dtype and j.get("doc_type", "") != dtype:
             continue
-        out.append(_sanitize_job(j))
+        job_out = _sanitize_job(j)
+        # Compute duration in seconds
+        st = j.get("start_time")
+        et = j.get("end_time")
+        if st and et:
+            try:
+                start_dt = datetime.fromisoformat(st)
+                end_dt = datetime.fromisoformat(et)
+                job_out["duration_seconds"] = int((end_dt - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                job_out["duration_seconds"] = None
+        elif st and j.get("status") == "running":
+            try:
+                start_dt = datetime.fromisoformat(st)
+                job_out["duration_seconds"] = int((datetime.now() - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                job_out["duration_seconds"] = None
+        else:
+            job_out["duration_seconds"] = None
+        out.append(job_out)
     return jsonify(out)
 
 @app.route("/api/delete/<job_id>", methods=["POST"])
@@ -1467,16 +3208,30 @@ def delete_job(job_id):
         try:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             conn.execute("DELETE FROM verifications WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM verified_fields WHERE job_id = ?", (job_id,))
             conn.commit()
         except sqlite3.Error:
             pass
         finally:
             conn.close()
+        # Clean review locks
+        try:
+            conn2 = _get_db()
+            conn2.execute("DELETE FROM review_locks WHERE job_id = ?", (job_id,))
+            conn2.commit()
+            conn2.close()
+        except sqlite3.Error:
+            pass
         # Clean up page images
         job_pages = PAGES_DIR / job_id
         if job_pages.exists():
             import shutil
             shutil.rmtree(str(job_pages), ignore_errors=True)
+        # Clean up evidence images
+        job_evidence = EVIDENCE_DIR / job_id
+        if job_evidence.exists():
+            import shutil
+            shutil.rmtree(str(job_evidence), ignore_errors=True)
     return jsonify({"ok": True})
 
 # ─── Verification ────────────────────────────────────────────────────────────
@@ -1532,6 +3287,550 @@ def _update_verify_summary(job_id, vdata):
     }
     save_jobs()
 
+
+def _resolve_field_value(log_data, field_key):
+    """Given an extraction log and a field key like '3:0:wages', return the extracted value."""
+    parts = field_key.split(":")
+    if len(parts) != 3:
+        return None
+    page_str, ext_idx_str, field_name = parts
+    try:
+        page_num = int(page_str)
+        ext_idx = int(ext_idx_str)
+    except ValueError:
+        return None
+    extractions = log_data.get("extractions", [])
+    page_exts = [e for e in extractions if e.get("_page") == page_num]
+    if ext_idx >= len(page_exts):
+        return None
+    ext = page_exts[ext_idx]
+    fields = ext.get("fields", {})
+    fdata = fields.get(field_name)
+    if fdata is None:
+        return None
+    return fdata.get("value") if isinstance(fdata, dict) else fdata
+
+
+def _load_extraction_log(job_id):
+    """Load the raw extraction log JSON for a job. Returns dict or None."""
+    job = jobs.get(job_id)
+    if not job:
+        return None
+    log_path = job.get("output_log")
+    if not log_path or not os.path.exists(log_path):
+        return None
+    try:
+        with open(log_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _resolve_extraction_for_field(log_data, field_key):
+    """Given a field_key like '3:0:wages', return the parent extraction dict.
+
+    Returns (extraction_dict, field_name) or (None, None).
+    """
+    parts = field_key.split(":")
+    if len(parts) != 3:
+        return None, None
+    page_str, ext_idx_str, field_name = parts
+    try:
+        page_num = int(page_str)
+        ext_idx = int(ext_idx_str)
+    except ValueError:
+        return None, None
+    extractions = log_data.get("extractions", [])
+    page_exts = [e for e in extractions if e.get("_page") == page_num]
+    if ext_idx >= len(page_exts):
+        return None, None
+    return page_exts[ext_idx], field_name
+
+
+def _upsert_client_canonical(conn, client_name, year, document_type, payer_key,
+                              payer_display, field_name, canonical_value,
+                              original_value, status, job_id, reviewer, verified_at,
+                              evidence_ref='', source_doc='', page_number=None):
+    """Upsert a single field into the client-level canonical store.
+
+    Newer verifications always overwrite older ones.
+    T1.6: Extended with evidence_ref, source_doc, page_number for workpaper support.
+    """
+    conn.execute(
+        """INSERT INTO client_canonical_values
+           (client_name, year, document_type, payer_key, payer_display,
+            field_name, canonical_value, original_value, status,
+            source_job_id, reviewer, verified_at,
+            evidence_ref, source_doc, page_number)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(client_name, year, document_type, payer_key, field_name)
+           DO UPDATE SET
+               canonical_value = excluded.canonical_value,
+               original_value = excluded.original_value,
+               payer_display = excluded.payer_display,
+               status = excluded.status,
+               source_job_id = excluded.source_job_id,
+               reviewer = excluded.reviewer,
+               verified_at = excluded.verified_at,
+               evidence_ref = excluded.evidence_ref,
+               source_doc = excluded.source_doc,
+               page_number = excluded.page_number""",
+        (client_name, year, document_type, payer_key, payer_display,
+         field_name,
+         json.dumps(canonical_value) if canonical_value is not None else None,
+         json.dumps(original_value) if original_value is not None else None,
+         status, job_id, reviewer, verified_at,
+         evidence_ref, source_doc, page_number)
+    )
+
+
+def _populate_facts_from_extraction(job):
+    """T1.6.2: Populate unified facts table from extraction results.
+
+    Chain of custody: extraction results are written to the unified facts
+    table immediately. The FactStore enforces monotonic trust — corrected and
+    confirmed facts are never overwritten by automation.
+
+    Also syncs to the legacy client_canonical_values table for workpaper compat.
+
+    Only runs when client_name and year are available.
+    """
+    from fact_store import FactStore
+
+    client_name = job.get("client_name") or ""
+    year = job.get("year") or ""
+    job_id = job.get("id") or ""
+    filename = job.get("filename") or ""
+
+    if not client_name or not year:
+        return
+
+    log_data = _load_extraction_log(job_id)
+    if not log_data:
+        return
+
+    exts = log_data.get("extractions", [])
+    if not exts:
+        return
+
+    # Status mapping: high-confidence extractions get auto_verified
+    AUTO_VERIFIED_CONFS = frozenset({
+        "dual_confirmed", "verified_confirmed", "auto_verified",
+        "consensus_accepted", "multipage_verified",
+    })
+
+    fs = FactStore(str(DB_PATH))
+    try:
+        tax_year = int(year) if year.isdigit() else None
+    except (ValueError, AttributeError):
+        tax_year = None
+
+    count = 0
+    for ext in exts:
+        payer_key = _normalize_payer_key(ext)
+        doc_type = ext.get("document_type") or "unknown"
+        page = ext.get("_page")
+        extraction_method = ext.get("_extraction_method") or ""
+
+        fields = ext.get("fields") or {}
+        for fname, fdata in fields.items():
+            if fname.startswith("_"):
+                continue
+            if not isinstance(fdata, dict):
+                continue
+
+            value = fdata.get("value")
+            confidence_str = fdata.get("confidence") or ""
+
+            # Determine status
+            if confidence_str in AUTO_VERIFIED_CONFS:
+                status = "auto_verified"
+            else:
+                status = "extracted"
+
+            # Build fact_key: "doc_type.payer_key.field_name"
+            fact_key = FactStore.fact_key(doc_type, payer_key, fname)
+
+            # Parse numeric value
+            value_num = None
+            value_text = None
+            if value is not None:
+                try:
+                    value_num = float(str(value).replace(",", "").replace("$", ""))
+                except (ValueError, TypeError):
+                    value_text = str(value)
+
+            # Determine source_method from extraction method
+            source_method = extraction_method
+            if "ocr" in extraction_method.lower():
+                source_method = "ocr"
+            elif "vision" in extraction_method.lower():
+                source_method = "vision"
+            elif "text" in extraction_method.lower():
+                source_method = "text_layer"
+
+            # Parse confidence to float
+            conf_num = None
+            if confidence_str:
+                conf_map = {
+                    "high": 0.9, "medium": 0.7, "low": 0.4,
+                    "auto_verified": 0.95, "dual_confirmed": 0.99,
+                    "verified_confirmed": 0.98, "consensus_accepted": 0.97,
+                    "multipage_verified": 0.96,
+                }
+                conf_num = conf_map.get(confidence_str)
+
+            # Write to unified facts table (respects lock rules automatically)
+            try:
+                fs.upsert_candidate_fact(
+                    job_id=job_id, client_id=client_name,
+                    tax_year=tax_year, fact_key=fact_key,
+                    value_num=value_num, value_text=value_text,
+                    status=status, confidence=conf_num,
+                    source_method=source_method,
+                    source_doc=filename, source_page=page,
+                    evidence_ref=confidence_str
+                )
+                count += 1
+            except (ValueError, sqlite3.Error):
+                pass  # Skip invalid values silently
+
+    # Sync to legacy table for workpaper compatibility
+    try:
+        fs.sync_to_legacy(job_id, client_name, str(year))
+    except Exception:
+        pass  # Non-fatal
+
+    if count > 0:
+        job.setdefault("log", []).append(
+            f"  T1.6.2: Populated {count} facts for {client_name} / {year}"
+        )
+
+
+def _upsert_verified_fields(job_id, incoming_fields):
+    """Write individual field decisions to the normalized verified_fields table.
+
+    For each field:
+      confirmed → canonical_value = original extracted value
+      corrected → canonical_value = corrected value
+      flagged   → canonical_value = NULL
+      _remove   → DELETE from table
+    """
+    if not incoming_fields:
+        return
+    conn = _get_db()
+    try:
+        # Load extraction log once for resolving confirmed values
+        log_data = _load_extraction_log(job_id)
+        now = datetime.now().isoformat()
+
+        for field_key, decision in incoming_fields.items():
+            status = decision.get("status", "")
+
+            if status == "_remove":
+                conn.execute(
+                    "DELETE FROM verified_fields WHERE job_id = ? AND field_key = ?",
+                    (job_id, field_key)
+                )
+                continue
+
+            if status not in ("confirmed", "corrected", "flagged"):
+                continue
+
+            canonical = None
+            original = None
+
+            if status == "corrected":
+                canonical = decision.get("corrected_value")
+                if log_data:
+                    original = _resolve_field_value(log_data, field_key)
+            elif status == "confirmed":
+                if log_data:
+                    original = _resolve_field_value(log_data, field_key)
+                    canonical = original
+            # flagged: canonical stays None
+
+            conn.execute(
+                """INSERT INTO verified_fields
+                   (job_id, field_key, canonical_value, original_value, status,
+                    category, vendor_desc, note, reviewer, verified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, field_key) DO UPDATE SET
+                       canonical_value = excluded.canonical_value,
+                       original_value = excluded.original_value,
+                       status = excluded.status,
+                       category = excluded.category,
+                       vendor_desc = excluded.vendor_desc,
+                       note = excluded.note,
+                       reviewer = excluded.reviewer,
+                       verified_at = excluded.verified_at""",
+                (job_id, field_key,
+                 json.dumps(canonical) if canonical is not None else None,
+                 json.dumps(original) if original is not None else None,
+                 status,
+                 decision.get("category", ""),
+                 decision.get("vendor_desc", ""),
+                 decision.get("note", ""),
+                 decision.get("reviewer", decision.get("reviewer", "")),
+                 decision.get("timestamp", now))
+            )
+
+        # Promote to client-level canonical store + unified facts table
+        job = jobs.get(job_id)
+        if job and log_data:
+            client_name = job.get("client_name", "")
+            year = job.get("year", "")
+            if client_name and year:
+                # T1.6.2: Also update unified facts table
+                from fact_store import FactStore
+                try:
+                    fs = FactStore(str(DB_PATH))
+                    tax_year = int(year) if year.isdigit() else None
+                except Exception:
+                    fs = None
+                    tax_year = None
+
+                for field_key, decision in incoming_fields.items():
+                    status = decision.get("status", "")
+                    if status not in ("confirmed", "corrected"):
+                        continue
+                    ext, fn = _resolve_extraction_for_field(log_data, field_key)
+                    if not ext or not fn:
+                        continue
+                    doc_type = ext.get("document_type", "")
+                    if not doc_type:
+                        continue
+                    payer_key = _normalize_payer_key(ext)
+                    payer_display = ext.get("payer_or_entity", "")
+
+                    canonical = None
+                    original = _resolve_field_value(log_data, field_key)
+                    if status == "corrected":
+                        canonical = decision.get("corrected_value")
+                    elif status == "confirmed":
+                        canonical = original
+
+                    if canonical is not None:
+                        _upsert_client_canonical(
+                            conn, client_name, year, doc_type, payer_key,
+                            payer_display, fn, canonical, original,
+                            status, job_id,
+                            decision.get("reviewer", ""),
+                            decision.get("timestamp", now)
+                        )
+
+                    # T1.6.2: Update unified facts table
+                    if fs and tax_year is not None:
+                        fact_key = FactStore.fact_key(doc_type, payer_key, fn)
+                        try:
+                            if status == "corrected" and canonical is not None:
+                                # Parse corrected value
+                                corr_num = None
+                                corr_text = None
+                                try:
+                                    corr_num = float(str(canonical).replace(",", "").replace("$", ""))
+                                except (ValueError, TypeError):
+                                    corr_text = str(canonical)
+                                fs.apply_correction(
+                                    job_id, tax_year, fact_key,
+                                    value_num=corr_num, value_text=corr_text,
+                                    reviewer=decision.get("reviewer", "")
+                                )
+                            elif status == "confirmed":
+                                fs.upgrade_fact_status(
+                                    job_id, tax_year, fact_key, "confirmed"
+                                )
+                        except Exception:
+                            pass  # Non-fatal — legacy table is still updated
+
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"  Warning: Could not upsert verified_fields for {job_id}: {e}")
+    finally:
+        conn.close()
+
+
+def get_verified_extractions(job_id):
+    """Load extraction log and overlay all verified field values.
+
+    Two-tier resolution:
+      1. Job-level: verified_fields table (per-job confirmations/corrections)
+      2. Client-level: client_canonical_values table (cross-job canonical truth)
+
+    Job-level always takes precedence. Client-level fills in unverified fields
+    when the same client/year/payer/field was verified in another job.
+
+    Returns the full log_data dict with verified values replacing raw values.
+    Returns None if no extraction log exists.
+    """
+    import copy
+
+    job = jobs.get(job_id)
+    log_data = _load_extraction_log(job_id)
+    if not log_data:
+        return None
+
+    extractions = log_data.get("extractions", [])
+    if not extractions:
+        return log_data
+
+    conn = _get_db()
+    try:
+        # Load job-level verified fields
+        job_rows = conn.execute(
+            "SELECT field_key, canonical_value, status, category, vendor_desc "
+            "FROM verified_fields WHERE job_id = ?",
+            (job_id,)
+        ).fetchall()
+
+        # Load client-level canonical values
+        client_canonicals = {}
+        if job:
+            client_name = job.get("client_name", "")
+            year = job.get("year", "")
+            if client_name and year:
+                cc_rows = conn.execute(
+                    "SELECT document_type, payer_key, field_name, canonical_value, status "
+                    "FROM client_canonical_values WHERE client_name = ? AND year = ?",
+                    (client_name, year)
+                ).fetchall()
+                for doc_type, payer_key, field_name, canon_json, status in cc_rows:
+                    cc_key = (doc_type, payer_key, field_name)
+                    canonical = None
+                    if canon_json is not None:
+                        try:
+                            canonical = json.loads(canon_json)
+                        except (json.JSONDecodeError, ValueError):
+                            canonical = canon_json
+                    client_canonicals[cc_key] = {
+                        "canonical": canonical,
+                        "status": status,
+                    }
+    except sqlite3.Error:
+        job_rows = []
+        client_canonicals = {}
+    finally:
+        conn.close()
+
+    if not job_rows and not client_canonicals:
+        return log_data  # No verifications at all — return raw
+
+    # Build job-level lookup: field_key → {canonical, status, category, vendor_desc}
+    verified = {}
+    for field_key, canonical_json, status, category, vendor_desc in job_rows:
+        canonical = None
+        if canonical_json is not None:
+            try:
+                canonical = json.loads(canonical_json)
+            except (json.JSONDecodeError, ValueError):
+                canonical = canonical_json
+        verified[field_key] = {
+            "canonical": canonical,
+            "status": status,
+            "category": category or "",
+            "vendor_desc": vendor_desc or "",
+        }
+
+    # Deep copy extractions so we don't mutate the cached log data
+    extractions = copy.deepcopy(extractions)
+
+    # Build page-index mapping
+    page_groups = {}
+    for ext in extractions:
+        p = ext.get("_page")
+        if p is not None:
+            page_groups.setdefault(p, []).append(ext)
+
+    # Pass 1: Overlay job-level verified values
+    # Track which fields were handled at job level
+    job_verified_fields = set()
+
+    for page, page_exts in page_groups.items():
+        for ext_idx, ext in enumerate(page_exts):
+            fields = ext.get("fields")
+            if not fields:
+                continue
+            for field_name in list(fields.keys()):
+                fk = f"{page}:{ext_idx}:{field_name}"
+                vf = verified.get(fk)
+                if not vf:
+                    continue
+
+                job_verified_fields.add(fk)
+                fdata = fields[field_name]
+                canonical = vf["canonical"]
+
+                if canonical is not None:
+                    try:
+                        canonical = float(str(canonical).replace(",", ""))
+                    except (ValueError, TypeError):
+                        pass
+
+                    if isinstance(fdata, dict):
+                        fdata["_original_value"] = fdata.get("value")
+                        fdata["value"] = canonical
+                        fdata["confidence"] = "operator_corrected" if vf["status"] == "corrected" else "operator_confirmed"
+                    else:
+                        fields[field_name] = {
+                            "value": canonical,
+                            "_original_value": fdata,
+                            "confidence": "operator_corrected" if vf["status"] == "corrected" else "operator_confirmed",
+                        }
+
+                if vf.get("category"):
+                    if isinstance(fields[field_name], dict):
+                        fields[field_name]["_operator_category"] = vf["category"]
+                if vf.get("vendor_desc"):
+                    if isinstance(fields[field_name], dict):
+                        fields[field_name]["_vendor_desc"] = vf["vendor_desc"]
+
+    # Pass 2: Overlay client-level canonicals for unverified fields
+    if client_canonicals:
+        for page, page_exts in page_groups.items():
+            for ext_idx, ext in enumerate(page_exts):
+                fields = ext.get("fields")
+                if not fields:
+                    continue
+                doc_type = ext.get("document_type", "")
+                if not doc_type:
+                    continue
+                payer_key = _normalize_payer_key(ext)
+
+                for field_name in list(fields.keys()):
+                    fk = f"{page}:{ext_idx}:{field_name}"
+                    if fk in job_verified_fields:
+                        continue  # Job-level takes precedence
+
+                    cc_key = (doc_type, payer_key, field_name)
+                    cc = client_canonicals.get(cc_key)
+                    if not cc:
+                        continue
+
+                    canonical = cc["canonical"]
+                    if canonical is None:
+                        continue
+
+                    try:
+                        canonical = float(str(canonical).replace(",", ""))
+                    except (ValueError, TypeError):
+                        pass
+
+                    fdata = fields[field_name]
+                    if isinstance(fdata, dict):
+                        fdata["_original_value"] = fdata.get("value")
+                        fdata["value"] = canonical
+                        fdata["confidence"] = "client_canonical"
+                    else:
+                        fields[field_name] = {
+                            "value": canonical,
+                            "_original_value": fdata,
+                            "confidence": "client_canonical",
+                        }
+
+    log_data["extractions"] = extractions
+    return log_data
+
+
 @app.route("/api/verify/<job_id>", methods=["GET"])
 def get_verifications(job_id):
     return jsonify(_load_verifications(job_id))
@@ -1570,8 +3869,25 @@ def save_verification(job_id):
 
     _save_verifications(job_id, data)
 
+    # Write field-level verified values to normalized table
+    _upsert_verified_fields(job_id, payload.get("fields", {}))
+
     # Auto-regenerate Excel with corrections applied
     _regen_excel(job_id)
+
+    # Sprint 2: Log verification event
+    field_count = len(payload.get("fields", {}))
+    statuses = {}
+    for _fk, _fd in (payload.get("fields") or {}).items():
+        s = _fd.get("status", "unknown")
+        statuses[s] = statuses.get(s, 0) + 1
+    verify_user = current_user()
+    log_event("info", "fact_verified",
+              f"Verified {field_count} field(s) on job {job_id[:12]}",
+              user_id=verify_user["id"] if verify_user else None,
+              job_id=job_id,
+              details={"reviewer": reviewer, "field_count": field_count,
+                       "statuses": statuses})
 
     return jsonify({"ok": True, "total_reviewed": len(data["fields"])})
 
@@ -1696,6 +4012,188 @@ def update_client_info(client_name):
         info["notes"] = (data["notes"] or "").strip()[:1000]
     _save_client_info(safe, info)
     return jsonify({"ok": True})
+
+
+@app.route("/api/clients/<path:client_name>", methods=["DELETE"])
+def delete_client(client_name):
+    """Delete a client folder and all its data. Requires typing 'delete' to confirm."""
+    import shutil
+    payload = request.get_json(silent=True) or {}
+    confirm_text = (payload.get("confirm") or "").strip().lower()
+    if confirm_text != "delete":
+        return jsonify({"error": "Type 'delete' to confirm"}), 400
+
+    safe = _safe_client_name(client_name)
+    client_dir = CLIENTS_DIR / safe
+    if not client_dir.exists():
+        return jsonify({"error": f"Client folder '{safe}' not found"}), 404
+
+    # Block if any job is running/queued for this client
+    for jid, j in jobs.items():
+        if _safe_client_name(j.get("client_name", "")) == safe and j.get("status") in ("running", "queued"):
+            return jsonify({"error": f"Cannot delete: job '{jid}' is currently running for this client"}), 409
+
+    try:
+        shutil.rmtree(str(client_dir))
+    except OSError as e:
+        return jsonify({"error": f"Failed to delete client folder: {e}"}), 500
+
+    # Clean up client canonical values from SQLite
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM client_canonical_values WHERE client_name = ?", (safe,))
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+
+    # Clear file paths from jobs (keep records for audit trail)
+    updated_count = 0
+    for jid, j in jobs.items():
+        if _safe_client_name(j.get("client_name", "")) == safe:
+            j["client_folder"] = None
+            updated_count += 1
+    if updated_count:
+        save_jobs()
+
+    return jsonify({"ok": True, "name": safe, "jobs_updated": updated_count})
+
+
+@app.route("/api/clients/merge", methods=["POST"])
+def merge_clients():
+    """Merge source client into target client. Moves all data."""
+    import shutil
+    payload = request.get_json(force=True)
+    source_name = (payload.get("source") or "").strip()
+    target_name = (payload.get("target") or "").strip()
+
+    if not source_name or not target_name:
+        return jsonify({"error": "Both source and target are required"}), 400
+
+    safe_source = _safe_client_name(source_name)
+    safe_target = _safe_client_name(target_name)
+    if safe_source == safe_target:
+        return jsonify({"error": "Source and target cannot be the same client"}), 400
+
+    source_dir = CLIENTS_DIR / safe_source
+    target_dir = CLIENTS_DIR / safe_target
+    if not source_dir.exists():
+        return jsonify({"error": f"Source client '{safe_source}' not found"}), 404
+
+    # Block if source has running/queued jobs
+    for jid, j in jobs.items():
+        if _safe_client_name(j.get("client_name", "")) == safe_source and j.get("status") in ("running", "queued"):
+            return jsonify({"error": f"Cannot merge: job '{jid}' is running for source client"}), 409
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    merge_log = []
+
+    # 1. Merge client_info.json
+    source_info = _load_client_info(safe_source)
+    target_info = _load_client_info(safe_target) or {"name": safe_target, "created": datetime.now().isoformat()}
+    if source_info:
+        source_notes = source_info.get("notes", "")
+        if source_notes:
+            existing = target_info.get("notes", "") or ""
+            target_info["notes"] = (existing + "\n[Merged from " + safe_source + "] " + source_notes).strip()
+        for field in ("ein_last4", "contact"):
+            if not target_info.get(field) and source_info.get(field):
+                target_info[field] = source_info[field]
+        target_info["updated"] = datetime.now().isoformat()
+        _save_client_info(safe_target, target_info)
+        merge_log.append("Merged client info")
+
+    # 2. Merge instructions
+    source_instr = _load_instructions(safe_source)
+    if source_instr.get("rules"):
+        target_instr = _load_instructions(safe_target)
+        existing_texts = {r.get("text", "").lower() for r in target_instr.get("rules", [])}
+        added = 0
+        for rule in source_instr["rules"]:
+            if rule.get("text", "").lower() not in existing_texts:
+                rule["id"] = datetime.now().strftime("%Y%m%d%H%M%S") + str(len(target_instr.get("rules", [])) + added)
+                target_instr.setdefault("rules", []).append(rule)
+                added += 1
+        if added:
+            _save_instructions(safe_target, target_instr)
+            merge_log.append(f"Merged {added} instructions")
+
+    # 3. Merge context documents
+    source_ctx_dir = CLIENTS_DIR / safe_source / "context"
+    if source_ctx_dir.exists():
+        target_ctx_dir = _context_dir(safe_target)
+        source_ctx_idx = _load_context_index(safe_source)
+        target_ctx_idx = _load_context_index(safe_target)
+
+        moved_docs = 0
+        for doc in source_ctx_idx.get("documents", []):
+            src_file = source_ctx_dir / doc.get("filename", "")
+            if src_file.exists():
+                dst_file = target_ctx_dir / src_file.name
+                if dst_file.exists():
+                    dst_file = target_ctx_dir / f"{dst_file.stem}_from_{safe_source}{dst_file.suffix}"
+                    doc["filename"] = dst_file.name
+                shutil.move(str(src_file), str(dst_file))
+            target_ctx_idx.setdefault("documents", []).append(doc)
+            moved_docs += 1
+
+        # Merge prior_year_data
+        source_pyd = source_ctx_idx.get("prior_year_data", {})
+        target_pyd = target_ctx_idx.get("prior_year_data", {})
+        for year, payers in source_pyd.items():
+            if year not in target_pyd:
+                target_pyd[year] = payers
+            else:
+                existing_eins = {p.get("ein", "") for p in target_pyd[year] if p.get("ein")}
+                for payer in payers:
+                    if payer.get("ein") and payer["ein"] in existing_eins:
+                        continue
+                    target_pyd[year].append(payer)
+        target_ctx_idx["prior_year_data"] = target_pyd
+        _save_context_index(safe_target, target_ctx_idx)
+        if moved_docs:
+            merge_log.append(f"Merged {moved_docs} context documents")
+
+    # 4. Move output directories (DocType/Year folders)
+    for item in source_dir.iterdir():
+        if item.is_dir() and item.name not in ("context",):
+            target_doctype_dir = target_dir / item.name
+            target_doctype_dir.mkdir(parents=True, exist_ok=True)
+            for sub in item.iterdir():
+                if sub.is_dir():
+                    target_sub = target_doctype_dir / sub.name
+                    if target_sub.exists():
+                        for f in sub.iterdir():
+                            dst = target_sub / f.name
+                            if dst.exists():
+                                dst = target_sub / f"{f.stem}_from_{safe_source}{f.suffix}"
+                            shutil.move(str(f), str(dst))
+                    else:
+                        shutil.move(str(sub), str(target_sub))
+            merge_log.append(f"Moved output folder: {item.name}")
+
+    # 5. Update all jobs: source → target
+    jobs_updated = 0
+    for jid, j in jobs.items():
+        if _safe_client_name(j.get("client_name", "")) == safe_source:
+            j["client_name"] = safe_target
+            old_cf = j.get("client_folder") or ""
+            if old_cf:
+                j["client_folder"] = old_cf.replace(str(source_dir), str(target_dir))
+            jobs_updated += 1
+    if jobs_updated:
+        save_jobs()
+        merge_log.append(f"Updated {jobs_updated} job records")
+
+    # 6. Delete source folder
+    try:
+        shutil.rmtree(str(source_dir))
+        merge_log.append(f"Deleted source folder: {safe_source}")
+    except OSError as e:
+        merge_log.append(f"Warning: Could not fully delete source folder: {e}")
+
+    return jsonify({"ok": True, "source": safe_source, "target": safe_target, "log": merge_log, "jobs_updated": jobs_updated})
 
 
 @app.route("/api/clients/<path:client_name>/documents", methods=["GET"])
@@ -2018,7 +4516,11 @@ def apply_batch_categories():
 # ─── Excel Regeneration ──────────────────────────────────────────────────────
 
 def _regen_excel(job_id):
-    """Regenerate the Excel file with operator verification corrections applied."""
+    """Regenerate the Excel file with operator verification corrections applied.
+
+    Uses get_verified_extractions() to overlay all confirmed/corrected values
+    onto the raw extraction data, then calls extract.py --regen-excel to rebuild.
+    """
     job = jobs.get(job_id)
     if not job or job.get("status") != "complete":
         return False
@@ -2028,102 +4530,21 @@ def _regen_excel(job_id):
     if not log_path or not xlsx_path or not os.path.exists(log_path):
         return False
 
+    # Load verifications for audit trail (decision metadata: status, notes, timestamps)
     vdata = _load_verifications(job_id)
     corrections = vdata.get("fields", {})
-    if not corrections:
-        return True  # Nothing to apply
+
+    # Get canonical data with verified values overlaid
+    verified_log = get_verified_extractions(job_id)
+    if not verified_log:
+        return False
+
+    extractions = verified_log.get("extractions", [])
+    if not extractions:
+        return False
 
     try:
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill
-        from openpyxl.comments import Comment
-
-        # Load the extraction log
-        with open(log_path) as f:
-            log_data = json.load(f)
-
-        extractions = log_data.get("extractions", [])
-        if not extractions:
-            return False
-
-        # Apply corrections to the extraction data
-        corrected_count = 0
-        for key, decision in corrections.items():
-            if decision.get("status") != "corrected":
-                continue
-            parts = key.split(":")
-            if len(parts) != 3:
-                continue
-            page_str, ext_idx_str, field_name = parts
-
-            corrected_value = decision.get("corrected_value")
-            if corrected_value is None:
-                continue
-
-            # Find the matching extraction by page
-            page_num = int(page_str) if page_str.isdigit() else None
-            ext_idx = int(ext_idx_str) if ext_idx_str.isdigit() else None
-            if page_num is None or ext_idx is None:
-                continue
-
-            # Match: find extractions for this page
-            page_exts = [e for e in extractions if e.get("_page") == page_num]
-            if ext_idx < len(page_exts):
-                ext = page_exts[ext_idx]
-                fields = ext.get("fields", {})
-                if field_name in fields:
-                    fdata = fields[field_name]
-                    old_val = fdata.get("value") if isinstance(fdata, dict) else fdata
-                    # Try to convert to number if it looks numeric
-                    try:
-                        new_val = float(str(corrected_value).replace(",", ""))
-                    except (ValueError, TypeError):
-                        new_val = corrected_value
-                    if isinstance(fdata, dict):
-                        fdata["_original_value"] = old_val
-                        fdata["value"] = new_val
-                        fdata["confidence"] = "operator_corrected"
-                    else:
-                        fields[field_name] = {
-                            "value": new_val,
-                            "_original_value": old_val,
-                            "confidence": "operator_corrected",
-                        }
-                    corrected_count += 1
-
-        # Inject operator-assigned categories into extraction fields
-        # These flow through to _build_journal_entries to replace "Unclassified"
-        for key, decision in corrections.items():
-            cat = decision.get("category", "")
-            if not cat:
-                continue
-            parts = key.split(":")
-            if len(parts) != 3:
-                continue
-            page_str, ext_idx_str, field_name = parts
-            page_num = int(page_str) if page_str.isdigit() else None
-            ext_idx = int(ext_idx_str) if ext_idx_str.isdigit() else None
-            if page_num is None or ext_idx is None:
-                continue
-            page_exts = [e for e in extractions if e.get("_page") == page_num]
-            if ext_idx < len(page_exts):
-                ext = page_exts[ext_idx]
-                fields = ext.get("fields", {})
-                # Store category on the field itself so _build_journal_entries can read it
-                if field_name in fields:
-                    fdata = fields[field_name]
-                    if isinstance(fdata, dict):
-                        fdata["_operator_category"] = cat
-                    else:
-                        fields[field_name] = {"value": fdata, "_operator_category": cat}
-                # Also store vendor description for the extraction log
-                vendor = decision.get("vendor_desc", "")
-                if vendor:
-                    if isinstance(fields.get(field_name), dict):
-                        fields[field_name]["_vendor_desc"] = vendor
-
-        # Now re-run populate_template via extract.py as a subprocess
-        # This is the safest way — extract.py has all the Excel formatting logic
+        # Re-run populate_template via extract.py as a subprocess
         import subprocess
         year = job.get("year", "2024")
         cmd = [
@@ -2134,12 +4555,12 @@ def _regen_excel(job_id):
             "--year", str(year),
         ]
 
-        # Write the corrected log to a temp file for extract.py to read
+        # Write verified log to a temp file for extract.py to read
         corrected_log_path = log_path.replace("_log.json", "_corrected_log.json")
         with open(corrected_log_path, "w") as f:
-            json.dump(log_data, f, indent=2, default=str)
+            json.dump(verified_log, f, indent=2, default=str)
 
-        cmd[4] = corrected_log_path  # --log-input uses the corrected version
+        cmd[4] = corrected_log_path  # --log-input uses the verified version
 
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(BASE_DIR), timeout=30)
 
@@ -2153,11 +4574,10 @@ def _regen_excel(job_id):
             print(f"  Regen subprocess failed (rc={proc.returncode}): {proc.stderr[:500] if proc.stderr else 'no stderr'}")
             # Fallback: apply corrections directly to existing Excel
             _apply_corrections_to_excel(xlsx_path, corrections, vdata.get("reviewer", ""))
-        elif corrected_count > 0:
-            # Verify corrections actually made it into the new Excel
-            # (The subprocess rewrote the file using corrected extraction data,
-            # so operator_corrected confidence values should appear)
-            print(f"  ✓ Regen complete: {corrected_count} corrections applied via extract.py")
+        else:
+            corrected_count = sum(1 for d in corrections.values() if d.get("status") == "corrected")
+            if corrected_count > 0:
+                print(f"  ✓ Regen complete: {corrected_count} corrections applied via extract.py")
 
         # Always add the audit trail worksheet (primary path doesn't create one)
         _add_audit_trail_worksheet(xlsx_path, corrections, vdata.get("reviewer", ""))
@@ -2425,19 +4845,16 @@ def generate_report(client_name):
     if not job_ids:
         return jsonify({"error": "No jobs selected"}), 400
 
-    # Gather extractions from all selected jobs
+    # Gather extractions from all selected jobs (using verified values where available)
     combined_extractions = []
     for jid in job_ids:
         job = jobs.get(jid)
         if not job or job.get("status") != "complete":
             continue
-        log_path = job.get("output_log")
-        if not log_path or not os.path.exists(log_path):
-            continue
         try:
-            with open(log_path) as f:
-                log_data = json.load(f)
-            combined_extractions.extend(log_data.get("extractions", []))
+            verified_log = get_verified_extractions(jid)
+            if verified_log:
+                combined_extractions.extend(verified_log.get("extractions", []))
         except Exception:
             continue
 
@@ -2487,6 +4904,114 @@ def download_report(report_id):
     if not path.exists():
         return jsonify({"error": "Report not found"}), 404
     return send_file(str(path), as_attachment=True, download_name=f"{safe_id}.xlsx")
+
+
+# ─── T1.6.2: Facts API (DB-backed) ──────────────────────────────────────────
+
+@app.route("/api/facts/<job_id>")
+def get_facts(job_id):
+    """Return all facts for a job from the unified facts table.
+
+    This is the DB-backed source of truth. The review UI can use this
+    instead of (or in addition to) /api/results/<job_id>.
+
+    Query params:
+        tax_year: optional filter by tax year
+    """
+    from fact_store import FactStore
+
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    tax_year = request.args.get("tax_year", type=int)
+
+    try:
+        fs = FactStore(str(DB_PATH))
+        facts = fs.get_facts_for_job(job_id, tax_year=tax_year)
+        counts = fs.count_facts(job_id, tax_year=tax_year)
+        review_queue = fs.get_review_queue(job_id)
+
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "client_id": job.get("client_name", ""),
+            "tax_year": tax_year or job.get("year"),
+            "facts": facts,
+            "counts": counts,
+            "total": sum(counts.values()),
+            "needs_review": len(review_queue),
+            "source": "db",
+        })
+    except Exception as e:
+        return jsonify({"error": f"Could not read facts: {e}"}), 500
+
+
+# ─── T1.6: Workpaper Generation ──────────────────────────────────────────────
+
+@app.route("/api/workpaper/<path:client_name>", methods=["POST"])
+def generate_workpaper(client_name):
+    """Generate a professional workpaper Excel file for a client.
+
+    POST body: {"year": "2025", "mode": "assisted"|"safe"}
+    Returns:   {"ok": true, "download_url": "/api/download-report/{id}"}
+    """
+    from fact_store import FactStore
+    from workpaper_export import WorkpaperBuilder
+
+    data = request.get_json(silent=True) or {}
+    year = data.get("year") or ""
+    mode = data.get("mode") or "assisted"
+
+    if not year:
+        return jsonify({"error": "year is required"}), 400
+    if mode not in ("assisted", "safe"):
+        return jsonify({"error": "mode must be 'assisted' or 'safe'"}), 400
+
+    try:
+        fs = FactStore(str(DB_PATH))
+
+        # Check that facts exist for this client/year
+        fact_list = fs.list_legacy_facts(client_name, year)
+        if not fact_list:
+            return jsonify({
+                "error": f"No facts found for {client_name} / {year}. "
+                         "Run extraction and review first."
+            }), 404
+
+        # Generate filename
+        safe_name = re.sub(r'[^\w\-]', '_', client_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_id = f"{safe_name}-workpaper-{year}-{timestamp}"
+        output_path = OUTPUT_DIR / f"{report_id}.xlsx"
+
+        builder = WorkpaperBuilder(fs, client_name, year, mode=mode)
+        builder.build(str(output_path))
+
+        if not output_path.exists():
+            return jsonify({"error": "Workpaper file was not created"}), 500
+
+        # Sprint 2: Log workpaper generation
+        wp_user = current_user()
+        log_event("info", "workpaper_generated",
+                  f"Workpaper generated: {client_name} / {year} ({mode} mode)",
+                  user_id=wp_user["id"] if wp_user else None,
+                  details={"client": client_name, "year": year, "mode": mode,
+                           "facts_count": len(fact_list),
+                           "filename": f"{report_id}.xlsx"})
+
+        return jsonify({
+            "ok": True,
+            "filename": f"{report_id}.xlsx",
+            "download_url": f"/api/download-report/{report_id}",
+            "facts_count": len(fact_list),
+            "mode": mode,
+        })
+
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Workpaper generation failed: {e}"}), 500
 
 
 # ─── Retry Failed/Interrupted Jobs ──────────────────────────────────────────
@@ -2794,7 +5319,7 @@ td.actions { white-space: nowrap; text-align: right; }
 .progress-bar { width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin: 12px 0; }
 .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #5DADE2); border-radius: 3px; transition: width 0.4s ease; }
 .progress-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); }
-.console-output { background: #1E2A38; color: #BDC3C7; font-family: var(--mono); font-size: 11px; padding: 12px; border-radius: 6px; max-height: 200px; overflow-y: auto; margin-top: 12px; line-height: 1.6; }
+.console-output { background: #1E2A38; color: #BDC3C7; font-family: var(--mono); font-size: 11px; padding: 12px; border-radius: 6px; max-height: 320px; overflow-y: auto; margin-top: 12px; line-height: 1.6; }
 .console-output .line-highlight { color: #5DADE2; }
 
 /* ═══ REVIEW ═══ */
@@ -2977,6 +5502,40 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.4); z-index:9999; display:none; align-items:center; justify-content:center; }
 .modal-overlay.visible { display:flex; }
 .modal-content { background:white; border-radius:12px; padding:24px; width:420px; max-width:90vw; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
+
+/* ═══ GUIDED REVIEW ═══ */
+.guided-header { padding: 12px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.guided-progress { display: flex; align-items: center; gap: 12px; }
+.guided-progress-text { font-size: 14px; font-weight: 700; color: var(--navy); white-space: nowrap; }
+.guided-progress-bar { width: 200px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.guided-progress-fill { height: 100%; background: var(--green); transition: width 0.3s ease; }
+.guided-actions-top { display: flex; gap: 8px; }
+.guided-split { display: grid; grid-template-columns: 3fr 2fr; height: calc(100vh - 80px); }
+.guided-evidence { background: #3D3D3D; overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
+.guided-evidence img { max-width: 100%; height: auto; box-shadow: var(--shadow-lg); border-radius: 4px; }
+.guided-detail { padding: 32px; display: flex; flex-direction: column; gap: 16px; background: var(--bg-card); overflow-y: auto; }
+.guided-field-label { font-size: 14px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
+.guided-field-dest { font-size: 13px; color: var(--text-light); }
+.guided-field-value { font-size: 36px; font-weight: 700; color: var(--navy); font-family: var(--mono); padding: 24px; background: var(--bg); border-radius: var(--radius-lg); border: 2px solid var(--border); text-align: center; word-break: break-all; }
+.guided-field-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; }
+.guided-field-meta .badge { font-size: 11px; }
+.guided-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+.guided-actions .btn { padding: 14px 20px; font-size: 14px; font-weight: 700; justify-content: center; border-radius: 8px; }
+.guided-actions .btn kbd { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); padding: 1px 6px; border-radius: 3px; font-size: 11px; margin-left: 6px; }
+.guided-edit-area { background: var(--bg); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.guided-edit-input { font-size: 24px; padding: 12px; text-align: center; font-family: var(--mono); font-weight: 700; border: 2px solid var(--accent); border-radius: 8px; }
+.guided-edit-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(52,152,219,0.2); }
+.guided-edit-btns { display: flex; gap: 8px; justify-content: center; }
+.guided-complete { text-align: center; padding: 60px 24px; }
+.guided-complete h2 { font-size: 24px; color: var(--green); margin-bottom: 8px; }
+.guided-complete p { font-size: 15px; color: var(--text-secondary); margin-bottom: 24px; }
+.guided-lock-banner { background: var(--yellow-bg); color: #7E5109; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; text-align: center; }
+@media (max-width: 768px) {
+  .guided-split { grid-template-columns: 1fr; }
+  .guided-evidence { max-height: 40vh; }
+  .guided-field-value { font-size: 24px; padding: 16px; }
+  .guided-actions { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -2996,6 +5555,10 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <a class="nav-item" onclick="showSection('review')" data-section="review" id="navReview" style="display:none">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
       <span>Review</span>
+    </a>
+    <a class="nav-item" onclick="openGuidedReview()" data-section="guided-review" id="navGuidedReview" style="display:none">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+      <span>Guided Review</span>
     </a>
     <a class="nav-item" onclick="showSection('clients')" data-section="clients">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -3117,11 +5680,13 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
         <div class="progress-label">
           <span id="procStage">Starting...</span>
           <span id="procPct">0%</span>
+          <span id="procElapsed" style="display:none; font-size:11px; color:var(--text-light); margin-left:8px"></span>
         </div>
         <div class="progress-bar"><div class="progress-fill" id="procBar" style="width:0%"></div></div>
         <div class="console-output" id="procConsole"></div>
         <div style="margin-top:16px; text-align:center">
           <button class="btn btn-secondary btn-sm" id="procCancelBtn" onclick="cancelJob()" style="display:none">Cancel</button>
+          <button class="btn btn-secondary btn-sm" id="procReviewEarlyBtn" style="display:none;margin-left:8px" onclick="openEarlyReview()">Review extracted fields</button>
         </div>
       </div>
     </div>
@@ -3130,6 +5695,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 
 <!-- ═══ REVIEW SECTION ═══ -->
 <div class="section" id="sec-review">
+  <div id="reviewPartialBanner" style="display:none;padding:8px 16px;background:#FFF3CD;color:#856404;text-align:center;font-size:13px;border-bottom:1px solid #E0C96B"></div>
   <div class="review-header">
     <div class="review-nav">
       <button class="btn btn-secondary btn-sm" onclick="prevPage()">&#9664; Prev</button>
@@ -3142,8 +5708,10 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <button class="btn btn-success btn-sm" onclick="downloadFile('xlsx')">&#x2B73; Excel</button>
       <button class="btn btn-secondary btn-sm" onclick="downloadFile('log')">&#x2B73; JSON</button>
       <button class="btn btn-secondary btn-sm" onclick="regenExcel()" title="Regenerate Excel with corrections">&#x21BB; Regen Excel</button>
+      <button class="btn btn-sm" style="background:#1565C0;color:#fff" onclick="generateWorkpaper()" title="Generate professional workpaper from verified facts" id="btnWorkpaper">&#x1F4CB; Workpaper</button>
       <button class="btn btn-secondary btn-sm" onclick="toggleAiChat()" title="Ask AI about this page" id="aiChatToggle">&#x1F4AC; Ask AI</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
+      <button class="btn btn-sm" style="background:#8E44AD;color:#fff" onclick="openGuidedReview()" title="Review one field at a time with evidence highlights">&#x2714; Guided</button>
     </div>
   </div>
   <div style="padding:0 20px 4px; background:var(--bg-card); border-bottom:1px solid var(--border)">
@@ -3169,6 +5737,47 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   </div>
 </div>
 
+<!-- ═══ GUIDED REVIEW SECTION ═══ -->
+<div class="section" id="sec-guided-review">
+  <div class="guided-header">
+    <div class="guided-progress">
+      <span class="guided-progress-text" id="guidedProgressText">0 of 0</span>
+      <div class="guided-progress-bar">
+        <div class="guided-progress-fill" id="guidedProgressBar" style="width:0%"></div>
+      </div>
+    </div>
+    <div class="guided-actions-top">
+      <button class="btn btn-secondary btn-sm" onclick="showSection('review')">Grid View</button>
+      <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
+    </div>
+  </div>
+  <div class="guided-split">
+    <div class="guided-evidence" id="guidedEvidence">
+      <div class="empty-state" style="color:rgba(255,255,255,0.5)"><p>Loading evidence...</p></div>
+    </div>
+    <div class="guided-detail" id="guidedDetail">
+      <div id="guidedLockBanner" class="guided-lock-banner" style="display:none"></div>
+      <div class="guided-field-label" id="guidedLabel"></div>
+      <div class="guided-field-dest" id="guidedDest"></div>
+      <div class="guided-field-value" id="guidedValue"></div>
+      <div class="guided-field-meta" id="guidedMeta"></div>
+      <div class="guided-actions" id="guidedBtns">
+        <button class="btn btn-success" onclick="guidedAction('confirm')">Confirm <kbd>Y</kbd></button>
+        <button class="btn btn-primary" onclick="guidedStartEdit()">Edit <kbd>E</kbd></button>
+        <button class="btn btn-danger" onclick="guidedAction('not_present')">Not Present <kbd>N</kbd></button>
+        <button class="btn btn-secondary" onclick="guidedAction('skip')">Skip <kbd>S</kbd></button>
+      </div>
+      <div class="guided-edit-area" id="guidedEditArea" style="display:none">
+        <input type="text" class="guided-edit-input" id="guidedEditInput" placeholder="Enter corrected value...">
+        <div class="guided-edit-btns">
+          <button class="btn btn-success" onclick="guidedFinishEdit()">Save Correction</button>
+          <button class="btn btn-secondary" onclick="guidedCancelEdit()">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ CLIENTS SECTION ═══ -->
 <div class="section" id="sec-clients">
   <div class="page-header"><h2>Client Manager</h2><p>Upload prior-year returns &amp; workpapers, set extraction instructions, track document completeness</p></div>
@@ -3181,7 +5790,11 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     </div>
     <div class="client-detail" id="clientDetailView">
       <div class="client-back" onclick="closeClientDetail()">&#9664; Back to all clients</div>
-      <h2 id="clientDetailName" style="font-size:20px;font-weight:700;color:var(--navy);margin-bottom:4px"></h2>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px">
+        <h2 id="clientDetailName" style="font-size:20px;font-weight:700;color:var(--navy);margin:0"></h2>
+        <button class="btn btn-ghost btn-sm" onclick="openMergeClientModal()" title="Merge into another client" style="color:var(--purple)">&#x21C4; Merge</button>
+        <button class="btn btn-ghost btn-sm" onclick="openDeleteClientModal()" title="Delete this client" style="color:var(--red)">&#x1F5D1; Delete</button>
+      </div>
       <div id="clientDetailMeta" style="font-size:13px;color:var(--text-secondary);margin-bottom:16px"></div>
       <div class="client-tabs">
         <div class="client-tab active" data-tab="documents" onclick="showClientTab('documents')">Documents</div>
@@ -3279,7 +5892,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="card">
       <div class="table-wrap">
         <table class="data-table" id="historyTable">
-          <thead><tr><th>Client</th><th>File</th><th>Type</th><th>Year</th><th>Status</th><th>Cost</th><th>Date</th><th></th></tr></thead>
+          <thead><tr><th>Client</th><th>File</th><th>Type</th><th>Year</th><th>Status</th><th>Cost</th><th>Duration</th><th>Date</th><th></th></tr></thead>
           <tbody id="historyBody"></tbody>
         </table>
       </div>
@@ -3291,6 +5904,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <div class="kbd-overlay" id="kbdOverlay" onclick="if(event.target===this)toggleKbdHelp()">
   <div class="kbd-card">
     <h3>Keyboard Shortcuts</h3>
+    <div style="font-size:11px;font-weight:700;color:var(--text-light);text-transform:uppercase;margin-bottom:6px">Grid Review</div>
     <div class="kbd-row"><span>Confirm field</span><kbd>Enter</kbd></div>
     <div class="kbd-row"><span>Flag field</span><kbd>F</kbd></div>
     <div class="kbd-row"><span>Edit value</span><kbd>E</kbd></div>
@@ -3299,7 +5913,14 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="kbd-row"><span>Prev field</span><kbd>&#x2191; / Shift+Tab</kbd></div>
     <div class="kbd-row"><span>Next page</span><kbd>&#x2192;</kbd></div>
     <div class="kbd-row"><span>Prev page</span><kbd>&#x2190;</kbd></div>
-    <div class="kbd-row"><span>This help</span><kbd>?</kbd></div>
+    <div style="font-size:11px;font-weight:700;color:var(--text-light);text-transform:uppercase;margin:10px 0 6px;padding-top:8px;border-top:1px solid var(--border)">Guided Review</div>
+    <div class="kbd-row"><span>Confirm</span><kbd>Y</kbd></div>
+    <div class="kbd-row"><span>Edit</span><kbd>E</kbd></div>
+    <div class="kbd-row"><span>Not Present</span><kbd>N</kbd></div>
+    <div class="kbd-row"><span>Skip</span><kbd>S</kbd></div>
+    <div class="kbd-row"><span>Save correction</span><kbd>Enter</kbd></div>
+    <div class="kbd-row"><span>Cancel edit</span><kbd>Esc</kbd></div>
+    <div class="kbd-row" style="margin-top:8px"><span>This help</span><kbd>?</kbd></div>
   </div>
 </div>
 
@@ -3323,6 +5944,7 @@ let totalFieldCount = 0;
 let focusedFieldIdx = -1;
 let pageFieldKeys = [];
 let selectedDocType = 'tax_returns';
+let earlyReviewActive = false;
 
 // Field display order by document type (matches extract.py TEMPLATE_SECTIONS)
 const FIELD_ORDER = {
@@ -3510,22 +6132,52 @@ function pollStatus() {
     document.getElementById('procPct').textContent = pct + '%';
     document.getElementById('procBar').style.width = pct + '%';
 
+    // Elapsed time
+    const elapsedEl = document.getElementById('procElapsed');
+    if (data.start_time && data.status === 'running') {
+      const elapsed = Math.floor((Date.now() - new Date(data.start_time).getTime()) / 1000);
+      const mins = Math.floor(elapsed / 60); const secs = elapsed % 60;
+      elapsedEl.textContent = mins + 'm ' + secs + 's elapsed';
+      elapsedEl.style.display = '';
+    } else if (data.status === 'complete' && data.start_time && data.end_time) {
+      const elapsed = Math.floor((new Date(data.end_time).getTime() - new Date(data.start_time).getTime()) / 1000);
+      const mins = Math.floor(elapsed / 60); const secs = elapsed % 60;
+      elapsedEl.textContent = 'Completed in ' + mins + 'm ' + secs + 's';
+      elapsedEl.style.display = '';
+    } else {
+      elapsedEl.style.display = 'none';
+    }
+
     // Console output
-    const log = data.log || [];
+    const log = data.recent_log || data.log || [];
     const console_el = document.getElementById('procConsole');
-    console_el.innerHTML = log.slice(-30).map(l => '<div' + (/phase|complete|error|warning/i.test(l) ? ' class="line-highlight"' : '') + '>' + esc(l) + '</div>').join('');
+    console_el.innerHTML = log.slice(-50).map(l => '<div' + (/phase|complete|error|warning/i.test(l) ? ' class="line-highlight"' : '') + '>' + esc(l) + '</div>').join('');
     console_el.scrollTop = console_el.scrollHeight;
+
+    // T1.5: Show early review button when partial results are ready
+    if (data.partial_results_ready && data.status === 'running') {
+      const btn = document.getElementById('procReviewEarlyBtn');
+      if (btn) {
+        btn.style.display = '';
+        btn.textContent = 'Review ' + (data.fields_streamed || 0) + ' fields now';
+      }
+    }
 
     if (data.status === 'complete') {
       clearInterval(pollTimer); pollTimer = null;
       document.getElementById('procCancelBtn').style.display = 'none';
+      document.getElementById('procReviewEarlyBtn').style.display = 'none';
       const costStr = data.cost_usd ? ' ($' + data.cost_usd.toFixed(4) + ')' : '';
       showToast('Extraction complete!' + costStr, 'success');
       document.getElementById('navReview').style.display = '';
+      document.getElementById('navGuidedReview').style.display = '';
+      if (earlyReviewActive) { earlyReviewActive = false; return; }
       openReview(data);
     } else if (data.status === 'failed' || data.status === 'interrupted') {
       clearInterval(pollTimer); pollTimer = null;
       document.getElementById('procCancelBtn').style.display = 'none';
+      document.getElementById('procReviewEarlyBtn').style.display = 'none';
+      earlyReviewActive = false;
       showToast(data.status === 'interrupted' ? 'Extraction cancelled' : 'Extraction failed', 'error');
     }
   }).catch(() => {});
@@ -3535,6 +6187,8 @@ function pollStatus() {
 function openReview(job) {
   showSection('review');
   currentJobId = job.id || job.job_id || currentJobId;
+  document.getElementById('navReview').style.display = '';
+  document.getElementById('navGuidedReview').style.display = '';
 
   Promise.all([
     fetch('/api/results/' + currentJobId).then(r => r.json()),
@@ -3568,9 +6222,127 @@ function openReview(job) {
   }).catch(() => { reviewData = null; verifications = {}; loadPage(1); });
 }
 
+// ─── Early Review (T1.5) ───
+function openEarlyReview() {
+  earlyReviewActive = true;
+  fetch('/api/results/' + currentJobId).then(r => r.json()).then(data => {
+    if (data.error) { showToast('Partial results not ready yet', 'info'); return; }
+    reviewData = data;
+    // Also load verifications + vendor categories
+    Promise.all([
+      fetch('/api/verify/' + currentJobId).then(r => r.json()),
+      fetch('/api/vendor-categories').then(r => r.json()),
+    ]).then(([vdata, vcdata]) => {
+      verifications = (vdata && vdata.fields) ? vdata.fields : {};
+      vendorMap = (vcdata && vcdata.vendors) ? vcdata.vendors : {};
+      chartOfAccounts = (vcdata && vcdata.chart_of_accounts) ? vcdata.chart_of_accounts : {};
+    }).catch(() => {});
+    showSection('review');
+    const banner = document.getElementById('reviewPartialBanner');
+    banner.style.display = '';
+    banner.textContent = 'Partial review \u2014 extraction in progress (' +
+      (data.batch_num || '?') + '/' + (data.total_batches || '?') + ' batches)';
+    countTotalFields();
+    updateVerifyBar();
+    loadPage(1);
+    // Switch to slower polling while reviewing
+    clearInterval(pollTimer);
+    pollTimer = setInterval(pollPartialStatus, 2000);
+  }).catch(() => { showToast('Could not load partial results', 'error'); });
+}
+
+function pollPartialStatus() {
+  if (!currentJobId) return;
+  fetch('/api/status/' + currentJobId).then(r => r.json()).then(data => {
+    if (data.status === 'complete') {
+      // Extraction finished — transition to full review
+      earlyReviewActive = false;
+      clearInterval(pollTimer); pollTimer = null;
+      document.getElementById('reviewPartialBanner').style.display = 'none';
+      const costStr = data.cost_usd ? ' ($' + data.cost_usd.toFixed(4) + ')' : '';
+      showToast('Extraction complete!' + costStr, 'success');
+      document.getElementById('navReview').style.display = '';
+      document.getElementById('navGuidedReview').style.display = '';
+      // Reload full results
+      const savedPage = currentPage;
+      fetch('/api/results/' + currentJobId).then(r => r.json()).then(rdata => {
+        reviewData = rdata;
+        countTotalFields();
+        updateVerifyBar();
+        loadPage(savedPage);
+      }).catch(() => {});
+      return;
+    }
+    if (data.status === 'failed' || data.status === 'interrupted') {
+      earlyReviewActive = false;
+      clearInterval(pollTimer); pollTimer = null;
+      document.getElementById('reviewPartialBanner').style.display = 'none';
+      showToast(data.status === 'interrupted' ? 'Extraction cancelled' : 'Extraction failed', 'error');
+      showSection('processing');
+      return;
+    }
+    // Still running — refresh partial data if new batches arrived
+    if (data.batches_complete && reviewData &&
+        data.batches_complete > (reviewData.batch_num || 0)) {
+      const savedPage = currentPage;
+      fetch('/api/results/' + currentJobId).then(r => r.json()).then(rdata => {
+        if (!rdata.error) {
+          reviewData = rdata;
+          const banner = document.getElementById('reviewPartialBanner');
+          banner.textContent = 'Partial review \u2014 extraction in progress (' +
+            (rdata.batch_num || '?') + '/' + (rdata.total_batches || '?') + ' batches)';
+          countTotalFields();
+          updateVerifyBar();
+          loadPage(savedPage);
+        }
+      }).catch(() => {});
+    }
+  }).catch(() => {});
+}
+
+// Fields to hide from review panel — metadata, PII, and non-tax-relevant details
+const REVIEW_SKIP_FIELDS = new Set([
+  // PII / identifiers
+  'payer_ein','recipient_ssn_last4','tax_year','entity_type','partner_type','state_id',
+  'account_number_last4','account_number','employee_ssn','card_number','card_number_last_four',
+  'card_number_last_4','card_type','card_holder_name','auth_code','auth_number','authorization_code',
+  'cc_auth','response_message_code','confirmation_number','receipt_number','register_number',
+  'check_number','guarantor_id','guarantor_name','guarantor_number','patient_id','patient_name',
+  'patient_address','patient_phone',
+  // Property assessment metadata (not dollar amounts for tax return)
+  'property_id','map_code','district','tax_district','homestead','exemptions','acreage','acres',
+  'building_value','land_value','total_fair_market_value','appraised_value_100_percent',
+  'assessed_value_40_percent','current_year_assessed_value','homestead_exemption_value',
+  'net_taxable_value','county_millage_rate','school_millage_rate','previous_year_fair_market_value',
+  'current_year_fair_market_value','assessment_notice_date','appeal_deadline','current_year_other_value',
+  'other_exemption_value','covenant_year','taxpayer_returned_value','taxing_authority_county',
+  'taxing_authority_school','property_owner_name','property_description',
+  // 1098 metadata
+  'outstanding_mortgage_principal','mortgage_origination_date','mortgage_acquisition_date',
+  'number_of_properties','box_7_checkbox','points_paid_on_purchase',
+  // Medical/pharmacy metadata
+  'pharmacy_name','pharmacy_phone','rx_number','ndc_number','dea_number','prescriber',
+  'prescriber_name','prescriber_dea','prescribing_doctor','medication','medication_name',
+  'syrup_strength','manufacturer','quantity','date_filled','prescription_date','prescription_number',
+  'copay_amount','copay','insurance','insurance_adjustments','insurance_paid','insurance_adjustment',
+  'claim_adjustments','previously_paid','practice_address','payment_website','payment_code',
+  'payment_location','payment_source','payment_clerk','payment_method','payment_type',
+  'payment_status','reference','appointment_date','procedure_description',
+  'previous_statement_amount','new_charges','payments_and_adjustments',
+  'patient_payments_since_last_statement','phone_numbers','service_date',
+  // Receipt/payment metadata
+  'receipt_date','transaction_date','billing_date','print_time','paid_by','mh_decal',
+  // Course/tuition metadata
+  'course_code','course_description','credit_hours','semester_term','book_type',
+  // Vehicle tag metadata
+  'tag_title','dmv_amount','service_fee_amount',
+  // Other metadata
+  'bill_number','statement_date','foreign_country','name','date','due_date',
+]);
+
 function countTotalFields() {
   totalFieldCount = 0;
-  const skipFields = new Set(['payer_ein','recipient_ssn_last4','tax_year','entity_type','partner_type','state_id','account_number_last4']);
+  const skipFields = REVIEW_SKIP_FIELDS;
   if (!reviewData || !reviewData.page_map) return;
   for (const pg in reviewData.page_map) {
     reviewData.page_map[pg].forEach((ext, extIdx) => {
@@ -3617,6 +6389,22 @@ function saveVerification(key, status, correctedValue, note, category, vendorDes
 }
 
 function confirmField(key) {
+  // If an edit input is active for this field, finish the edit first
+  const activeInput = document.querySelector('.field-edit-input[data-key="' + key.replace(/"/g, '\\"') + '"]');
+  if (activeInput) {
+    const nv = activeInput.value.trim();
+    const orig = activeInput.dataset.original;
+    // Remove listeners so finishEdit won't double-fire
+    activeInput.removeEventListener('blur', activeInput._finishEdit);
+    activeInput.removeEventListener('keydown', activeInput._onKey);
+    if (nv !== '' && nv !== orig) {
+      const nextIdx = focusedFieldIdx + 1;
+      saveVerification(key, 'corrected', nv);
+      showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' ') + ' corrected', 'success');
+      loadPage(currentPage, nextIdx);
+      return;
+    }
+  }
   const current = verifications[key];
   if (current && current.status === 'confirmed') {
     // Toggle off — un-confirm
@@ -3629,8 +6417,17 @@ function confirmField(key) {
     loadPage(currentPage, focusedFieldIdx);
     return;
   }
+  if (current && current.status === 'corrected' && current._justCorrected) {
+    // Just corrected by finishEdit blur race — don't overwrite with plain confirmed.
+    // Clear the flag and advance to next field.
+    delete current._justCorrected;
+    const nextIdx = focusedFieldIdx + 1;
+    showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' ') + ' corrected', 'success');
+    loadPage(currentPage, nextIdx);
+    return;
+  }
   const nextIdx = focusedFieldIdx + 1;
-  saveVerification(key, 'confirmed');
+  saveVerification(key, 'confirmed', current && current.corrected_value !== undefined ? current.corrected_value : null);
   showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' '), 'success');
   loadPage(currentPage, nextIdx);
 }
@@ -3660,17 +6457,28 @@ function startEdit(key, currentVal) {
   if (!valSpan) return;
   const input = document.createElement('input');
   input.type = 'text'; input.className = 'field-edit-input';
-  input.value = currentVal; input.dataset.key = key; input.dataset.original = currentVal;
+  input.value = currentVal; input.dataset.key = key; input.dataset.original = String(currentVal);
   valSpan.innerHTML = ''; valSpan.appendChild(input); input.focus(); input.select();
+  let finished = false;
   function finishEdit() {
+    if (finished) return;  // Prevent double-fire from blur + confirmField
+    finished = true;
     const nv = input.value.trim();
     input.removeEventListener('blur', finishEdit); input.removeEventListener('keydown', onKey);
     if (nv !== '' && nv !== String(currentVal)) {
       saveVerification(key, 'corrected', nv);
+      if (verifications[key]) verifications[key]._justCorrected = true;
+      showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' ') + ' corrected', 'success');
     }
     loadPage(currentPage, focusedFieldIdx);
   }
-  function onKey(e) { if (e.key === 'Enter') finishEdit(); else if (e.key === 'Escape') { loadPage(currentPage, focusedFieldIdx); } }
+  function onKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); finishEdit(); }
+    else if (e.key === 'Escape') { finished = true; loadPage(currentPage, focusedFieldIdx); }
+  }
+  // Store references so confirmField can remove them
+  input._finishEdit = finishEdit;
+  input._onKey = onKey;
   input.addEventListener('blur', finishEdit);
   input.addEventListener('keydown', onKey);
 }
@@ -3794,7 +6602,7 @@ function loadPage(page, focusIdx) {
     return;
   }
 
-  const skipFields = new Set(['payer_ein','recipient_ssn_last4','tax_year','entity_type','partner_type','state_id','account_number_last4']);
+  const skipFields = REVIEW_SKIP_FIELDS;
 
   pageExts.forEach((ext, extIdx) => {
     const fields = ext.fields || {};
@@ -3832,7 +6640,7 @@ function loadPage(page, focusIdx) {
       return true;
     });
     const infoKeys = summaryKeys.filter(k => {
-      if (skipFields.has(k)) return true;
+      if (skipFields.has(k)) return false;  // Hide skipped fields entirely
       const v = fields[k].value;
       return !(typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim())));
     });
@@ -3877,9 +6685,10 @@ function loadPage(page, focusIdx) {
       const displayName = (boxLabel ? boxLabel + ' \u2014 ' : '') + k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
       html += '<span class="field-name">' + esc(displayName) + '</span>';
       html += '<span class="field-val-wrap"><span class="conf-dot ' + dotClass + '"></span>';
-      html += '<span class="field-val" ondblclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')">' + esc(displayStr) + '</span>';
+      const safeVal = JSON.stringify(displayStr).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+      html += '<span class="field-val" onclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + safeVal + ')">' + esc(displayStr) + '</span>';
       html += '<span class="field-actions">';
-      html += '<button class="vf-btn" onclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + JSON.stringify(displayStr) + ')" title="Edit value (E)">&#x270F;</button>';
+      html += '<button class="vf-btn" onclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + safeVal + ')" title="Edit value (E)">&#x270F;</button>';
       html += '<button class="vf-btn vf-btn-confirm' + (vstate&&vstate.status==='confirmed'?' active':'') + '" onclick="event.stopPropagation();confirmField(\'' + esc(vk) + '\')" title="Confirm (Enter)">\u2713</button>';
       html += '<button class="vf-btn vf-btn-flag' + (vstate&&vstate.status==='flagged'?' active':'') + '" onclick="event.stopPropagation();flagField(\'' + esc(vk) + '\')" title="Flag (F)">\u2691</button>';
       html += '<button class="vf-btn vf-btn-note' + (vstate&&vstate.note?' has-note':'') + '" onclick="event.stopPropagation();toggleNoteInput(\'' + esc(vk) + '\')" title="Add note (N)">&#x270E;</button>';
@@ -3987,6 +6796,37 @@ function regenExcel() {
     .catch(e => { showToast('Regen failed: ' + e, 'error'); });
 }
 
+// ─── T1.6: Workpaper Generation ───
+function generateWorkpaper() {
+  if (!currentJobId) { showToast('No job selected', 'error'); return; }
+  const job = jobs.find(j => j.id === currentJobId);
+  if (!job) { showToast('Job not found', 'error'); return; }
+  const clientName = job.client_name;
+  if (!clientName) { showToast('No client name set for this job', 'error'); return; }
+
+  const year = job.year || prompt('Enter tax year:', '2025');
+  if (!year) return;
+
+  const mode = confirm('Use Safe mode? (only verified values)\\n\\nOK = Safe mode\\nCancel = Assisted mode (all values, flagged)') ? 'safe' : 'assisted';
+
+  showToast('Generating workpaper (' + mode + ' mode)...', 'info');
+  fetch('/api/workpaper/' + encodeURIComponent(clientName), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ year: year, mode: mode })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) {
+      showToast('Workpaper failed: ' + data.error, 'error');
+      return;
+    }
+    showToast('Workpaper generated (' + data.facts_count + ' facts, ' + mode + ' mode)', 'success');
+    window.open(data.download_url, '_blank');
+  })
+  .catch(e => { showToast('Workpaper failed: ' + e, 'error'); });
+}
+
 // ─── AI Chat ───
 function toggleAiChat() {
   const panel = document.getElementById('aiChatPanel');
@@ -4041,9 +6881,17 @@ function loadJobs() {
   }).catch(()=>{});
 }
 
+function formatDuration(secs) {
+  if (secs === null || secs === undefined) return '\u2014';
+  if (secs < 60) return secs + 's';
+  const m = Math.floor(secs / 60); const s = secs % 60;
+  if (m >= 60) { const h = Math.floor(m / 60); return h + 'h ' + (m % 60) + 'm'; }
+  return m + 'm ' + s + 's';
+}
+
 function renderHistory(data) {
   const body = document.getElementById('historyBody');
-  if (!data.length) { body.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text-light)">No jobs yet</td></tr>'; return; }
+  if (!data.length) { body.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:24px;color:var(--text-light)">No jobs yet</td></tr>'; return; }
   body.innerHTML = data.map(j => {
     const dt = j.created ? new Date(j.created).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
     const typeLabel = DOC_TYPES.find(d=>d.id===j.doc_type);
@@ -4055,9 +6903,11 @@ function renderHistory(data) {
       '<td>' + esc(j.year||'') + '</td>' +
       '<td><span class="job-status ' + (j.status||'') + '">' + esc(j.status||'') + '</span></td>' +
       '<td style="font-size:12px;font-family:var(--mono);color:var(--text-secondary)">' + costStr + '</td>' +
+      '<td style="font-size:12px;font-family:var(--mono);color:var(--text-secondary)">' + formatDuration(j.duration_seconds) + '</td>' +
       '<td style="font-size:12px;color:var(--text-secondary)">' + dt + '</td>' +
       '<td class="actions">' +
         (j.status==='complete'?'<button class="btn btn-sm btn-secondary" onclick=\'openReview('+JSON.stringify({id:j.id,client_name:j.client_name})+')\'>\u{1F50D} Review</button> ':'') +
+        (j.status==='running'||j.status==='queued'?'<button class="btn btn-sm btn-primary" onclick="monitorJob(\''+j.id+'\')">Monitor</button> ':'') +
         (j.status==='failed'||j.status==='interrupted'||j.status==='error'?'<button class="btn btn-sm btn-secondary" onclick="retryJob(\''+j.id+'\')">Retry</button> ':'') +
         '<button class="btn btn-ghost btn-sm" onclick="deleteJob(\''+j.id+'\')" title="Delete">\u2716</button>' +
       '</td></tr>';
@@ -4077,6 +6927,13 @@ function filterHistory() {
 
 function retryJob(id) { fetch('/api/retry/'+id,{method:'POST'}).then(r=>r.json()).then(d=>{if(d.job_id){currentJobId=d.job_id;showSection('processing');startPolling();}}).catch(()=>{}); }
 function deleteJob(id) { if(!confirm('Delete this job?')) return; fetch('/api/delete/'+id,{method:'POST'}).then(()=>loadJobs()).catch(()=>{}); }
+function monitorJob(id) {
+  currentJobId = id;
+  const job = allJobs.find(j => j.id === id);
+  if (job) document.getElementById('processingFile').textContent = job.filename || '';
+  showSection('processing');
+  startPolling();
+}
 
 // ─── Clients ───
 function loadClientSuggestions() {
@@ -4373,8 +7230,25 @@ function applyBatchCategory(gi) {
 // ─── Keyboard Shortcuts ───
 function toggleKbdHelp() { document.getElementById('kbdOverlay').classList.toggle('visible'); }
 document.addEventListener('keydown', function(e) {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+    // Allow Enter/Escape in guided edit input
+    if (e.target.id === 'guidedEditInput') {
+      if (e.key === 'Enter') { guidedFinishEdit(); e.preventDefault(); }
+      else if (e.key === 'Escape') { guidedCancelEdit(); e.preventDefault(); }
+    }
+    return;
+  }
   const sec = document.querySelector('.section.active');
+  // Guided review shortcuts
+  if (sec && sec.id === 'sec-guided-review') {
+    if (e.key === '?') { toggleKbdHelp(); return; }
+    if (e.key === 'y' || e.key === 'Y') { guidedAction('confirm'); e.preventDefault(); }
+    else if (e.key === 'e' || e.key === 'E') { guidedStartEdit(); e.preventDefault(); }
+    else if (e.key === 'n' || e.key === 'N') { guidedAction('not_present'); e.preventDefault(); }
+    else if (e.key === 's' || e.key === 'S') { guidedAction('skip'); e.preventDefault(); }
+    else if (e.key === 'Escape') { guidedCancelEdit(); e.preventDefault(); }
+    return;
+  }
   if (!sec || sec.id !== 'sec-review') {
     if (e.key === '?') toggleKbdHelp();
     return;
@@ -4472,6 +7346,285 @@ function generateReport() {
     window.open(d.download_url, '_blank');
   }).catch(e => { btn.disabled = false; btn.textContent = 'Generate'; showToast('Failed: '+e, 'error'); });
 }
+
+// ─── Delete Client Modal ───
+function openDeleteClientModal() {
+  document.getElementById('deleteClientTarget').textContent = currentClientName;
+  document.getElementById('deleteClientConfirm').value = '';
+  document.getElementById('deleteClientOverlay').classList.add('visible');
+  setTimeout(() => document.getElementById('deleteClientConfirm').focus(), 100);
+}
+function closeDeleteClientModal() {
+  document.getElementById('deleteClientOverlay').classList.remove('visible');
+}
+function confirmDeleteClient() {
+  const val = document.getElementById('deleteClientConfirm').value.trim().toLowerCase();
+  if (val !== 'delete') { showToast('Type "delete" to confirm', 'error'); return; }
+  const btn = document.getElementById('deleteClientBtn');
+  btn.disabled = true; btn.textContent = 'Deleting...';
+  fetch('/api/clients/' + encodeURIComponent(currentClientName), {
+    method: 'DELETE',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({confirm: 'delete'})
+  }).then(r => r.json()).then(d => {
+    btn.disabled = false; btn.textContent = 'Delete Client';
+    if (d.error) { showToast(d.error, 'error'); return; }
+    showToast('Client "' + currentClientName + '" deleted', 'success');
+    closeDeleteClientModal();
+    closeClientDetail();
+    loadClients();
+    loadClientSuggestions();
+  }).catch(e => { btn.disabled = false; btn.textContent = 'Delete Client'; showToast('Failed: ' + e, 'error'); });
+}
+
+// ─── Merge Client Modal ───
+function openMergeClientModal() {
+  document.getElementById('mergeSourceName').textContent = currentClientName;
+  const sel = document.getElementById('mergeTargetSelect');
+  sel.innerHTML = '<option value="">-- Select target client --</option>';
+  allClientsData.filter(c => c.name !== currentClientName).forEach(c => {
+    sel.innerHTML += '<option value="' + esc(c.name) + '">' + esc(c.name) + (c.ein_last4 ? ' (' + esc(c.ein_last4) + ')' : '') + '</option>';
+  });
+  document.getElementById('mergeClientOverlay').classList.add('visible');
+}
+function closeMergeClientModal() {
+  document.getElementById('mergeClientOverlay').classList.remove('visible');
+}
+function confirmMergeClient() {
+  const target = document.getElementById('mergeTargetSelect').value;
+  if (!target) { showToast('Select a target client', 'error'); return; }
+  if (!confirm('Merge "' + currentClientName + '" into "' + target + '"? The source folder will be deleted. This cannot be undone.')) return;
+  const btn = document.getElementById('mergeClientBtn');
+  btn.disabled = true; btn.textContent = 'Merging...';
+  fetch('/api/clients/merge', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({source: currentClientName, target: target})
+  }).then(r => r.json()).then(d => {
+    btn.disabled = false; btn.textContent = 'Merge';
+    if (d.error) { showToast(d.error, 'error'); return; }
+    showToast('Merged "' + currentClientName + '" into "' + target + '"', 'success');
+    closeMergeClientModal();
+    closeClientDetail();
+    loadClients();
+    loadClientSuggestions();
+  }).catch(e => { btn.disabled = false; btn.textContent = 'Merge'; showToast('Failed: ' + e, 'error'); });
+}
+
+// ═══ GUIDED REVIEW ═══
+
+var guidedQueue = [];
+var guidedIdx = 0;
+var guidedCurrentItem = null;
+var guidedHeartbeatTimer = null;
+var guidedJobId = null;
+
+function openGuidedReview() {
+  guidedJobId = currentJobId;
+  if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
+  showSection('guided-review');
+  document.getElementById('guidedDetail').style.opacity = '0.5';
+  document.getElementById('guidedEvidence').innerHTML = '<div class="empty-state" style="color:rgba(255,255,255,0.5)"><p>Loading queue...</p></div>';
+  fetch('/api/guided-review/queue/' + guidedJobId)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      guidedQueue = data.queue || [];
+      guidedIdx = 0;
+      updateGuidedProgress(data.reviewed || 0, data.total || 0);
+      if (guidedQueue.length === 0) {
+        showGuidedComplete(data.reviewed || 0, data.total || 0);
+      } else {
+        loadGuidedItem();
+      }
+    })
+    .catch(function(e) { showToast('Failed to load queue: ' + e, 'error'); });
+}
+
+function updateGuidedProgress(reviewed, total) {
+  var pct = total > 0 ? Math.round(reviewed / total * 100) : 0;
+  document.getElementById('guidedProgressText').textContent = reviewed + ' of ' + total + ' reviewed';
+  document.getElementById('guidedProgressBar').style.width = pct + '%';
+}
+
+function loadGuidedItem() {
+  if (guidedIdx >= guidedQueue.length) {
+    // Reload queue to check for remaining items
+    fetch('/api/guided-review/queue/' + guidedJobId)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        guidedQueue = data.queue || [];
+        guidedIdx = 0;
+        updateGuidedProgress(data.reviewed || 0, data.total || 0);
+        if (guidedQueue.length === 0) {
+          showGuidedComplete(data.reviewed || 0, data.total || 0);
+        } else {
+          loadGuidedItem();
+        }
+      });
+    return;
+  }
+
+  var item = guidedQueue[guidedIdx];
+  document.getElementById('guidedDetail').style.opacity = '0.5';
+  document.getElementById('guidedEditArea').style.display = 'none';
+  document.getElementById('guidedBtns').style.display = '';
+
+  fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(item.field_id))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { showToast(data.error, 'error'); return; }
+      guidedCurrentItem = data;
+      renderGuidedItem(data);
+      // Acquire lock
+      var reviewer = getReviewer();
+      if (reviewer) {
+        fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(item.field_id), {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ reviewer: reviewer })
+        }).then(function(r) { return r.json(); }).then(function(lockData) {
+          if (lockData.error) {
+            document.getElementById('guidedLockBanner').textContent = lockData.error;
+            document.getElementById('guidedLockBanner').style.display = '';
+          } else {
+            document.getElementById('guidedLockBanner').style.display = 'none';
+          }
+        });
+      }
+      // Heartbeat
+      if (guidedHeartbeatTimer) clearInterval(guidedHeartbeatTimer);
+      guidedHeartbeatTimer = setInterval(function() {
+        if (reviewer && guidedCurrentItem) {
+          fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(guidedCurrentItem.field_id), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ reviewer: reviewer })
+          });
+        }
+      }, 120000);
+    })
+    .catch(function(e) { showToast('Failed to load item: ' + e, 'error'); });
+}
+
+function renderGuidedItem(data) {
+  document.getElementById('guidedDetail').style.opacity = '1';
+  // Evidence image
+  var evEl = document.getElementById('guidedEvidence');
+  if (data.evidence_url) {
+    evEl.innerHTML = '<img src="' + esc(data.evidence_url) + '" alt="Evidence for ' + esc(data.field_name) + '">';
+  } else if (data.page_url) {
+    evEl.innerHTML = '<img src="' + esc(data.page_url) + '" alt="Page ' + data.page_num + '">';
+  }
+  // Field label + destination
+  document.getElementById('guidedLabel').textContent = data.display_name || data.field_name;
+  document.getElementById('guidedDest').textContent =
+    (data.document_type || '') + (data.entity ? ' \u2022 ' + data.entity : '') + ' \u2022 Page ' + data.page_num;
+  // Big value
+  var displayVal = data.value;
+  if (typeof data.value === 'number') {
+    displayVal = data.value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  } else {
+    displayVal = String(data.value || '(empty)');
+  }
+  document.getElementById('guidedValue').textContent = displayVal;
+  // Meta badges
+  var confClass = 'badge-gray';
+  var conf = String(data.confidence || '');
+  if (conf.includes('dual') || conf.includes('verified_confirmed') || conf === 'auto_verified') confClass = 'badge-green';
+  else if (conf === 'high' || conf === 'ocr_accepted') confClass = 'badge-blue';
+  else if (conf === 'medium') confClass = 'badge-yellow';
+  else if (conf === 'low' || conf === 'needs_review') confClass = 'badge-red';
+  var metaHtml = '<span class="badge ' + confClass + '">' + esc(conf || 'unknown') + '</span>';
+  metaHtml += ' <span class="badge badge-gray">' + esc(data.method || '') + '</span>';
+  if (!data.evidence_available) {
+    metaHtml += ' <span class="badge badge-yellow">location uncertain</span>';
+  }
+  document.getElementById('guidedMeta').innerHTML = metaHtml;
+}
+
+function guidedAction(action) {
+  if (!guidedCurrentItem || !guidedJobId) return;
+  var body = { action: action, reviewer: getReviewer() };
+  if (action === 'correct') {
+    body.corrected_value = document.getElementById('guidedEditInput').value.trim();
+    if (!body.corrected_value) { showToast('Enter a corrected value', 'error'); return; }
+  }
+  // Disable buttons during save
+  var btns = document.querySelectorAll('#guidedBtns .btn');
+  btns.forEach(function(b) { b.disabled = true; });
+
+  fetch('/api/guided-review/action/' + guidedJobId + '/' + encodeURIComponent(guidedCurrentItem.field_id), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r) { return r.json(); })
+    .then(function(data) {
+      btns.forEach(function(b) { b.disabled = false; });
+      if (!data.ok) { showToast(data.error || 'Action failed', 'error'); return; }
+      var msg = action === 'confirm' ? 'Confirmed' : action === 'correct' ? 'Corrected' : action === 'not_present' ? 'Marked not present' : 'Skipped';
+      showToast(msg, action === 'skip' ? 'info' : 'success');
+      updateGuidedProgress(data.reviewed || 0, data.total || 0);
+      if (action === 'skip') {
+        guidedIdx++;
+      } else {
+        guidedQueue.splice(guidedIdx, 1);
+      }
+      if (guidedQueue.length === 0 || guidedIdx >= guidedQueue.length) {
+        // Refetch queue for any remaining
+        fetch('/api/guided-review/queue/' + guidedJobId)
+          .then(function(r) { return r.json(); })
+          .then(function(qdata) {
+            guidedQueue = qdata.queue || [];
+            guidedIdx = 0;
+            updateGuidedProgress(qdata.reviewed || 0, qdata.total || 0);
+            if (guidedQueue.length === 0) {
+              showGuidedComplete(qdata.reviewed || 0, qdata.total || 0);
+            } else {
+              loadGuidedItem();
+            }
+          });
+      } else {
+        loadGuidedItem();
+      }
+    })
+    .catch(function(e) {
+      btns.forEach(function(b) { b.disabled = false; });
+      showToast('Error: ' + e, 'error');
+    });
+}
+
+function guidedStartEdit() {
+  if (!guidedCurrentItem) return;
+  document.getElementById('guidedEditInput').value = String(guidedCurrentItem.value || '');
+  document.getElementById('guidedEditArea').style.display = '';
+  document.getElementById('guidedBtns').style.display = 'none';
+  document.getElementById('guidedEditInput').focus();
+  document.getElementById('guidedEditInput').select();
+}
+
+function guidedFinishEdit() {
+  guidedAction('correct');
+}
+
+function guidedCancelEdit() {
+  document.getElementById('guidedEditArea').style.display = 'none';
+  document.getElementById('guidedBtns').style.display = '';
+}
+
+function showGuidedComplete(reviewed, total) {
+  if (guidedHeartbeatTimer) { clearInterval(guidedHeartbeatTimer); guidedHeartbeatTimer = null; }
+  guidedCurrentItem = null;
+  document.getElementById('guidedEvidence').innerHTML = '';
+  document.getElementById('guidedDetail').innerHTML =
+    '<div class="guided-complete">' +
+    '<h2>&#x2714; Review Complete</h2>' +
+    '<p>' + reviewed + ' of ' + total + ' fields reviewed</p>' +
+    '<button class="btn btn-primary" onclick="showSection(\'review\')">Return to Grid View</button> ' +
+    '<button class="btn btn-secondary" onclick="openGuidedReview()">Refresh Queue</button>' +
+    '</div>';
+  document.getElementById('guidedDetail').style.opacity = '1';
+}
+
 </script>
 
 <!-- New Client Modal -->
@@ -4534,6 +7687,46 @@ function generateReport() {
     <div style="display:flex;justify-content:flex-end;gap:8px">
       <button class="btn btn-ghost" onclick="closeReportModal()">Cancel</button>
       <button class="btn btn-primary" onclick="generateReport()">Generate</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Client Modal -->
+<div class="modal-overlay" id="deleteClientOverlay">
+  <div class="modal-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0;color:var(--red)">Delete Client</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeDeleteClientModal()">&times;</button>
+    </div>
+    <p style="font-size:13px;margin-bottom:12px">This will permanently delete the client folder <strong id="deleteClientTarget"></strong> and all its contents (context documents, instructions, output files).</p>
+    <p style="font-size:13px;margin-bottom:12px;color:var(--text-secondary)">Job history records will be preserved for audit purposes.</p>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Type "delete" to confirm</label>
+      <input type="text" id="deleteClientConfirm" class="form-input" placeholder="delete" autocomplete="off">
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn btn-ghost" onclick="closeDeleteClientModal()">Cancel</button>
+      <button class="btn btn-danger" id="deleteClientBtn" onclick="confirmDeleteClient()">Delete Client</button>
+    </div>
+  </div>
+</div>
+
+<!-- Merge Client Modal -->
+<div class="modal-overlay" id="mergeClientOverlay">
+  <div class="modal-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="margin:0;color:var(--purple)">Merge Client</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeMergeClientModal()">&times;</button>
+    </div>
+    <p style="font-size:13px;margin-bottom:12px">Merge all data from <strong id="mergeSourceName"></strong> into another client. This will move all documents, context, instructions, and update job history.</p>
+    <div class="form-group" style="margin-bottom:12px">
+      <label class="form-label">Merge Into (Target Client)</label>
+      <select id="mergeTargetSelect" class="form-input form-select"></select>
+    </div>
+    <p style="font-size:12px;color:var(--red);margin-bottom:16px">&#x26A0; The source client folder will be deleted after merge. This cannot be undone.</p>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn btn-ghost" onclick="closeMergeClientModal()">Cancel</button>
+      <button class="btn btn-primary" id="mergeClientBtn" onclick="confirmMergeClient()" style="background:var(--purple)">Merge</button>
     </div>
   </div>
 </div>

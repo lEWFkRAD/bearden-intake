@@ -1,0 +1,55 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <div class="card">
+      <h2>Key Metrics</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="label">Jobs Today</div><div class="value" id="kpi_jobs_today">{{ kpis.jobs_today }}</div><div class="hint">Uploads processed</div></div>
+        <div class="kpi"><div class="label">Failures Today</div><div class="value" id="kpi_fail_today">{{ kpis.failures_today }}</div><div class="hint">Needs attention</div></div>
+        <div class="kpi"><div class="label">Avg Runtime</div><div class="value" id="kpi_avg_runtime">{{ kpis.avg_runtime_s }}s</div><div class="hint">Per job</div></div>
+        <div class="kpi"><div class="label">Time → First Values</div><div class="value" id="kpi_ttfv">{{ kpis.time_to_first_values_s }}s</div><div class="hint">Per job</div></div>
+        <div class="kpi"><div class="label">Disk Free</div><div class="value" id="kpi_disk_free">{{ kpis.disk_free_gb }} GB</div><div class="hint">Mac mini storage</div></div>
+        <div class="kpi"><div class="label">Running Jobs</div><div class="value">{{ kpis.running_jobs }}</div><div class="hint">Active right now</div></div>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: span 7;">
+      <h2>Recent Jobs</h2>
+      <table class="table">
+        <thead><tr><th>Job</th><th>Client</th><th>Status</th><th>Started</th><th>Runtime</th></tr></thead>
+        <tbody>
+          {% for j in recent_jobs %}
+          <tr>
+            <td class="mono">{{ j.job_id }}</td>
+            <td>{{ j.client_name or "-" }}</td>
+            <td><span class="pill {{ j.status_class }}">{{ j.status }}</span></td>
+            <td class="small">{{ j.started }}</td>
+            <td class="small">{{ j.runtime_s }}s</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="grid-column: span 5;">
+      <h2>Recent Events</h2>
+      <div class="feed">
+        {% for e in recent_events %}
+        <div class="event">
+          <div class="top">
+            <div class="msg">{{ e.message }}</div>
+            <div class="meta">{{ e.ts }} • {{ e.level }}</div>
+          </div>
+          <div class="meta">type={{ e.event_type }}{% if e.job_id %} • job={{ e.job_id }}{% endif %}</div>
+          {% if e.details_json %}
+          <details>
+            <summary class="small">details</summary>
+            <pre>{{ e.details_json }}</pre>
+          </details>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+{% endblock %}

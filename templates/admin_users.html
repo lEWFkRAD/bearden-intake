@@ -1,0 +1,62 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <div class="card" style="grid-column: span 7;">
+      <h2>Users</h2>
+      <table class="table">
+        <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
+        <tbody>
+          {% for u in users %}
+          <tr>
+            <td><b>{{ u.display_name }}</b><div class="small mono">{{ u.username }}</div></td>
+            <td><span class="pill">{{ u.role }}</span></td>
+            <td>{% if u.is_active %}<span class="pill good">active</span>{% else %}<span class="pill warn">disabled</span>{% endif %}</td>
+            <td class="small">{{ u.last_login or '-' }}</td>
+            <td class="row">
+              <form method="post" action="/admin/users/{{ u.id }}/toggle">
+                <button class="btn" type="submit">{{ "Disable" if u.is_active else "Enable" }}</button>
+              </form>
+              <form method="post" action="/admin/users/{{ u.id }}/reset_pin">
+                <button class="btn danger" type="submit">Reset PIN</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if temp_pin %}
+        <div class="hr"></div>
+        <div class="event">
+          <div class="msg">Temporary PIN (show once)</div>
+          <div class="mono">{{ temp_pin }}</div>
+          <div class="small">Share securely. User should change after login (optional policy).</div>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="card" style="grid-column: span 5;">
+      <h2>Create User</h2>
+      {% if error %}
+        <div class="event"><div class="msg">{{ error }}</div></div>
+        <div class="hr"></div>
+      {% endif %}
+      <form method="post" action="/admin/users/create">
+        <div class="controls">
+          <input class="input" name="username" placeholder="username (e.g. susan)" required/>
+          <input class="input" name="display_name" placeholder="Display name (Susan)" required/>
+          <select name="role">
+            <option value="reviewer">reviewer</option>
+            <option value="partner">partner</option>
+            <option value="admin">admin</option>
+          </select>
+        </div>
+        <div class="controls" style="margin-top:10px">
+          <button class="btn primary" type="submit">Create + Set PIN</button>
+        </div>
+        <div class="small" style="margin-top:10px">
+          Create will generate a temp PIN and display it once.
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}

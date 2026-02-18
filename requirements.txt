@@ -2,5 +2,6 @@ anthropic
 flask
 openpyxl
 pdf2image
+pymupdf
 pytesseract
 Pillow
