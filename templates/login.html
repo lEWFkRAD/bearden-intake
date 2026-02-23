@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>OathLedger — Login</title>
+  <link rel="stylesheet" href="/static/admin.css"/>
+</head>
+<body>
+  <div class="main" style="max-width:520px;margin:0 auto;padding-top:48px">
+    <div class="card">
+      <div class="h1">OathLedger</div>
+      <div class="sub">Select your name and enter your 6-digit PIN.</div>
+      <div class="hr"></div>
+      {% if error %}
+        <div class="event"><div class="msg">{{ error }}</div></div>
+        <div class="hr"></div>
+      {% endif %}
+      <form method="post" action="/login">
+        <div class="controls">
+          <select name="username" required>
+            <option value="">Select user</option>
+            {% for u in users %}
+              <option value="{{ u.username }}">{{ u.display_name }}</option>
+            {% endfor %}
+          </select>
+          <input class="input" name="pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit PIN" required/>
+        </div>
+        <div class="controls" style="margin-top:12px">
+          <button class="btn primary" type="submit">Sign In</button>
+        </div>
+      </form>
+      <div class="small" style="margin-top:10px">Internal office system. Do not expose to the public internet.</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,171 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <!-- Client/Year Picker -->
+    <div class="card" style="grid-column: span 12;">
+      <div class="controls">
+        <select id="clientPicker" class="input">
+          <option value="">Select Client...</option>
+          {% for c in clients %}
+          <option value="{{ c }}">{{ c }}</option>
+          {% endfor %}
+        </select>
+        <select id="yearPicker" class="input">
+          <option value="2025">2025</option>
+          <option value="2024">2024</option>
+          <option value="2023">2023</option>
+        </select>
+        <button class="btn primary" onclick="loadSummary()">Load</button>
+        <button class="btn cas-action-btn" onclick="applyRules()">Apply Rules</button>
+        <button class="btn" onclick="downloadReport()">Download Report</button>
+        <a href="/admin/ledger/review" class="btn">Review Transactions</a>
+        <a href="/admin/ledger/rules" class="btn">Manage Rules</a>
+      </div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div class="card" style="grid-column: span 12;">
+      <div class="kpis" id="txnKpis">
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Total Transactions</div>
+          <div class="value" id="kpi_total">--</div>
+        </div>
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Staged</div>
+          <div class="value" id="kpi_staged">--</div>
+        </div>
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Suggested</div>
+          <div class="value" id="kpi_suggested">--</div>
+        </div>
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Verified</div>
+          <div class="value" id="kpi_verified">--</div>
+        </div>
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Corrected</div>
+          <div class="value" id="kpi_corrected">--</div>
+        </div>
+        <div class="kpi" style="grid-column: span 2;">
+          <div class="label">Uncategorized</div>
+          <div class="value" id="kpi_uncategorized">--</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Monthly Summary Grid -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Monthly Summary</h2>
+      <div id="monthlyGrid" style="overflow-x:auto;">
+        <p class="small">Select a client and year, then click Load.</p>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+function getParams(){
+  return {
+    client: document.getElementById("clientPicker").value,
+    year: document.getElementById("yearPicker").value
+  };
+}
+
+async function loadSummary(){
+  const {client, year} = getParams();
+  if(!client){ alert("Please select a client"); return; }
+
+  try {
+    const r = await fetch(`/api/ledger/summary?client=${encodeURIComponent(client)}&year=${year}`);
+    const d = await r.json();
+    if(d.error){ alert(d.error); return; }
+
+    // KPIs
+    const s = d.stats || {};
+    document.getElementById("kpi_total").textContent = s.total || 0;
+    document.getElementById("kpi_staged").textContent = s.staged || 0;
+    document.getElementById("kpi_suggested").textContent = s.suggested || 0;
+    document.getElementById("kpi_verified").textContent = s.verified || 0;
+    document.getElementById("kpi_corrected").textContent = s.corrected || 0;
+    document.getElementById("kpi_uncategorized").textContent = s.uncategorized || 0;
+
+    // Monthly grid
+    const sum = d.summary || {};
+    const cats = sum.categories || {};
+    const mt = sum.monthly_totals || {};
+
+    let html = '<table class="table"><thead><tr><th>Category</th>';
+    MONTHS.forEach((m,i) => html += `<th style="text-align:right">${m}</th>`);
+    html += '<th style="text-align:right"><b>Total</b></th></tr></thead><tbody>';
+
+    const catNames = Object.keys(cats).sort();
+    catNames.forEach(cat => {
+      html += `<tr><td>${cat}</td>`;
+      let rowTotal = 0;
+      for(let m=1; m<=12; m++){
+        const v = (cats[cat] || {})[String(m)] || 0;
+        rowTotal += v;
+        html += `<td style="text-align:right;font-family:var(--mono);font-size:11px">${v ? v.toLocaleString('en-US',{style:'currency',currency:'USD'}) : ''}</td>`;
+      }
+      html += `<td style="text-align:right;font-weight:bold;font-family:var(--mono);font-size:11px">${rowTotal.toLocaleString('en-US',{style:'currency',currency:'USD'})}</td></tr>`;
+    });
+
+    // Grand total row
+    html += '<tr style="background:rgba(255,255,255,.06);font-weight:bold"><td>TOTAL</td>';
+    let grand = 0;
+    for(let m=1; m<=12; m++){
+      const v = mt[String(m)] || 0;
+      grand += v;
+      html += `<td style="text-align:right;font-family:var(--mono);font-size:11px">${v ? v.toLocaleString('en-US',{style:'currency',currency:'USD'}) : ''}</td>`;
+    }
+    html += `<td style="text-align:right;font-family:var(--mono);font-size:11px">${grand.toLocaleString('en-US',{style:'currency',currency:'USD'})}</td></tr>`;
+    html += '</tbody></table>';
+
+    document.getElementById("monthlyGrid").innerHTML = html;
+  } catch(e){
+    document.getElementById("monthlyGrid").innerHTML = `<p class="small" style="color:#fecaca">Error: ${e}</p>`;
+  }
+}
+
+async function applyRules(){
+  const {client, year} = getParams();
+  if(!client){ alert("Please select a client"); return; }
+
+  try {
+    const r = await fetch("/api/ledger/apply-rules", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({client, year: parseInt(year)})
+    });
+    const d = await r.json();
+    if(d.error){ alert(d.error); return; }
+    alert(`Rules applied: ${d.matched} matched, ${d.unmatched} unmatched`);
+    loadSummary();
+  } catch(e){ alert("Error: " + e); }
+}
+
+async function downloadReport(){
+  const {client, year} = getParams();
+  if(!client){ alert("Please select a client"); return; }
+
+  try {
+    const r = await fetch("/api/ledger/report", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({client, year: parseInt(year)})
+    });
+    if(!r.ok){ const d = await r.json(); alert(d.error || "Error"); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${client.replace(/\s+/g,'_')}-txn-summary-${year}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e){ alert("Error: " + e); }
+}
+</script>
+{% endblock %}

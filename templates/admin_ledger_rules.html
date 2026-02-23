@@ -1,0 +1,181 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <!-- Vendor Rules -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Vendor Rules</h2>
+      <p class="small">Map vendor names to categories. Exact match takes priority over prefix and contains.</p>
+      <div class="controls" style="margin-top:10px;flex-direction:column;align-items:stretch;gap:8px">
+        <input id="vrPattern" class="input" placeholder="Vendor pattern (e.g. GEORGIA POWER)"/>
+        <div class="controls" style="gap:8px">
+          <select id="vrMatchType" class="input">
+            <option value="exact">Exact</option>
+            <option value="prefix">Prefix</option>
+            <option value="contains">Contains</option>
+          </select>
+          <select id="vrCategory" class="input" style="min-width:180px">
+            <option value="">Select Category...</option>
+          </select>
+        </div>
+        <button class="btn primary" onclick="addVendorRule()">Add Vendor Rule</button>
+      </div>
+      <div style="margin-top:12px">
+        <table class="table" id="vrTable">
+          <thead><tr><th>Pattern</th><th>Match</th><th>Category</th><th>Uses</th><th></th></tr></thead>
+          <tbody id="vrBody"><tr><td colspan="5" class="small">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Category/Keyword Rules -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Keyword Rules</h2>
+      <p class="small">Map keywords found in descriptions to categories. Lower priority number = higher priority.</p>
+      <div class="controls" style="margin-top:10px;flex-direction:column;align-items:stretch;gap:8px">
+        <input id="crKeyword" class="input" placeholder="Keyword (e.g. ELECTRIC)"/>
+        <div class="controls" style="gap:8px">
+          <input id="crPriority" class="input" type="number" value="100" style="width:80px" placeholder="Priority"/>
+          <select id="crCategory" class="input" style="min-width:180px">
+            <option value="">Select Category...</option>
+          </select>
+        </div>
+        <button class="btn primary" onclick="addCategoryRule()">Add Keyword Rule</button>
+      </div>
+      <div style="margin-top:12px">
+        <table class="table" id="crTable">
+          <thead><tr><th>Keyword</th><th>Category</th><th>Priority</th><th>Source</th><th></th></tr></thead>
+          <tbody id="crBody"><tr><td colspan="5" class="small">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+let taxonomy = {};
+
+window.addEventListener("load", async () => {
+  try {
+    const r = await fetch("/api/ledger/taxonomy");
+    const d = await r.json();
+    taxonomy = d.taxonomy || {};
+    populateDropdowns();
+    loadVendorRules();
+    loadCategoryRules();
+  } catch(e){}
+});
+
+function populateDropdowns(){
+  ["vrCategory","crCategory"].forEach(id => {
+    const sel = document.getElementById(id);
+    for(const [group, cats] of Object.entries(taxonomy)){
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = group;
+      cats.forEach(cat => {
+        const opt = document.createElement("option");
+        opt.value = cat; opt.textContent = cat;
+        optgroup.appendChild(opt);
+      });
+      sel.appendChild(optgroup);
+    }
+  });
+}
+
+async function loadVendorRules(){
+  try {
+    const r = await fetch("/api/ledger/vendor-rules");
+    const d = await r.json();
+    const rules = d.rules || [];
+    const tbody = document.getElementById("vrBody");
+    if(!rules.length){
+      tbody.innerHTML = '<tr><td colspan="5" class="small">No vendor rules yet.</td></tr>';
+      return;
+    }
+    let html = '';
+    rules.forEach(rule => {
+      html += `<tr>
+        <td class="mono small">${rule.vendor_pattern}</td>
+        <td class="small">${rule.match_type}</td>
+        <td class="small">${rule.category}</td>
+        <td class="mono small">${rule.usage_count}</td>
+        <td><button class="btn danger" style="font-size:10px;padding:3px 8px" onclick="deleteVendorRule(${rule.rule_id})">Del</button></td>
+      </tr>`;
+    });
+    tbody.innerHTML = html;
+  } catch(e){
+    document.getElementById("vrBody").innerHTML = `<tr><td colspan="5" class="small">Error: ${e}</td></tr>`;
+  }
+}
+
+async function loadCategoryRules(){
+  try {
+    const r = await fetch("/api/ledger/category-rules");
+    const d = await r.json();
+    const rules = d.rules || [];
+    const tbody = document.getElementById("crBody");
+    if(!rules.length){
+      tbody.innerHTML = '<tr><td colspan="5" class="small">No keyword rules yet.</td></tr>';
+      return;
+    }
+    let html = '';
+    rules.forEach(rule => {
+      html += `<tr>
+        <td class="mono small">${rule.keyword}</td>
+        <td class="small">${rule.category}</td>
+        <td class="mono small">${rule.priority}</td>
+        <td class="small">${rule.source}</td>
+        <td><button class="btn danger" style="font-size:10px;padding:3px 8px" onclick="deleteCategoryRule(${rule.rule_id})">Del</button></td>
+      </tr>`;
+    });
+    tbody.innerHTML = html;
+  } catch(e){
+    document.getElementById("crBody").innerHTML = `<tr><td colspan="5" class="small">Error: ${e}</td></tr>`;
+  }
+}
+
+async function addVendorRule(){
+  const pattern = document.getElementById("vrPattern").value.trim();
+  const matchType = document.getElementById("vrMatchType").value;
+  const category = document.getElementById("vrCategory").value;
+  if(!pattern || !category){ alert("Pattern and category required"); return; }
+
+  const r = await fetch("/api/ledger/vendor-rules", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({vendor_pattern: pattern, match_type: matchType, category})
+  });
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById("vrPattern").value = "";
+  loadVendorRules();
+}
+
+async function deleteVendorRule(ruleId){
+  await fetch(`/api/ledger/vendor-rules/${ruleId}`, {method:"DELETE"});
+  loadVendorRules();
+}
+
+async function addCategoryRule(){
+  const keyword = document.getElementById("crKeyword").value.trim();
+  const category = document.getElementById("crCategory").value;
+  const priority = parseInt(document.getElementById("crPriority").value) || 100;
+  if(!keyword || !category){ alert("Keyword and category required"); return; }
+
+  const r = await fetch("/api/ledger/category-rules", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({keyword, category, priority})
+  });
+  const d = await r.json();
+  if(d.error){ alert(d.error); return; }
+  document.getElementById("crKeyword").value = "";
+  loadCategoryRules();
+}
+
+async function deleteCategoryRule(ruleId){
+  await fetch(`/api/ledger/category-rules/${ruleId}`, {method:"DELETE"});
+  loadCategoryRules();
+}
+</script>
+{% endblock %}

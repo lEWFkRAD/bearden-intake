@@ -1,0 +1,206 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <!-- CR Header -->
+    <div class="card" style="grid-column: span 12;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+        <div>
+          <h2 style="margin-bottom:8px">{{ cr.cr_id }}
+            <span class="pill {{ 'bad' if cr.severity=='CRITICAL' else ('warn' if cr.severity=='WARNING' else '') }}">{{ cr.severity }}</span>
+            {% if cr.status == 'closed' %}
+              <span class="pill good">closed</span>
+            {% elif cr.status == 'gate_passed' %}
+              <span class="pill good">gate_passed</span>
+            {% elif cr.status == 'fix_submitted' or cr.status == 'gate_failed' %}
+              <span class="pill warn">{{ cr.status }}</span>
+            {% else %}
+              <span class="pill bad">{{ cr.status }}</span>
+            {% endif %}
+          </h2>
+          <div class="small">Source: <b>{{ cr.source }}</b> | Created: {{ (cr.created_at or '')[:19] }}{% if cr.closed_at %} | Closed: {{ cr.closed_at[:19] }} by {{ cr.closed_by }}{% endif %}</div>
+          <div class="small" style="margin-top:4px">{{ cr.trigger_summary or '' }}</div>
+        </div>
+        <div class="row" style="gap:8px">
+          <a href="/api/cas/cr/{{ cr.cr_id }}/agent-pack" class="btn cas-action-btn">Agent Pack</a>
+          <a href="/admin/cas/cr" class="btn ghost">Back to List</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Findings -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Findings ({{ cr.findings|length }})</h2>
+      {% if cr.findings %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Severity</th>
+            <th>Check</th>
+            <th>Details</th>
+            <th>Measured</th>
+            <th>Threshold</th>
+            <th>Recommended Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in cr.findings %}
+          <tr>
+            <td class="mono">{{ f.finding_id }}</td>
+            <td><span class="pill {{ 'bad' if f.severity=='CRITICAL' else ('warn' if f.severity=='WARNING' else '') }}">{{ f.severity }}</span></td>
+            <td>{{ f.check_name or '-' }}</td>
+            <td class="small">{{ f.details or '-' }}</td>
+            <td class="mono small">{{ f.measured_value or '-' }}</td>
+            <td class="mono small">{{ f.threshold or '-' }}</td>
+            <td class="small">{{ f.recommended_action or '-' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="small">No findings recorded.</p>
+      {% endif %}
+    </div>
+
+    <!-- Fix Manifest -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Fix Manifest</h2>
+      {% if cr.status in ('open',) %}
+      <div id="manifest_form_area">
+        <p class="small">Describe the changes made to resolve these findings.</p>
+        <div class="manifest-form" style="margin-top:10px;display:flex;flex-direction:column;gap:12px">
+          <div>
+            <label class="small" style="font-weight:600;display:block;margin-bottom:4px">Description</label>
+            <textarea id="mf_description" rows="3" placeholder="What was changed and why..." style="width:100%;background:rgba(0,0,0,.18);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;padding:8px;resize:vertical"></textarea>
+          </div>
+          <div>
+            <label class="small" style="font-weight:600;display:block;margin-bottom:4px">Files Changed <span style="font-weight:400;color:var(--muted)">(one per line)</span></label>
+            <textarea id="mf_files" rows="3" placeholder="app.py&#10;extract.py&#10;templates/admin_cas.html" style="width:100%;background:rgba(0,0,0,.18);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--mono);font-size:11px;padding:8px;resize:vertical"></textarea>
+          </div>
+          <div>
+            <label class="small" style="font-weight:600;display:block;margin-bottom:4px">Tests Added <span style="font-weight:400;color:var(--muted)">(one per line, optional)</span></label>
+            <textarea id="mf_tests" rows="2" placeholder="test_extraction.py&#10;test_validation.py" style="width:100%;background:rgba(0,0,0,.18);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--mono);font-size:11px;padding:8px;resize:vertical"></textarea>
+          </div>
+          <div>
+            <label class="small" style="font-weight:600;display:block;margin-bottom:4px">Config Changed <span style="font-weight:400;color:var(--muted)">(one per line, optional)</span></label>
+            <textarea id="mf_config" rows="2" placeholder="launch.bat&#10;requirements.txt" style="width:100%;background:rgba(0,0,0,.18);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--mono);font-size:11px;padding:8px;resize:vertical"></textarea>
+          </div>
+          <input type="hidden" id="mf_author" value="{{ current_user.display_name }}">
+          <div class="controls">
+            <button class="btn primary" onclick="submitManifest()">Submit Fix Manifest</button>
+          </div>
+          <div id="manifest_result"></div>
+        </div>
+      </div>
+      {% elif cr.status != 'open' %}
+      <p class="small"><span class="pill good">Manifest Submitted</span></p>
+      <p class="small">Status advanced to <b>{{ cr.status }}</b>.</p>
+      {% endif %}
+    </div>
+
+    <!-- Post-Fix Gate -->
+    <div class="card" style="grid-column: span 6;">
+      <h2>Post-Fix Gate</h2>
+      {% if cr.gate %}
+      <div style="margin-bottom:10px">
+        <span class="pill {{ 'good' if cr.gate.gate_result=='ACCEPTED' else ('warn' if cr.gate.gate_result=='NEEDS_REVIEW' else 'bad') }}">{{ cr.gate.gate_result }}</span>
+        <span class="small"> — {{ cr.gate.checks_passed }}/{{ cr.gate.checks_run }} checks passed</span>
+        <div class="small" style="margin-top:4px">Run at: {{ (cr.gate.run_at or '')[:19] }}</div>
+      </div>
+      {% else %}
+      <p class="small">No gate results yet.</p>
+      {% endif %}
+
+      {% if cr.status in ('fix_submitted', 'gate_failed', 'gate_passed') %}
+      <div class="controls">
+        <button class="btn cas-action-btn" onclick="runGate()">Run Post-Fix Gate</button>
+      </div>
+      <div id="gate_result" style="margin-top:8px"></div>
+      {% elif cr.status == 'open' %}
+      <p class="small" style="color:var(--muted)">Submit a fix manifest first to enable the gate.</p>
+      {% endif %}
+    </div>
+
+    <!-- Merge Guard & Close -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Merge Guard</h2>
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        {% if cr.merge_guard and cr.merge_guard.can_merge %}
+        <div class="merge-guard ready">Ready to Close</div>
+        <button class="btn primary" onclick="closeCR()">Close Change Request</button>
+        {% else %}
+        <div class="merge-guard blocked">Blocked: {{ cr.merge_guard.reason if cr.merge_guard else 'Unknown' }}</div>
+        {% endif %}
+        <div id="close_result"></div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+const CR_ID = '{{ cr.cr_id }}';
+
+function linesToArray(id){
+  return document.getElementById(id).value.split('\n').map(s=>s.trim()).filter(Boolean);
+}
+async function submitManifest(){
+  const el = document.getElementById('manifest_result');
+  const desc = document.getElementById('mf_description').value.trim();
+  if(!desc){ el.innerHTML = '<p class="small" style="color:var(--bad)">Please enter a description.</p>'; return; }
+  const data = {
+    description: desc,
+    files_changed: linesToArray('mf_files'),
+    tests_added: linesToArray('mf_tests'),
+    config_changed: linesToArray('mf_config'),
+    author: document.getElementById('mf_author').value,
+    timestamp: new Date().toISOString()
+  };
+
+  el.innerHTML = '<p class="small">Submitting...</p>';
+  try {
+    const r = await fetch(`/api/cas/cr/${CR_ID}/manifest`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)
+    });
+    const d = await r.json();
+    if(d.success){
+      el.innerHTML = '<p><span class="pill good">Manifest submitted</span></p>';
+      setTimeout(() => location.reload(), 1000);
+    } else {
+      el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${d.error}</p>`;
+    }
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function runGate(){
+  const el = document.getElementById('gate_result');
+  el.innerHTML = '<p class="small">Running post-fix gate (this may take a while)...</p>';
+  try {
+    const r = await fetch(`/api/cas/cr/${CR_ID}/gate`, {method:'POST'});
+    const d = await r.json();
+    if(d.error){
+      el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${d.error}</p>`;
+      return;
+    }
+    const cls = d.gate_result==='ACCEPTED'?'good':(d.gate_result==='NEEDS_REVIEW'?'warn':'bad');
+    el.innerHTML = `<p><span class="pill ${cls}">${d.gate_result}</span> — ${d.checks_passed}/${d.checks_run} checks passed</p>`;
+    setTimeout(() => location.reload(), 1500);
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+
+async function closeCR(){
+  const el = document.getElementById('close_result');
+  el.innerHTML = '<p class="small">Closing...</p>';
+  try {
+    const r = await fetch(`/api/cas/cr/${CR_ID}/close`, {method:'POST'});
+    const d = await r.json();
+    if(d.error){
+      el.innerHTML = `<p class="small" style="color:var(--bad)">${d.error}</p>`;
+      return;
+    }
+    el.innerHTML = '<p><span class="pill good">CR Closed</span></p>';
+    setTimeout(() => location.reload(), 1000);
+  } catch(e){ el.innerHTML = `<p class="small" style="color:var(--bad)">Error: ${e}</p>`; }
+}
+</script>
+{% endblock %}

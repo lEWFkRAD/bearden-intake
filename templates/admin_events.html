@@ -1,0 +1,36 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="card">
+    <h2>Events</h2>
+    <form class="controls" method="get">
+      <select name="level">
+        <option value="">All levels</option>
+        <option value="error" {{ 'selected' if level=='error' else '' }}>error</option>
+        <option value="warn" {{ 'selected' if level=='warn' else '' }}>warn</option>
+        <option value="info" {{ 'selected' if level=='info' else '' }}>info</option>
+      </select>
+      <input class="input" name="job_id" placeholder="job_id" value="{{ job_id or '' }}"/>
+      <input class="input" name="user_id" placeholder="user_id" value="{{ user_id or '' }}"/>
+      <button class="btn primary" type="submit">Filter</button>
+      <a class="btn" href="/admin/events">Reset</a>
+    </form>
+    <div class="hr"></div>
+    <div class="feed">
+      {% for e in events %}
+      <div class="event">
+        <div class="top">
+          <div class="msg">{{ e.message }}</div>
+          <div class="meta">{{ e.ts }} • {{ e.level }}</div>
+        </div>
+        <div class="meta">type={{ e.event_type }}{% if e.user_display %} • user={{ e.user_display }}{% endif %}{% if e.job_id %} • job={{ e.job_id }}{% endif %}</div>
+        {% if e.details_json %}
+        <details>
+          <summary class="small">details</summary>
+          <pre>{{ e.details_json }}</pre>
+        </details>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+{% endblock %}

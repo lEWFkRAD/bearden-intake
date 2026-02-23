@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>{{ title or "OathLedger Admin" }}</title>
+  <link rel="stylesheet" href="/static/admin.css"/>
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+  <div class="container">
+    <aside class="sidebar">
+      <div class="brand">
+        OathLedger Admin
+        <div class="sub">Ops Console • PIN Auth</div>
+      </div>
+      <nav class="nav">
+        <a href="/admin" class="{{ 'active' if active=='overview' else '' }}">Overview</a>
+        <a href="/admin/jobs" class="{{ 'active' if active=='jobs' else '' }}">Jobs</a>
+        <a href="/admin/events" class="{{ 'active' if active=='events' else '' }}">Events</a>
+        <a href="/admin/cas" class="{{ 'active' if active=='cas' else '' }}">System Health <span class="tag">Sigzil</span></a>
+        <a href="/admin/cas/runs" class="{{ 'active' if active=='cas_runs' else '' }}">Run Inspector <span class="tag">Sigzil</span></a>
+        <a href="/admin/cas/cr" class="{{ 'active' if active=='cas_cr' else '' }}">Change Requests <span class="tag">Sigzil</span></a>
+        <a href="/admin/ledger" class="{{ 'active' if active=='ledger' else '' }}">Ledger <span class="tag">Honor</span></a>
+        <a href="/admin/users" class="{{ 'active' if active=='users' else '' }}">Users <span class="tag">Admin</span></a>
+      </nav>
+      <div class="hr"></div>
+      <div class="small">Signed in as <b>{{ current_user.display_name }}</b></div>
+      <div class="small mono">role={{ current_user.role }}</div>
+      <div class="controls" style="margin-top:12px">
+        <form method="post" action="/logout">
+          <button class="btn ghost" type="submit">Logout</button>
+        </form>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <div class="h1">{{ header or "Dashboard" }}</div>
+          <div class="sub">Version <span id="meta_version">{{ version }}</span> • Uptime <span id="meta_uptime">{{ uptime_h }}</span>h</div>
+        </div>
+        <div class="row">
+          <span class="pill {{ health_state }}" id="health_pill">{{ health_label }}</span>
+        </div>
+      </div>
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <footer style="text-align:center;padding:12px 0 4px;font-size:9px;color:rgba(0,0,0,0.15);">
+    Honor is dead, but I'll see what I can do.
+  </footer>
+
+  <script src="/static/admin.js"></script>
+  {% block body_extra %}{% endblock %}
+</body>
+</html>

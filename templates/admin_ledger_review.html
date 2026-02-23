@@ -1,0 +1,250 @@
+{% extends "admin_base.html" %}
+{% block content %}
+  <div class="grid">
+    <!-- Filters -->
+    <div class="card" style="grid-column: span 12;">
+      <div class="controls" style="flex-wrap:wrap;gap:8px">
+        <select id="clientPicker" class="input">
+          <option value="">Select Client...</option>
+          {% for c in clients %}
+          <option value="{{ c }}">{{ c }}</option>
+          {% endfor %}
+        </select>
+        <select id="yearPicker" class="input">
+          <option value="2025">2025</option>
+          <option value="2024">2024</option>
+        </select>
+        <select id="statusFilter" class="input">
+          <option value="">All Statuses</option>
+          <option value="staged">Staged</option>
+          <option value="suggested">Suggested</option>
+          <option value="verified">Verified</option>
+          <option value="corrected">Corrected</option>
+        </select>
+        <select id="monthFilter" class="input">
+          <option value="">All Months</option>
+          <option value="1">Jan</option><option value="2">Feb</option>
+          <option value="3">Mar</option><option value="4">Apr</option>
+          <option value="5">May</option><option value="6">Jun</option>
+          <option value="7">Jul</option><option value="8">Aug</option>
+          <option value="9">Sep</option><option value="10">Oct</option>
+          <option value="11">Nov</option><option value="12">Dec</option>
+        </select>
+        <input id="searchBox" class="input" placeholder="Search description..." style="min-width:180px"/>
+        <button class="btn primary" onclick="loadTxns()">Search</button>
+      </div>
+      <div class="controls" style="margin-top:8px;gap:8px">
+        <select id="bulkCategory" class="input" style="min-width:200px">
+          <option value="">Bulk Category...</option>
+        </select>
+        <button class="btn cas-action-btn" onclick="bulkCategorize()">Categorize Selected</button>
+        <button class="btn" onclick="bulkVerify()">Verify Selected</button>
+        <label class="small" style="margin-left:8px"><input type="checkbox" id="learnRule"/> Learn vendor rule</label>
+      </div>
+    </div>
+
+    <!-- Transaction Table -->
+    <div class="card" style="grid-column: span 12;">
+      <h2>Transactions <span id="txnCount" class="small"></span></h2>
+      <table class="table" id="txnTable">
+        <thead>
+          <tr>
+            <th style="width:30px"><input type="checkbox" id="selectAll" onchange="toggleAll()"/></th>
+            <th>Date</th>
+            <th>Description</th>
+            <th style="text-align:right">Amount</th>
+            <th>Type</th>
+            <th>Category</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="txnBody">
+          <tr><td colspan="8" class="small">Select a client and search.</td></tr>
+        </tbody>
+      </table>
+      <div class="controls" id="pagination" style="margin-top:10px"></div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block body_extra %}
+<script>
+let taxonomy = {};
+let currentPage = 1;
+
+// Load taxonomy on page load
+window.addEventListener("load", async () => {
+  try {
+    const r = await fetch("/api/ledger/taxonomy");
+    const d = await r.json();
+    taxonomy = d.taxonomy || {};
+    populateCategoryDropdown();
+  } catch(e){}
+});
+
+function populateCategoryDropdown(){
+  const sel = document.getElementById("bulkCategory");
+  for(const [group, cats] of Object.entries(taxonomy)){
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = group;
+    cats.forEach(cat => {
+      const opt = document.createElement("option");
+      opt.value = cat; opt.textContent = cat;
+      optgroup.appendChild(opt);
+    });
+    sel.appendChild(optgroup);
+  }
+}
+
+function makeCategorySelect(txnId, currentCat){
+  let html = `<select class="input" style="font-size:11px;padding:4px 6px" onchange="categorizeOne('${txnId}', this.value)">`;
+  html += `<option value="">${currentCat || 'Uncategorized'}</option>`;
+  for(const [group, cats] of Object.entries(taxonomy)){
+    html += `<optgroup label="${group}">`;
+    cats.forEach(cat => {
+      const sel = cat === currentCat ? ' selected' : '';
+      html += `<option value="${cat}"${sel}>${cat}</option>`;
+    });
+    html += '</optgroup>';
+  }
+  return html + '</select>';
+}
+
+function statusPill(status){
+  const cls = {staged:'bad',suggested:'warn',verified:'good',corrected:'good'}[status] || '';
+  return `<span class="pill ${cls}" style="font-size:10px">${status}</span>`;
+}
+
+function fmtMoney(v){
+  if(v == null) return '';
+  return Number(v).toLocaleString('en-US',{style:'currency',currency:'USD'});
+}
+
+async function loadTxns(page){
+  currentPage = page || 1;
+  const client = document.getElementById("clientPicker").value;
+  const year = document.getElementById("yearPicker").value;
+  if(!client){ return; }
+
+  const params = new URLSearchParams({client, year, page: currentPage, per_page: 50});
+  const status = document.getElementById("statusFilter").value;
+  const month = document.getElementById("monthFilter").value;
+  const search = document.getElementById("searchBox").value;
+  if(status) params.set("status", status);
+  if(month) params.set("month", month);
+  if(search) params.set("search", search);
+
+  try {
+    const r = await fetch(`/api/ledger/transactions?${params}`);
+    const d = await r.json();
+    if(d.error){ alert(d.error); return; }
+
+    document.getElementById("txnCount").textContent = `(${d.total} total)`;
+
+    const tbody = document.getElementById("txnBody");
+    if(!d.items || d.items.length === 0){
+      tbody.innerHTML = '<tr><td colspan="8" class="small">No transactions found.</td></tr>';
+      document.getElementById("pagination").innerHTML = '';
+      return;
+    }
+
+    let html = '';
+    d.items.forEach(t => {
+      html += `<tr>
+        <td><input type="checkbox" class="txn-cb" value="${t.txn_id}"/></td>
+        <td class="mono small">${t.txn_date || ''}</td>
+        <td class="small">${t.description || ''}</td>
+        <td class="mono small" style="text-align:right">${fmtMoney(t.amount)}</td>
+        <td class="small">${t.txn_type || ''}</td>
+        <td>${makeCategorySelect(t.txn_id, t.category)}</td>
+        <td>${statusPill(t.status)}</td>
+        <td>
+          <button class="btn" style="font-size:10px;padding:4px 8px" onclick="verifyOne('${t.txn_id}')">Verify</button>
+          <button class="btn ghost" style="font-size:10px;padding:4px 8px" onclick="showEvents('${t.txn_id}')">Audit</button>
+        </td>
+      </tr>`;
+    });
+    tbody.innerHTML = html;
+
+    // Pagination
+    let phtml = '';
+    for(let p=1; p<=d.pages; p++){
+      phtml += `<button class="btn${p===currentPage?' primary':''}" style="font-size:11px;padding:4px 10px" onclick="loadTxns(${p})">${p}</button> `;
+    }
+    document.getElementById("pagination").innerHTML = phtml;
+  } catch(e){
+    document.getElementById("txnBody").innerHTML = `<tr><td colspan="8" class="small" style="color:#fecaca">Error: ${e}</td></tr>`;
+  }
+}
+
+function toggleAll(){
+  const checked = document.getElementById("selectAll").checked;
+  document.querySelectorAll(".txn-cb").forEach(cb => cb.checked = checked);
+}
+
+function getSelectedIds(){
+  return Array.from(document.querySelectorAll(".txn-cb:checked")).map(cb => cb.value);
+}
+
+async function categorizeOne(txnId, category){
+  if(!category) return;
+  const learn = document.getElementById("learnRule").checked;
+  await fetch("/api/ledger/categorize", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({txn_ids:[txnId], category, learn})
+  });
+  loadTxns(currentPage);
+}
+
+async function verifyOne(txnId){
+  await fetch("/api/ledger/verify", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({txn_ids:[txnId]})
+  });
+  loadTxns(currentPage);
+}
+
+async function bulkCategorize(){
+  const ids = getSelectedIds();
+  const cat = document.getElementById("bulkCategory").value;
+  if(!ids.length){ alert("Select transactions first"); return; }
+  if(!cat){ alert("Select a category first"); return; }
+  const learn = document.getElementById("learnRule").checked;
+  await fetch("/api/ledger/categorize", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({txn_ids:ids, category:cat, learn})
+  });
+  loadTxns(currentPage);
+}
+
+async function bulkVerify(){
+  const ids = getSelectedIds();
+  if(!ids.length){ alert("Select transactions first"); return; }
+  const r = await fetch("/api/ledger/verify", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({txn_ids:ids})
+  });
+  const d = await r.json();
+  alert(`Verified: ${d.verified}, Skipped: ${d.skipped}`);
+  loadTxns(currentPage);
+}
+
+async function showEvents(txnId){
+  try {
+    const r = await fetch(`/api/ledger/events/${txnId}`);
+    const d = await r.json();
+    const events = d.events || [];
+    let msg = `Audit Trail for ${txnId}:\n\n`;
+    events.forEach(e => {
+      msg += `[${e.event_at}] ${e.event_type}: ${e.old_value || ''} -> ${e.new_value || ''} (${e.reviewer || 'system'})\n`;
+    });
+    alert(msg);
+  } catch(e){ alert("Error loading events: " + e); }
+}
+</script>
+{% endblock %}
