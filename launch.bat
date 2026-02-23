@@ -13,14 +13,37 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-REM Check Tesseract is installed
+REM Check Tesseract is installed (check PATH first, then default locations)
 tesseract --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo WARNING: Tesseract OCR not found in PATH.
-    echo Download from https://github.com/UB-Mannheim/tesseract/wiki
-    echo Install and add to PATH, then restart this launcher.
-    pause
-    exit /b 1
+    if exist "C:\Program Files\Tesseract-OCR\tesseract.exe" (
+        set "PATH=%PATH%;C:\Program Files\Tesseract-OCR"
+        echo   Found Tesseract at C:\Program Files\Tesseract-OCR
+    ) else if exist "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe" (
+        set "PATH=%PATH%;C:\Program Files (x86)\Tesseract-OCR"
+        echo   Found Tesseract at C:\Program Files ^(x86^)\Tesseract-OCR
+    ) else (
+        echo WARNING: Tesseract OCR not found.
+        echo Download from https://github.com/UB-Mannheim/tesseract/wiki
+        echo Install and restart this launcher.
+        pause
+        exit /b 1
+    )
+)
+
+REM Check Poppler is installed (needed for PDF rendering)
+where pdftoppm >nul 2>&1
+if %errorlevel% neq 0 (
+    if exist "C:\poppler\Library\bin\pdftoppm.exe" (
+        set "PATH=%PATH%;C:\poppler\Library\bin"
+        echo   Found Poppler at C:\poppler\Library\bin
+    ) else if exist "C:\poppler\bin\pdftoppm.exe" (
+        set "PATH=%PATH%;C:\poppler\bin"
+        echo   Found Poppler at C:\poppler\bin
+    ) else (
+        echo WARNING: Poppler not found. PDF page rendering may fail.
+        echo Download from https://github.com/oschwartz10612/poppler-windows/releases
+    )
 )
 
 REM Check API key is set

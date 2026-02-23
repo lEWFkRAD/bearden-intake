@@ -128,10 +128,24 @@ def _secure_file(path):
 
 def _get_db():
     """Get a SQLite connection. Each call creates a new connection (thread-safe)."""
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
+
+
+def _retry_on_locked(fn, max_retries=3, delay=0.5):
+    """Retry a database operation if it hits a locked database."""
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < max_retries - 1:
+                _time.sleep(delay * (attempt + 1))
+                continue
+            raise
 
 def _init_db():
     """Create tables if needed. Migrate from JSON files on first run."""
@@ -561,6 +575,65 @@ def _init_db():
             CREATE INDEX IF NOT EXISTS idx_category_rules_keyword ON category_rules(keyword);
         """)
         # ─── End Transaction Ledger Tables ──────────────────────────────────
+
+        # ─── Time Tracking & Firm Cost Tables ───────────────────────────────
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS time_entries (
+                entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client TEXT NOT NULL DEFAULT '',
+                user TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL DEFAULT 'general',
+                description TEXT DEFAULT '',
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                duration_minutes REAL DEFAULT 0,
+                billable INTEGER DEFAULT 1,
+                rate REAL DEFAULT 0,
+                job_id TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_time_client ON time_entries(client);
+            CREATE INDEX IF NOT EXISTS idx_time_user ON time_entries(user);
+            CREATE INDEX IF NOT EXISTS idx_time_start ON time_entries(start_time);
+
+            CREATE TABLE IF NOT EXISTS firm_costs (
+                cost_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                amount REAL NOT NULL DEFAULT 0,
+                date TEXT NOT NULL,
+                recurring INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'manual',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_firm_costs_date ON firm_costs(date);
+            CREATE INDEX IF NOT EXISTS idx_firm_costs_cat ON firm_costs(category);
+        """);
+        # ─── End Time Tracking & Firm Cost Tables ───────────────────────────
+
+        # ─── Integrations Settings Table ──────────────────────────────────────
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS integrations (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        """)
+        # Seed Muse defaults if not present
+        for k, v in [
+            ("muse_enabled", "0"),
+            ("muse_url", "http://localhost:3001"),
+            ("muse_board", "Tax Preparation"),
+            ("muse_column", "To Contemplate"),
+            ("muse_assignee", ""),
+            ("muse_tags", "oathledger"),
+            ("oathledger_v2_enabled", "0"),
+        ]:
+            conn.execute(
+                "INSERT OR IGNORE INTO integrations (key, value) VALUES (?, ?)",
+                (k, v)
+            )
+        # ─── End Integrations Settings Table ──────────────────────────────────
 
         conn.commit()
         _secure_file(DB_PATH)
@@ -1026,6 +1099,267 @@ def _event_row_to_dict(row):
     }
 
 
+# ─── Integrations: Muse Bridge ────────────────────────────────────────────────
+
+def _get_integration(key, default=""):
+    """Read a single value from the integrations table. Thread-safe."""
+    conn = _get_db()
+    try:
+        row = conn.execute("SELECT value FROM integrations WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+    finally:
+        conn.close()
+
+
+def _set_integration(key, value):
+    """Write a single value to the integrations table. Thread-safe."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO integrations (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+            (key, str(value))
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _notify_muse(job_id, job):
+    """Fire-and-forget POST to Muse /api/agent/execute when a job completes.
+    Creates review tasks in Muse for the CPA team to pick up.
+    Never crashes — all failures are logged and swallowed."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        if _get_integration("muse_enabled") != "1":
+            return
+
+        muse_url = _get_integration("muse_url", "http://localhost:3001").rstrip("/")
+        board_name = _get_integration("muse_board", "Tax Preparation")
+        column_name = _get_integration("muse_column", "To Contemplate")
+        assignee = _get_integration("muse_assignee", "")
+        base_tags = [t.strip() for t in _get_integration("muse_tags", "oathledger").split(",") if t.strip()]
+
+        client_name = job.get("client_name", "Unknown Client")
+        doc_count = job.get("stats", {}).get("documents", 0)
+        total_pages = job.get("total_pages", 0)
+        filename = job.get("filename", "")
+        year = job.get("year", "")
+        cost = job.get("cost_usd", 0)
+        review_stage = job.get("review_stage", "preparer_review")
+
+        # Build descriptive task
+        title = f"Review: {client_name}"
+        if year:
+            title += f" ({year})"
+        if filename:
+            title += f" — {filename}"
+        # Cap at 200 chars (Muse guardrail)
+        title = title[:200]
+
+        description_lines = [
+            f"**OathLedger Job:** `{job_id}`",
+            f"**Client:** {client_name}",
+            f"**Documents:** {doc_count} | **Pages:** {total_pages}",
+            f"**Cost:** ${cost:.4f}" if isinstance(cost, (int, float)) else "",
+            f"**Review Stage:** {review_stage}",
+            "",
+            f"Extraction complete. Ready for {review_stage.replace('_', ' ')}.",
+            "",
+            f"Open in OathLedger: [Review →](http://localhost:5000/#review/{job_id})",
+        ]
+        description = "\n".join(l for l in description_lines if l is not None)[:2000]
+
+        tags = list(base_tags)
+        tags.append(review_stage)
+        if year:
+            tags.append(str(year))
+
+        task_params = {
+            "title": title,
+            "description": description,
+            "priority": "high",
+            "status": "not_started",
+            "board_name": board_name,
+            "column_name": column_name,
+            "tags": tags,
+        }
+        if assignee:
+            task_params["assignee_names"] = [n.strip() for n in assignee.split(",") if n.strip()]
+
+        payload = json.dumps({"actions": [{"type": "create_task", "params": task_params}]})
+
+        req = urllib.request.Request(
+            f"{muse_url}/api/agent/execute",
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        task_id = ""
+        if result.get("results"):
+            r0 = result["results"][0]
+            if r0.get("success"):
+                task_id = r0.get("taskId", "")
+
+        log_event("info", "muse_task_created",
+                  f"Muse task created for {client_name}: {task_id}",
+                  job_id=job_id,
+                  details={"muse_task_id": task_id, "board": board_name})
+        job["muse_task_id"] = task_id
+
+    except urllib.error.URLError as e:
+        log_event("warn", "muse_notify_failed",
+                  f"Could not reach Muse at {_get_integration('muse_url')}: {e}",
+                  job_id=job_id)
+    except Exception as e:
+        log_event("warn", "muse_notify_failed",
+                  f"Muse notification failed: {e}",
+                  job_id=job_id)
+
+
+def _update_muse_task(job_id, job, new_stage):
+    """Update (or create) a Muse task when the review stage transitions.
+    At any stage: updates title, tags, description with current stage.
+    At 'final': marks task done with full extraction stats.
+    If no muse_task_id exists: creates a new task instead.
+    Fire-and-forget. Never raises. Never crashes the review workflow."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        if _get_integration("muse_enabled") != "1":
+            return
+
+        muse_url    = _get_integration("muse_url", "http://localhost:3001").rstrip("/")
+        board_name  = _get_integration("muse_board", "Tax Preparation")
+        column_name = _get_integration("muse_column", "To Contemplate")
+        assignee    = _get_integration("muse_assignee", "")
+        base_tags   = [t.strip() for t in _get_integration("muse_tags", "oathledger").split(",") if t.strip()]
+
+        client_name = job.get("client_name", "Unknown Client")
+        filename    = job.get("filename", "")
+        year        = job.get("year", "")
+        cost        = job.get("cost_usd", 0)
+        stats       = job.get("stats", {})
+        doc_count   = stats.get("documents", 0)
+        total_pages = job.get("total_pages", 0)
+        output_xlsx = job.get("output_xlsx", "")
+        stage_display = STAGE_DISPLAY.get(new_stage, new_stage)
+
+        # Build title
+        title = f"Review: {client_name}"
+        if year:
+            title += f" ({year})"
+        if filename:
+            title += f" — {filename}"
+        title = title[:200]
+
+        # Build tags
+        tags = list(base_tags)
+        tags.append(new_stage)
+        if year:
+            tags.append(str(year))
+        if new_stage == "final":
+            tags.append("complete")
+
+        # Build description
+        desc_lines = [
+            f"**OathLedger Job:** `{job_id}`",
+            f"**Client:** {client_name}",
+            f"**Review Stage:** {stage_display}",
+            f"**Documents:** {doc_count} | **Pages:** {total_pages}",
+            f"**Cost:** ${cost:.4f}" if isinstance(cost, (int, float)) else "",
+            "",
+        ]
+        if new_stage == "final":
+            warnings = stats.get("warnings", 0)
+            fields   = stats.get("total_fields", 0)
+            methods  = stats.get("methods", {})
+            desc_lines += [
+                "**Review complete.** All stages passed.",
+                "",
+                f"**Fields extracted:** {fields}",
+                f"**Warnings:** {warnings}",
+            ]
+            if methods:
+                method_summary = ", ".join(f"{k}: {v}" for k, v in methods.items())
+                desc_lines.append(f"**Methods:** {method_summary}")
+            if output_xlsx:
+                desc_lines.append(f"**Output:** `{Path(output_xlsx).name}`")
+        else:
+            desc_lines.append(f"Awaiting {stage_display}.")
+
+        desc_lines.append("")
+        desc_lines.append(f"Open in OathLedger: [Review →](http://localhost:5050/#review/{job_id})")
+        description = "\n".join(l for l in desc_lines if l is not None)[:2000]
+
+        muse_status = "done" if new_stage == "final" else "in_progress"
+        existing_task_id = job.get("muse_task_id", "")
+
+        if existing_task_id:
+            # Update existing Muse task
+            action_params = {
+                "id":          existing_task_id,
+                "new_title":   title,
+                "description": description,
+                "tags":        tags,
+                "status":      muse_status,
+            }
+            action_type = "update_task"
+        else:
+            # No task yet — create one now
+            action_params = {
+                "title":       title,
+                "description": description,
+                "priority":    "high",
+                "status":      muse_status,
+                "board_name":  board_name,
+                "column_name": column_name,
+                "tags":        tags,
+            }
+            if assignee:
+                action_params["assignee_names"] = [n.strip() for n in assignee.split(",") if n.strip()]
+            action_type = "create_task"
+
+        payload = json.dumps({"actions": [{"type": action_type, "params": action_params}]})
+        req = urllib.request.Request(
+            f"{muse_url}/api/agent/execute",
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        if result.get("results"):
+            r0 = result["results"][0]
+            if r0.get("success"):
+                if action_type == "create_task":
+                    job["muse_task_id"] = r0.get("taskId", "")
+                    save_jobs()
+                log_event("info", "muse_task_updated",
+                          f"Muse {action_type} for {client_name} at stage {new_stage}",
+                          job_id=job_id,
+                          details={"muse_task_id": job.get("muse_task_id"), "stage": new_stage})
+
+    except urllib.error.URLError as e:
+        log_event("warn", "muse_update_failed",
+                  f"Could not reach Muse at {_get_integration('muse_url')}: {e}",
+                  job_id=job_id)
+    except Exception as e:
+        log_event("warn", "muse_update_failed",
+                  f"Muse stage update failed at {new_stage}: {e}",
+                  job_id=job_id)
+
+
 # ─── Sprint 2: Admin Summary Builder ─────────────────────────────────────────
 
 def build_admin_summary():
@@ -1254,6 +1588,29 @@ def build_dashboard_data():
                    if (j.get("created") or "") >= cutoff_7d)
     error_rate_7d = round((error_count_7d / total_7d * 100), 1) if total_7d > 0 else 0
 
+    # CPA metrics: docs this week, pending review, corrections rate
+    cutoff_week = (now - timedelta(days=7)).isoformat()
+    docs_this_week = sum(1 for j in jobs.values() if (j.get("created") or "") >= cutoff_week)
+    pending_review = sum(1 for j in jobs.values()
+                         if j.get("status") == "complete"
+                         and j.get("review_stage") in ("preparer_review", "reviewer_review", "partner_review"))
+    # Corrections rate from verified_fields
+    corrections_rate = 0.0
+    try:
+        conn2 = _get_db()
+        try:
+            vrow = conn2.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='corrected' THEN 1 ELSE 0 END) as corrected FROM verified_fields").fetchone()
+            if vrow and vrow[0] > 0:
+                corrections_rate = round((vrow[1] / vrow[0]) * 100, 1)
+        finally:
+            conn2.close()
+    except Exception:
+        pass
+    # Review completion: how many complete jobs are at 'final' stage
+    complete_jobs = sum(1 for j in jobs.values() if j.get("status") == "complete")
+    final_jobs = sum(1 for j in jobs.values() if j.get("status") == "complete" and j.get("review_stage") == "final")
+    review_completion = round((final_jobs / complete_jobs * 100), 1) if complete_jobs > 0 else 0
+
     return {
         "kpis": {
             "total_docs": total_docs,
@@ -1262,6 +1619,10 @@ def build_dashboard_data():
             "avg_time_s": avg_time,
             "total_cost": round(total_cost, 4),
             "active_jobs": active_jobs,
+            "docs_this_week": docs_this_week,
+            "pending_review": pending_review,
+            "corrections_rate": corrections_rate,
+            "review_completion": review_completion,
         },
         "charts": {
             "daily_series": daily_series,
@@ -1291,6 +1652,509 @@ def build_dashboard_data():
 def api_dashboard():
     """Aggregated dashboard data — one call powers the entire dashboard UI."""
     return jsonify(build_dashboard_data())
+
+
+@app.route("/api/stormfather", methods=["POST"])
+@require_login
+def api_stormfather():
+    """The Stormfather — platform-wide AI liaison grounded in OathLedger facts."""
+    message = (request.json or {}).get("message", "").strip()
+    if not message:
+        return jsonify({"error": "No message provided"}), 400
+
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return jsonify({"error": "Anthropic library not available"}), 500
+
+    # ── Gather platform context from FactStore ──
+    facts_summary = ""
+    try:
+        from fact_store import FactStore
+        fs = FactStore(str(DB_PATH))
+        # Get all facts, grouped by client
+        all_facts = []
+        conn_f = _get_db()
+        try:
+            rows = conn_f.execute(
+                "SELECT fact_key, value_num, value_text, status, confidence, client_id, tax_year "
+                "FROM facts ORDER BY created_at DESC LIMIT 500"
+            ).fetchall()
+            for r in rows:
+                val = r[1] if r[1] is not None else r[2]
+                all_facts.append(f"  {r[0]}: {val} (status={r[3]}, confidence={r[4]}, client={r[5]}, year={r[6]})")
+        finally:
+            conn_f.close()
+        if all_facts:
+            facts_summary = "Established Facts from FactStore (most recent 500):\n" + "\n".join(all_facts[:300])
+            if len(all_facts) > 300:
+                facts_summary += f"\n  ...({len(all_facts) - 300} more facts)"
+    except Exception:
+        facts_summary = "(FactStore not available)"
+
+    # ── Verified fields stats ──
+    vf_summary = ""
+    try:
+        conn_v = _get_db()
+        try:
+            vf_row = conn_v.execute(
+                "SELECT COUNT(*) as total, "
+                "SUM(CASE WHEN status='verified' THEN 1 ELSE 0 END) as verified, "
+                "SUM(CASE WHEN status='corrected' THEN 1 ELSE 0 END) as corrected, "
+                "SUM(CASE WHEN status='flagged' THEN 1 ELSE 0 END) as flagged "
+                "FROM verified_fields"
+            ).fetchone()
+            if vf_row and vf_row[0] > 0:
+                vf_summary = (f"Verified Fields: {vf_row[0]} total, {vf_row[1]} verified, "
+                              f"{vf_row[2]} corrected, {vf_row[3]} flagged")
+        finally:
+            conn_v.close()
+    except Exception:
+        pass
+
+    # ── Job statistics ──
+    total_jobs = len(jobs)
+    complete_jobs = sum(1 for j in jobs.values() if j.get("status") == "complete")
+    processing_jobs = sum(1 for j in jobs.values() if j.get("status") == "processing")
+    failed_jobs = sum(1 for j in jobs.values() if j.get("status") == "error")
+    total_pages = sum(j.get("total_pages", 0) for j in jobs.values())
+
+    # Review stages breakdown
+    stages = {}
+    for j in jobs.values():
+        rs = j.get("review_stage", "unknown")
+        stages[rs] = stages.get(rs, 0) + 1
+    stages_str = ", ".join(f"{k}: {v}" for k, v in stages.items()) if stages else "none"
+
+    # Client breakdown
+    client_counts = {}
+    for j in jobs.values():
+        c = j.get("client_name") or "Unassigned"
+        client_counts[c] = client_counts.get(c, 0) + 1
+    top_clients = sorted(client_counts.items(), key=lambda x: -x[1])[:10]
+    clients_str = ", ".join(f"{name} ({cnt} jobs)" for name, cnt in top_clients) if top_clients else "none"
+
+    # ── Recent app events ──
+    events_summary = ""
+    try:
+        conn_e = _get_db()
+        try:
+            evt_rows = conn_e.execute(
+                "SELECT event_type, summary, created_at FROM app_events "
+                "ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+            if evt_rows:
+                events_summary = "Recent Platform Events:\n" + "\n".join(
+                    f"  [{r[2]}] {r[0]}: {r[1]}" for r in evt_rows
+                )
+        finally:
+            conn_e.close()
+    except Exception:
+        pass
+
+    # ── Op runs performance ──
+    ops_summary = ""
+    try:
+        conn_o = _get_db()
+        try:
+            op_rows = conn_o.execute(
+                "SELECT op_name, COUNT(*) as cnt, "
+                "ROUND(AVG(duration_sec), 1) as avg_dur, "
+                "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as ok "
+                "FROM op_runs GROUP BY op_name ORDER BY cnt DESC LIMIT 15"
+            ).fetchall()
+            if op_rows:
+                ops_summary = "Operation Performance:\n" + "\n".join(
+                    f"  {r[0]}: {r[1]} runs, avg {r[2]}s, {r[3]} successes" for r in op_rows
+                )
+        finally:
+            conn_o.close()
+    except Exception:
+        pass
+
+    # ── Build the Stormfather prompt ──
+    platform_context = f"""Platform Status:
+  Total Jobs: {total_jobs} | Complete: {complete_jobs} | Processing: {processing_jobs} | Failed: {failed_jobs}
+  Total Pages Processed: {total_pages}
+  Review Stages: {stages_str}
+  Top Clients: {clients_str}
+
+{vf_summary}
+
+{facts_summary}
+
+{ops_summary}
+
+{events_summary}"""
+
+    system_prompt = """You are The Stormfather, the AI liaison for OathLedger — a CPA document intake and review platform.
+
+You speak with authority about established facts and verified truths. You are direct, slightly dramatic, and always helpful. You reference specific data points from the platform when answering questions.
+
+Your personality:
+- Authoritative but approachable — like a wise mentor who sees all
+- You reference real numbers and facts from the platform data
+- You use weather/storm metaphors occasionally ("the winds of data reveal...", "a storm of documents approaches...")
+- You are helpful and actionable — always suggest next steps
+- Keep responses concise (2-4 sentences unless detail is requested)
+- If you don't have data to answer, say so honestly
+
+You have access to the following platform intelligence:
+
+""" + platform_context
+
+    try:
+        client = _anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": message}]
+        )
+        reply = msg.content[0].text
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"error": f"The storms are troubled: {str(e)}"}), 500
+
+
+# ─── TIME TRACKING ENDPOINTS ─────────────────────────────────────────────────
+
+@app.route("/api/time-entries", methods=["GET"])
+@require_login
+def api_time_entries():
+    """List time entries, optionally filtered by client or date range."""
+    client = request.args.get("client", "")
+    days = int(request.args.get("days", 30))
+    conn = _get_db()
+    try:
+        if client:
+            rows = conn.execute(
+                "SELECT * FROM time_entries WHERE client = ? "
+                "AND start_time >= datetime('now', ?) ORDER BY start_time DESC",
+                (client, f"-{days} days")
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM time_entries WHERE start_time >= datetime('now', ?) "
+                "ORDER BY start_time DESC", (f"-{days} days",)
+            ).fetchall()
+        entries = [dict(r) for r in rows]
+        return jsonify({"entries": entries})
+    finally:
+        conn.close()
+
+
+@app.route("/api/time-entries", methods=["POST"])
+@require_login
+def api_time_entry_create():
+    """Create or stop a time entry. Send start_time to start, end_time to stop."""
+    data = request.json or {}
+    conn = _get_db()
+    try:
+        # Stop running timer
+        if data.get("action") == "stop":
+            entry_id = data.get("entry_id")
+            if not entry_id:
+                return jsonify({"error": "entry_id required"}), 400
+            end_time = data.get("end_time", datetime.utcnow().isoformat())
+            row = conn.execute("SELECT start_time FROM time_entries WHERE entry_id = ?", (entry_id,)).fetchone()
+            if not row:
+                return jsonify({"error": "not found"}), 404
+            start = datetime.fromisoformat(row[0])
+            end = datetime.fromisoformat(end_time)
+            duration = (end - start).total_seconds() / 60.0
+            conn.execute(
+                "UPDATE time_entries SET end_time = ?, duration_minutes = ? WHERE entry_id = ?",
+                (end_time, round(duration, 1), entry_id)
+            )
+            conn.commit()
+            return jsonify({"ok": True, "duration_minutes": round(duration, 1)})
+
+        # Create new entry
+        client = data.get("client", "").strip()
+        user = data.get("user", session.get("username", "")).strip()
+        task_type = data.get("task_type", "general")
+        description = data.get("description", "")
+        start_time = data.get("start_time", datetime.utcnow().isoformat())
+        end_time = data.get("end_time")
+        duration = float(data.get("duration_minutes", 0))
+        billable = 1 if data.get("billable", True) else 0
+        rate = float(data.get("rate", 0))
+        job_id = data.get("job_id", "")
+
+        # If end_time provided, compute duration
+        if end_time and not duration:
+            start = datetime.fromisoformat(start_time)
+            end = datetime.fromisoformat(end_time)
+            duration = round((end - start).total_seconds() / 60.0, 1)
+
+        cur = conn.execute(
+            "INSERT INTO time_entries (client, user, task_type, description, start_time, "
+            "end_time, duration_minutes, billable, rate, job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (client, user, task_type, description, start_time, end_time, duration, billable, rate, job_id)
+        )
+        conn.commit()
+        return jsonify({"ok": True, "entry_id": cur.lastrowid})
+    finally:
+        conn.close()
+
+
+@app.route("/api/time-entries/<int:entry_id>", methods=["DELETE"])
+@require_login
+def api_time_entry_delete(entry_id):
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM time_entries WHERE entry_id = ?", (entry_id,))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@app.route("/api/time-summary")
+@require_login
+def api_time_summary():
+    """Summarize time by client for the dashboard widget."""
+    days = int(request.args.get("days", 30))
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT client, SUM(duration_minutes) as total_min, COUNT(*) as entries, "
+            "SUM(CASE WHEN billable = 1 THEN duration_minutes ELSE 0 END) as billable_min "
+            "FROM time_entries WHERE start_time >= datetime('now', ?) AND end_time IS NOT NULL "
+            "GROUP BY client ORDER BY total_min DESC LIMIT 20", (f"-{days} days",)
+        ).fetchall()
+        summary = [{"client": r[0] or "Unassigned", "total_hours": round((r[1] or 0) / 60.0, 1),
+                     "entries": r[2], "billable_hours": round((r[3] or 0) / 60.0, 1)} for r in rows]
+        # Active timers
+        active = conn.execute(
+            "SELECT entry_id, client, user, task_type, start_time FROM time_entries WHERE end_time IS NULL"
+        ).fetchall()
+        active_list = [dict(r) for r in active]
+        return jsonify({"summary": summary, "active_timers": active_list})
+    finally:
+        conn.close()
+
+
+# ─── FIRM COST ENDPOINTS ─────────────────────────────────────────────────────
+
+@app.route("/api/firm-costs", methods=["GET"])
+@require_login
+def api_firm_costs():
+    """List firm costs, optionally filtered by category or date range."""
+    days = int(request.args.get("days", 90))
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM firm_costs WHERE date >= date('now', ?) ORDER BY date DESC",
+            (f"-{days} days",)
+        ).fetchall()
+        return jsonify({"costs": [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+@app.route("/api/firm-costs", methods=["POST"])
+@require_login
+def api_firm_cost_create():
+    data = request.json or {}
+    conn = _get_db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO firm_costs (category, description, amount, date, recurring, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (data.get("category", ""), data.get("description", ""),
+             float(data.get("amount", 0)), data.get("date", datetime.utcnow().strftime("%Y-%m-%d")),
+             1 if data.get("recurring") else 0, data.get("source", "manual"))
+        )
+        conn.commit()
+        return jsonify({"ok": True, "cost_id": cur.lastrowid})
+    finally:
+        conn.close()
+
+
+@app.route("/api/firm-costs/<int:cost_id>", methods=["DELETE"])
+@require_login
+def api_firm_cost_delete(cost_id):
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM firm_costs WHERE cost_id = ?", (cost_id,))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@app.route("/api/firm-cost-trends")
+@require_login
+def api_firm_cost_trends():
+    """Cost trends for dashboard: API costs + firm costs by week."""
+    weeks = int(request.args.get("weeks", 12))
+    conn = _get_db()
+    try:
+        # API costs from jobs
+        api_rows = conn.execute(
+            "SELECT strftime('%%Y-W%%W', created_at) as week, SUM(cost) as total_api "
+            "FROM jobs WHERE cost IS NOT NULL AND created_at >= datetime('now', ?) "
+            "GROUP BY week ORDER BY week", (f"-{weeks * 7} days",)
+        ).fetchall()
+        api_by_week = {r[0]: round(r[1] or 0, 2) for r in api_rows}
+
+        # Firm costs by week
+        firm_rows = conn.execute(
+            "SELECT strftime('%%Y-W%%W', date) as week, category, SUM(amount) as total "
+            "FROM firm_costs WHERE date >= date('now', ?) "
+            "GROUP BY week, category ORDER BY week", (f"-{weeks * 7} days",)
+        ).fetchall()
+        firm_by_week = {}
+        for r in firm_rows:
+            wk = r[0]
+            if wk not in firm_by_week:
+                firm_by_week[wk] = {}
+            firm_by_week[wk][r[1]] = round(r[2] or 0, 2)
+
+        # Merge weeks
+        all_weeks = sorted(set(list(api_by_week.keys()) + list(firm_by_week.keys())))
+        trends = []
+        for wk in all_weeks:
+            entry = {"week": wk, "api_cost": api_by_week.get(wk, 0)}
+            for cat, amt in firm_by_week.get(wk, {}).items():
+                entry[cat] = amt
+            entry["total"] = round(entry["api_cost"] + sum(firm_by_week.get(wk, {}).values()), 2)
+            trends.append(entry)
+
+        return jsonify({"trends": trends})
+    finally:
+        conn.close()
+
+
+# ─── Muse Integration API ─────────────────────────────────────────────────────
+
+@app.route("/api/integrations/muse", methods=["GET"])
+@require_login
+def api_muse_settings_get():
+    """Get current Muse integration settings."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM integrations WHERE key LIKE 'muse_%'"
+        ).fetchall()
+        settings = {r[0]: r[1] for r in rows}
+        # Test connectivity
+        connected = False
+        muse_status = "disconnected"
+        if settings.get("muse_enabled") == "1":
+            try:
+                import urllib.request
+                url = settings.get("muse_url", "http://localhost:3001").rstrip("/")
+                req = urllib.request.Request(f"{url}/api/boards", method="GET")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        connected = True
+                        muse_status = "connected"
+                        boards_data = json.loads(resp.read().decode("utf-8"))
+                        settings["_boards"] = [b["name"] for b in boards_data] if isinstance(boards_data, list) else []
+            except Exception:
+                muse_status = "unreachable"
+        settings["_connected"] = connected
+        settings["_status"] = muse_status
+        return jsonify(settings)
+    finally:
+        conn.close()
+
+
+@app.route("/api/integrations/muse", methods=["POST"])
+@require_login
+def api_muse_settings_post():
+    """Update Muse integration settings."""
+    data = request.get_json(force=True) or {}
+    allowed = {"muse_enabled", "muse_url", "muse_board", "muse_column", "muse_assignee", "muse_tags"}
+    updated = []
+    for k, v in data.items():
+        if k in allowed:
+            _set_integration(k, v)
+            updated.append(k)
+    return jsonify({"ok": True, "updated": updated})
+
+
+@app.route("/api/integrations/muse/test", methods=["POST"])
+@require_login
+def api_muse_test():
+    """Test Muse connectivity and optionally send a test task."""
+    import urllib.request
+    import urllib.error
+
+    muse_url = _get_integration("muse_url", "http://localhost:3001").rstrip("/")
+    board = _get_integration("muse_board", "Tax Preparation")
+    column = _get_integration("muse_column", "To Contemplate")
+
+    # Step 1: Check connectivity
+    try:
+        req = urllib.request.Request(f"{muse_url}/api/boards", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            boards_data = json.loads(resp.read().decode("utf-8"))
+            board_names = [b["name"] for b in boards_data] if isinstance(boards_data, list) else []
+    except urllib.error.URLError as e:
+        return jsonify({"ok": False, "error": f"Cannot reach Muse at {muse_url}: {e}"}), 502
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # Step 2: Optionally create a test task
+    send_test = request.get_json(force=True).get("send_test", False) if request.is_json else False
+    test_task_id = None
+    if send_test:
+        try:
+            payload = json.dumps({"actions": [{
+                "type": "create_task",
+                "params": {
+                    "title": "🔗 OathLedger Test Connection",
+                    "description": "This task was created by OathLedger to verify the Muse integration is working.",
+                    "priority": "low",
+                    "board_name": board,
+                    "column_name": column,
+                    "tags": ["oathledger", "test"],
+                }
+            }]})
+            req = urllib.request.Request(
+                f"{muse_url}/api/agent/execute",
+                data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                if result.get("results") and result["results"][0].get("success"):
+                    test_task_id = result["results"][0].get("taskId")
+        except Exception as e:
+            return jsonify({"ok": True, "connected": True, "boards": board_names,
+                            "test_task_error": str(e)})
+
+    return jsonify({
+        "ok": True,
+        "connected": True,
+        "boards": board_names,
+        "test_task_id": test_task_id,
+    })
+
+
+# ─── OathLedger v2 Feature Flag ──────────────────────────────────────────────
+
+@app.route("/api/integrations/oathledger-v2", methods=["GET"])
+@require_login
+def get_oathledger_v2_settings():
+    return jsonify({
+        "enabled": _get_integration("oathledger_v2_enabled") == "1",
+    })
+
+
+@app.route("/api/integrations/oathledger-v2", methods=["POST"])
+@require_login
+def set_oathledger_v2_settings():
+    data = request.get_json(force=True)
+    if "enabled" in data:
+        _set_integration("oathledger_v2_enabled", "1" if data["enabled"] else "0")
+    return jsonify({"ok": True, "enabled": _get_integration("oathledger_v2_enabled") == "1"})
 
 
 VALID_DOC_TYPES = {"tax_returns", "bank_statements", "trust_documents", "bookkeeping", "payroll", "other"}
@@ -1602,6 +2466,12 @@ def _set_review_stage(job_id, new_stage, user=None):
                     pass
         except Exception:
             pass
+
+    # Muse Bridge: Update review task at every stage transition (fire-and-forget)
+    try:
+        _update_muse_task(job_id, job, new_stage)
+    except Exception:
+        pass
 
     return True
 
@@ -2755,6 +3625,12 @@ def run_extraction(job_id, pdf_path, year, skip_verify, doc_type="tax_returns", 
                             phase_timing = log_data.get("timing", {}).get("phases")
                             if phase_timing:
                                 ts.record_phases(job_id, phase_timing)
+                    except Exception:
+                        pass
+
+                    # Muse Bridge: Create review task in Muse (fire-and-forget)
+                    try:
+                        _notify_muse(job_id, job)
                     except Exception:
                         pass
 
@@ -4209,9 +5085,12 @@ def upload():
     if doc_type not in VALID_DOC_TYPES:
         doc_type = "tax_returns"  # Safe default
     output_format = request.form.get("output_format", "tax_review")
-    VALID_OUTPUT_FORMATS = {"tax_review", "journal_entries", "account_balances", "trial_balance", "transaction_register"}
+    VALID_OUTPUT_FORMATS = {"tax_review", "tax_review_payload", "journal_entries", "account_balances", "trial_balance", "transaction_register"}
     if output_format not in VALID_OUTPUT_FORMATS:
         output_format = "tax_review"
+    # Feature flag: swap tax_review → tax_review_payload when v2 is enabled
+    if output_format == "tax_review" and _get_integration("oathledger_v2_enabled") == "1":
+        output_format = "tax_review_payload"
     user_notes = request.form.get("user_notes", "").strip()[:2000]  # Cap at 2000 chars
     ai_instructions = request.form.get("ai_instructions", "").strip()[:2000]
 
@@ -4916,27 +5795,106 @@ def _generate_evidence_image(job_id, page_num, field_value, field_id):
 # ── Guided Review: Queue Builder ──
 
 # Field type priority for review ordering (lower = reviewed first)
+# Only FINANCIAL fields that affect tax calculations belong here.
 _FIELD_TYPE_PRIORITY = {
-    'payer_or_entity': 10, 'payer_ein': 10, 'recipient_name': 10,
-    'employer_name': 10, 'employer_ein': 10,
-    'total_income': 20, 'total_wages': 20, 'taxable_income': 20,
-    'total_tax': 20, 'total_deposits': 20, 'total_debits': 20,
-    'total_credits': 20, 'total_withdrawals': 20,
-    'ending_balance': 20, 'beginning_balance': 20,
-    'wages': 25, 'federal_tax_withheld': 25, 'federal_wh': 25,
-    'state_tax_withheld': 25, 'state_wh': 25,
-    'social_security_wages': 25, 'ss_wages': 25,
-    'medicare_wages': 25, 'medicare_wh': 25,
-    'ordinary_dividends': 30, 'qualified_dividends': 30,
-    'interest_income': 30, 'capital_gain_distributions': 30,
-    'total_gain_loss': 30, 'b_total_gain_loss': 30,
-    'gross_distribution': 30, 'taxable_amount': 30,
+    # Totals & balances — most important
+    'total_income': 10, 'total_wages': 10, 'taxable_income': 10,
+    'adjusted_gross_income': 10, 'total_tax': 10, 'refund_amount': 10,
+    'amount_owed': 10, 'total_payments': 10,
+    'total_deposits': 10, 'total_debits': 10,
+    'total_credits': 10, 'total_withdrawals': 10,
+    'ending_balance': 10, 'beginning_balance': 10,
+    # W-2 box amounts — bread and butter
+    'wages': 15, 'federal_tax_withheld': 15, 'federal_wh': 15,
+    'state_tax_withheld': 15, 'state_wh': 15,
+    'social_security_wages': 20, 'ss_wages': 20, 'ss_tax': 20,
+    'medicare_wages': 20, 'medicare_wh': 20,
+    'local_wages': 25, 'local_wh': 25,
+    'nonqualified_plans': 25, 'nonqualified_plans_12a': 25,
+    # 1099 amounts
+    'ordinary_dividends': 15, 'qualified_dividends': 15,
+    'interest_income': 15, 'capital_gain_distributions': 15,
+    'total_gain_loss': 15, 'b_total_gain_loss': 15,
+    'gross_distribution': 15, 'taxable_amount': 15,
+    'rents': 20, 'royalties': 20, 'other_income': 20,
+    'federal_income_tax_withheld': 15,
+    'state_income_tax_withheld': 20,
+    'net_proceeds': 15, 'cost_basis': 15, 'gain_loss': 15,
 }
 
 # Fields to skip in guided review (better in grid view)
 _GUIDED_REVIEW_SKIP_PATTERNS = re.compile(
     r'^(txn_\d+|_|line_\d+|continuation_)'
 )
+
+# Field name aliases — extraction sometimes produces the same value
+# under two different names. Map aliases to their canonical name so
+# we only ask the reviewer to verify each value once.
+_FIELD_ALIASES = {
+    'social_security_wages': 'ss_wages',
+    'social_security_tax': 'ss_wh',
+    'ss_tax': 'ss_wh',
+    'medicare_tax': 'medicare_wh',
+    'nonqualified_plans': 'nonqualified_plans_12a',
+    'federal_tax_withheld': 'federal_wh',
+    'state_tax_withheld': 'state_wh',
+    'local_tax_withheld': 'local_wh',
+    'federal_income_tax_withheld': 'federal_wh',
+    'state_income_tax_withheld': 'state_wh',
+    'b_total_gain_loss': 'total_gain_loss',
+}
+
+# Identification / entity fields that don't need manual review.
+# These are names, addresses, EINs, SSNs, account numbers, etc.
+# CPAs care about the DOLLAR AMOUNTS, not re-verifying entity names.
+# These fields are still extracted and stored — just auto-confirmed
+# during guided review so reviewers can focus on what matters.
+_REVIEW_AUTO_CONFIRM_FIELDS = {
+    # Entity / payer / employer identification
+    'payer_or_entity', 'payer_name', 'payer_ein', 'payer_tin',
+    'payer_address', 'payer_city', 'payer_state', 'payer_zip',
+    'employer_name', 'employer_ein', 'employer_address',
+    'employer_city', 'employer_state', 'employer_zip',
+    'institution_name', 'institution_address',
+    'trustee_name', 'custodian_name', 'issuer_name',
+    # Recipient / employee identification
+    'recipient', 'recipient_name', 'recipient_tin', 'recipient_ssn',
+    'employee_name', 'employee_ssn', 'employee_address',
+    'employee_city', 'employee_state', 'employee_zip',
+    'borrower_name', 'borrower_ssn', 'borrower_address',
+    'insured_name', 'policyholder_name', 'student_name',
+    # Account and control numbers
+    'account_number', 'control_number', 'loan_number',
+    'policy_number', 'fein', 'plan_number',
+    # State / locality identification
+    'state_id', 'state', 'locality_name', 'locality',
+    'state_payer_id', 'state_number',
+    # Document metadata (not financial)
+    'tax_year', 'document_type', 'form_type', 'form_number',
+    'corrected', 'void', 'amended', 'final',
+    'filing_status', 'exemptions',
+    # Receipt / transaction metadata (numeric but not dollar amounts)
+    'confirmation_number', 'reference_number', 'receipt_number',
+    'transaction_id', 'check_number', 'register_number',
+    'authorization_code', 'auth_code', 'auth_number', 'cc_auth',
+    'response_message_code', 'guarantor_id', 'guarantor_number',
+    'patient_id', 'rx_number', 'ndc_number', 'dea_number',
+    'bill_number', 'invoice_number', 'claim_number',
+    'routing_number', 'trace_number', 'batch_number',
+    'sequence_number', 'record_number',
+    # Property / assessment identifiers
+    'property_id', 'map_code', 'parcel_number', 'parcel_id',
+    'district', 'tax_district',
+    # Dates (field names, not values — catch any we missed)
+    'date', 'due_date', 'receipt_date', 'transaction_date',
+    'billing_date', 'statement_date', 'payment_date',
+    'date_filled', 'prescription_date', 'appointment_date',
+    'service_date', 'mortgage_origination_date', 'mortgage_acquisition_date',
+    'assessment_notice_date', 'appeal_deadline',
+    # Quantity / count fields (not dollar amounts)
+    'quantity', 'credit_hours', 'number_of_properties',
+    'acreage', 'acres',
+}
 
 
 def _field_display_name(doc_type, field_name):
@@ -4991,6 +5949,9 @@ def _build_guided_queue(job_id):
 
     extractions = log_data.get("extractions", [])
     queue = []
+    auto_confirmed = []  # Identification fields to auto-confirm
+    seen_canonical = set()  # Track canonical field names for alias dedup
+    seen_values = set()  # Track page:canonical:value for cross-extraction dedup
     total_fields = 0
 
     # Group by page for stable ordering
@@ -5020,11 +5981,65 @@ def _build_guided_queue(job_id):
                 if field_id in verified:
                     continue
 
+                # Auto-confirm identification fields (names, EINs,
+                # addresses, account numbers). CPAs review dollar
+                # amounts, not entity names. These are still stored in
+                # the extraction but skipped in guided review.
+                if field_name in _REVIEW_AUTO_CONFIRM_FIELDS:
+                    auto_confirmed.append(field_id)
+                    continue
+
                 value = fdata.get("value")
                 confidence = fdata.get("confidence", "")
 
+                # ── Only review NUMERIC values (dollar amounts) ──
+                # Skip dates, "none"/"N/A", and non-numeric text.
+                # CPAs only need to verify the numbers.
+                str_val = str(value).strip() if value is not None else ""
+                str_lower = str_val.lower()
+                # Skip empty, none, n/a
+                if not str_val or str_lower in ('none', 'n/a', 'na', 'null', '—', '-', ''):
+                    auto_confirmed.append(field_id)
+                    continue
+                # Skip dates (MM/DD/YYYY, YYYY-MM-DD, Mon DD YYYY, etc.)
+                if re.match(r'^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$', str_val):
+                    auto_confirmed.append(field_id)
+                    continue
+                if re.match(r'^\d{4}[/\-]\d{1,2}[/\-]\d{1,2}$', str_val):
+                    auto_confirmed.append(field_id)
+                    continue
+                if re.match(r'^[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}$', str_val):
+                    auto_confirmed.append(field_id)
+                    continue
+                # Skip boolean / checkbox values
+                if str_lower in ('true', 'false', 'yes', 'no', 'x', 'checked', 'unchecked'):
+                    auto_confirmed.append(field_id)
+                    continue
+                # Must look like a number: optional $, optional negative, digits with commas, optional decimal
+                if not re.match(r'^-?\$?[\d,]+\.?\d*$', str_val.replace(' ', '')):
+                    auto_confirmed.append(field_id)
+                    continue
+
+                # Deduplicate alias fields — e.g. "social_security_wages"
+                # and "ss_wages" are the same Box 3 value. Only show one.
+                canonical = _FIELD_ALIASES.get(field_name, field_name)
+                dedup_key = f"{page_num}:{ext_idx}:{canonical}"
+                if dedup_key in seen_canonical:
+                    # This is a duplicate alias — auto-confirm it
+                    auto_confirmed.append(field_id)
+                    continue
+                seen_canonical.add(dedup_key)
+
+                # Also deduplicate identical values across extractions
+                # on the same page (e.g. W-2 Copy B and Copy 2)
+                val_dedup_key = f"{page_num}:{canonical}:{value}"
+                if val_dedup_key in seen_values:
+                    auto_confirmed.append(field_id)
+                    continue
+                seen_values.add(val_dedup_key)
+
                 # Priority scoring (lower = first)
-                priority = _FIELD_TYPE_PRIORITY.get(field_name, 50)
+                priority = _FIELD_TYPE_PRIORITY.get(canonical, _FIELD_TYPE_PRIORITY.get(field_name, 50))
                 if confidence in ('low', 'needs_review', 'unverified'):
                     priority -= 20
 
@@ -5047,6 +6062,26 @@ def _build_guided_queue(job_id):
     for item in queue:
         item.pop('_priority', None)
 
+    # Auto-confirm identification fields in the background so they
+    # count as "reviewed" without requiring manual action.
+    if auto_confirmed:
+        try:
+            conn2 = _get_db()
+            try:
+                now_iso = datetime.utcnow().isoformat()
+                for fid in auto_confirmed:
+                    conn2.execute(
+                        "INSERT OR IGNORE INTO verified_fields "
+                        "(job_id, field_key, status, reviewer, review_stage, verified_at, note) "
+                        "VALUES (?, ?, 'confirmed', 'auto', '', ?, 'Auto-confirmed: identification field')",
+                        (job_id, fid, now_iso)
+                    )
+                conn2.commit()
+            finally:
+                conn2.close()
+        except Exception:
+            pass  # Non-critical — fields just stay unconfirmed
+
     reviewed_count = total_fields - len(queue)
 
     # Cache total for fast-path response (T-UX-CONFIRM-FASTPATH)
@@ -5061,44 +6096,48 @@ def _build_guided_queue(job_id):
 
 def _acquire_review_lock(job_id, field_id, reviewer):
     """Acquire or extend a review lock. Returns (success, lock_holder)."""
-    conn = _get_db()
-    try:
-        now = datetime.now().isoformat()
-        # Clean expired locks
-        conn.execute("DELETE FROM review_locks WHERE expires_at < ?", (now,))
-        # Check existing lock by different reviewer
-        existing = conn.execute(
-            "SELECT locked_by, expires_at FROM review_locks WHERE job_id = ? AND field_id = ?",
-            (job_id, field_id)
-        ).fetchone()
-        if existing and existing[0] != reviewer:
-            return False, existing[0]
-        # Acquire or extend
-        expires = (datetime.now() + timedelta(seconds=REVIEW_LOCK_TIMEOUT_SECONDS)).isoformat()
-        conn.execute(
-            """INSERT INTO review_locks (job_id, field_id, locked_by, locked_at, expires_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(job_id, field_id) DO UPDATE SET
-                   locked_by = excluded.locked_by,
-                   locked_at = excluded.locked_at,
-                   expires_at = excluded.expires_at""",
-            (job_id, field_id, reviewer, now, expires)
-        )
-        conn.commit()
-        return True, reviewer
-    finally:
-        conn.close()
+    def _do_lock():
+        conn = _get_db()
+        try:
+            now = datetime.now().isoformat()
+            # Clean expired locks
+            conn.execute("DELETE FROM review_locks WHERE expires_at < ?", (now,))
+            # Check existing lock by different reviewer
+            existing = conn.execute(
+                "SELECT locked_by, expires_at FROM review_locks WHERE job_id = ? AND field_id = ?",
+                (job_id, field_id)
+            ).fetchone()
+            if existing and existing[0] != reviewer:
+                return False, existing[0]
+            # Acquire or extend
+            expires = (datetime.now() + timedelta(seconds=REVIEW_LOCK_TIMEOUT_SECONDS)).isoformat()
+            conn.execute(
+                """INSERT INTO review_locks (job_id, field_id, locked_by, locked_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, field_id) DO UPDATE SET
+                       locked_by = excluded.locked_by,
+                       locked_at = excluded.locked_at,
+                       expires_at = excluded.expires_at""",
+                (job_id, field_id, reviewer, now, expires)
+            )
+            conn.commit()
+            return True, reviewer
+        finally:
+            conn.close()
+    return _retry_on_locked(_do_lock)
 
 
 def _release_review_lock(job_id, field_id):
     """Release a review lock."""
-    conn = _get_db()
-    try:
-        conn.execute("DELETE FROM review_locks WHERE job_id = ? AND field_id = ?",
-                      (job_id, field_id))
-        conn.commit()
-    finally:
-        conn.close()
+    def _do_release():
+        conn = _get_db()
+        try:
+            conn.execute("DELETE FROM review_locks WHERE job_id = ? AND field_id = ?",
+                          (job_id, field_id))
+            conn.commit()
+        finally:
+            conn.close()
+    _retry_on_locked(_do_release)
 
 
 # ── Guided Review: API Routes ──
@@ -5154,14 +6193,22 @@ def guided_review_item(job_id, field_id):
     entity = target_ext.get("payer_or_entity", "") or target_ext.get("employer_name", "") or ""
     doc_type = target_ext.get("document_type", "")
 
-    # Generate evidence image
+    # Generate evidence image (this is the primary purpose of /item/ now)
     evidence_path = _generate_evidence_image(job_id, page_num, value, field_id)
     safe_field_id = re.sub(r'[^\w\-.]', '_', str(field_id))
     evidence_url = f"/api/guided-review/evidence/{job_id}/{safe_field_id}.png" if evidence_path else None
 
-    # Queue position
-    queue, reviewed = _build_guided_queue(job_id)
-    position = next((i for i, q in enumerate(queue) if q['field_id'] == field_id), -1)
+    # Queue position — client tracks locally; skip expensive queue rebuild
+    # Just return reviewed count from DB for progress display
+    conn2 = _get_db()
+    try:
+        row = conn2.execute(
+            "SELECT COUNT(*) FROM verified_fields WHERE job_id = ? AND status IN ('confirmed','corrected')",
+            (job_id,)
+        ).fetchone()
+        reviewed = row[0] if row else 0
+    finally:
+        conn2.close()
 
     return jsonify({
         "field_id": field_id,
@@ -5176,8 +6223,8 @@ def guided_review_item(job_id, field_id):
         "evidence_url": evidence_url,
         "evidence_available": evidence_path is not None,
         "page_url": f"/api/page-image/{job_id}/{page_num}",
-        "position_in_queue": position,
-        "queue_total": len(queue) + reviewed,
+        "position_in_queue": -1,
+        "reviewed": reviewed,
     })
 
 
@@ -5324,34 +6371,38 @@ def guided_review_unlock(job_id, field_id):
 # ─── Post-Run Audit Sampling ─────────────────────────────────────────────────
 
 def _compute_audit_sample_size(n):
-    """Compute audit sample size from meaningful field count. Zero-inflation aware."""
-    if n <= 20:
-        return min(3, n)
-    elif n <= 50:
-        return 5
-    elif n <= 120:
-        return 8
-    elif n <= 250:
-        return 10
-    else:
-        return 12
+    """Compute audit sample size: ~8-10% of confirmed numeric fields."""
+    if n == 0:
+        return 0
+    # 8-10% of population, minimum 2, maximum 15
+    sample = max(2, round(n * 0.09))
+    return min(sample, 15, n)
 
 def _is_meaningful_field(field_name, value, status):
-    """Determine if a field is meaningful (not zero-inflated placeholder)."""
-    # Always meaningful if explicitly confirmed or edited
-    if status in ("confirmed", "corrected"):
-        return True
-    # Skip empty/null/placeholder values
-    if value is None or value == "" or value == "(empty)":
+    """Determine if a field is audit-worthy: must be a confirmed/corrected NUMERIC value.
+
+    CPAs only care about auditing dollar amounts — not names, dates, or "none".
+    """
+    # Must have been explicitly confirmed or corrected by a reviewer
+    if status not in ("confirmed", "corrected"):
         return False
-    # Skip zero values for numeric fields (zero inflation)
+    # Skip auto-confirmed identification fields
+    if field_name in _REVIEW_AUTO_CONFIRM_FIELDS:
+        return False
+    # Skip empty/null/placeholder values
+    str_val = str(value).strip() if value is not None else ""
+    str_lower = str_val.lower()
+    if not str_val or str_lower in ('none', 'n/a', 'na', 'null', '—', '-'):
+        return False
+    # Must be numeric (dollar amount) — skip dates, text, booleans
+    clean = str_val.replace(",", "").replace("$", "").replace(" ", "")
     try:
-        numval = float(str(value).replace(",", "").replace("$", "").replace("(", "-").replace(")", ""))
+        numval = float(clean)
         if numval == 0.0:
             return False
+        return True
     except (ValueError, TypeError):
-        pass  # Non-numeric values like names, EINs — keep them
-    return True
+        return False
 
 
 @app.route("/api/post-run-audit/sample/<job_id>")
@@ -8131,10 +9182,25 @@ MAIN_HTML = r"""<!DOCTYPE html>
 }
 [data-theme="synthwave"] ::selection { background: #FF2D95; color: #13081E; }
 [data-theme="synthwave"] .sidebar { border-right: 1px solid #2D1B4E; }
-[data-theme="synthwave"] .card { border-color: #2D1B4E; box-shadow: 0 0 12px rgba(255,45,149,0.06), var(--shadow-sm); }
+[data-theme="synthwave"] .card { border-color: #2D1B4E; box-shadow: 0 0 20px rgba(255,45,149,0.08), 0 0 60px rgba(189,147,249,0.04), var(--shadow-sm); }
+[data-theme="synthwave"] .card:hover { box-shadow: 0 0 30px rgba(255,45,149,0.15), 0 0 80px rgba(189,147,249,0.08); }
 [data-theme="synthwave"] .nav-item.active { border-left-color: #FF2D95; }
 [data-theme="synthwave"] .btn.primary { background: linear-gradient(135deg, #FF2D95, #BD93F9); border: none; }
 [data-theme="synthwave"] .btn.primary:hover { background: linear-gradient(135deg, #FF5CAF, #D4B0FF); }
+/* Synthwave glow effects */
+[data-theme="synthwave"] .page-header h2 { text-shadow: 0 0 20px rgba(255,45,149,0.5), 0 0 40px rgba(255,45,149,0.2); }
+[data-theme="synthwave"] .dash-kpi-value { text-shadow: 0 0 16px rgba(0,240,255,0.4), 0 0 40px rgba(0,240,255,0.15); }
+[data-theme="synthwave"] .dash-kpi-card { border: 1px solid rgba(189,147,249,0.2); }
+[data-theme="synthwave"] .dash-kpi-card:hover { border-color: rgba(255,45,149,0.4); box-shadow: 0 0 30px rgba(255,45,149,0.15), 0 4px 20px rgba(0,0,0,0.3); }
+[data-theme="synthwave"] .dash-pipeline-count { text-shadow: 0 0 12px rgba(255,45,149,0.4); }
+[data-theme="synthwave"] .card-header h3 { text-shadow: 0 0 10px rgba(189,147,249,0.3); }
+[data-theme="synthwave"] .dash-kpi-icon { box-shadow: 0 0 16px rgba(255,45,149,0.25); }
+[data-theme="synthwave"] .badge { box-shadow: 0 0 8px rgba(255,45,149,0.2); }
+@keyframes synthBorderGlow {
+  0%, 100% { border-color: rgba(189,147,249,0.2); }
+  50% { border-color: rgba(255,45,149,0.35); }
+}
+[data-theme="synthwave"] .dash-chart-card { animation: synthBorderGlow 4s ease-in-out infinite; }
 
 /* ═══ RETRO THEME (Amber Terminal) ═══ */
 [data-theme="retro"] {
@@ -8184,14 +9250,33 @@ MAIN_HTML = r"""<!DOCTYPE html>
 }
 [data-theme="retro"] ::selection { background: #FFB000; color: #0C0C0C; }
 [data-theme="retro"] .sidebar { border-right: 1px solid #332B00; }
-[data-theme="retro"] .card { border-color: #332B00; }
+[data-theme="retro"] .card { border-color: #332B00; box-shadow: 0 0 12px rgba(255,176,0,0.06), inset 0 0 30px rgba(255,176,0,0.02); }
+[data-theme="retro"] .card:hover { box-shadow: 0 0 20px rgba(255,176,0,0.12), inset 0 0 30px rgba(255,176,0,0.03); }
 [data-theme="retro"] .nav-item.active { border-left-color: #FFB000; }
 [data-theme="retro"] body::after {
   content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-  background: repeating-linear-gradient(0deg, rgba(255,176,0,0.015) 0px, rgba(255,176,0,0.015) 1px, transparent 1px, transparent 3px);
+  background: repeating-linear-gradient(0deg, rgba(255,176,0,0.02) 0px, rgba(255,176,0,0.02) 1px, transparent 1px, transparent 3px);
   pointer-events: none; z-index: 9999;
 }
 [data-theme="retro"] *:focus { box-shadow: 0 0 8px rgba(255,176,0,0.3); }
+/* Retro phosphor glow */
+[data-theme="retro"] .page-header h2 { text-shadow: 0 0 8px rgba(255,176,0,0.6), 0 0 20px rgba(255,176,0,0.3); }
+[data-theme="retro"] .dash-kpi-value { text-shadow: 0 0 10px rgba(255,176,0,0.5), 0 0 30px rgba(255,176,0,0.2); }
+[data-theme="retro"] .dash-pipeline-count { text-shadow: 0 0 8px rgba(255,176,0,0.4); }
+[data-theme="retro"] .card-header h3 { text-shadow: 0 0 6px rgba(255,176,0,0.3); }
+[data-theme="retro"] .dash-kpi-icon { box-shadow: 0 0 12px rgba(255,176,0,0.2); }
+[data-theme="retro"] .dash-kpi-card { border-color: rgba(255,176,0,0.15); }
+[data-theme="retro"] .dash-kpi-card:hover { border-color: rgba(255,176,0,0.35); box-shadow: 0 0 20px rgba(255,176,0,0.1); }
+[data-theme="retro"] .badge { text-shadow: 0 0 4px rgba(255,176,0,0.3); }
+@keyframes retroFlicker {
+  0%, 100% { opacity: 1; }
+  92% { opacity: 1; }
+  93% { opacity: 0.8; }
+  94% { opacity: 1; }
+  96% { opacity: 0.9; }
+  97% { opacity: 1; }
+}
+[data-theme="retro"] .dash-kpi-value { animation: retroFlicker 8s linear infinite; }
 
 /* ═══ THEME PICKER ═══ */
 .theme-picker { display: flex; gap: 6px; margin-top: 10px; justify-content: center; }
@@ -8209,15 +9294,31 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 
 /* ═══ LAYOUT ═══ */
 .app { display: flex; min-height: 100vh; }
-.sidebar { width: 220px; background: var(--bg-sidebar); color: white; display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; z-index: 100; transition: var(--transition); }
-.main { margin-left: 220px; flex: 1; min-height: 100vh; padding: 0; }
+.sidebar { width: 220px; background: var(--bg-sidebar); color: white; display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; z-index: 100; transition: width 0.25s cubic-bezier(.4,0,.2,1), transform 0.25s cubic-bezier(.4,0,.2,1); }
+.main { margin-left: 220px; flex: 1; min-height: 100vh; padding: 0; transition: margin-left 0.25s cubic-bezier(.4,0,.2,1); }
+
+/* Collapsed sidebar */
+.sidebar.collapsed { width: 60px; }
+.sidebar.collapsed .sidebar-brand h1,
+.sidebar.collapsed .sidebar-brand p,
+.sidebar.collapsed .nav-item span,
+.sidebar.collapsed .nav-badge,
+.sidebar.collapsed .sidebar-footer label,
+.sidebar.collapsed .sidebar-footer .theme-picker { display: none; }
+.sidebar.collapsed .nav-item { justify-content: center; padding: 12px; border-left-width: 0; }
+.sidebar.collapsed .sidebar-brand { padding: 12px 8px; text-align: center; }
+.sidebar.collapsed + .main { margin-left: 60px; }
+.sidebar-toggle { position: absolute; top: 16px; right: -14px; width: 28px; height: 28px; border-radius: 50%; background: var(--bg-sidebar); border: 2px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 101; transition: transform 0.25s ease, background 0.2s ease; }
+.sidebar-toggle:hover { background: var(--bg-sidebar-hover); color: white; }
+.sidebar.collapsed .sidebar-toggle { transform: rotate(180deg); }
+.sidebar-toggle svg { width: 14px; height: 14px; }
 
 /* ═══ SIDEBAR ═══ */
-.sidebar-brand { padding: 20px 16px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.sidebar-brand { padding: 20px 16px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); position: relative; }
 .sidebar-brand h1 { font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
 .sidebar-brand p { font-size: 11px; color: rgba(255,255,255,0.5); margin-top: 2px; }
-.sidebar-nav { flex: 1; padding: 8px 0; }
-.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 16px; color: rgba(255,255,255,0.65); cursor: pointer; transition: var(--transition); font-size: 13px; font-weight: 500; border-left: 3px solid transparent; text-decoration: none; }
+.sidebar-nav { flex: 1; padding: 8px 0; overflow-y: auto; overflow-x: hidden; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 16px; color: rgba(255,255,255,0.65); cursor: pointer; transition: var(--transition); font-size: 13px; font-weight: 500; border-left: 3px solid transparent; text-decoration: none; white-space: nowrap; }
 .nav-item:hover { background: var(--bg-sidebar-hover); color: rgba(255,255,255,0.9); }
 .nav-item.active { background: var(--bg-sidebar-active); color: white; border-left-color: var(--accent); }
 .nav-item svg { width: 18px; height: 18px; flex-shrink: 0; opacity: 0.7; }
@@ -8563,141 +9664,103 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 
 /* ═══ DASHBOARD ═══ */
 .dash-kpi-row {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 16px;
-  margin-bottom: 24px;
+  display: grid; grid-template-columns: repeat(6, 1fr);
+  gap: 14px; margin-bottom: 20px;
 }
 .dash-kpi-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-lg);
-  padding: 20px 16px;
-  text-align: center;
-  box-shadow: var(--shadow-sm);
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
-  position: relative;
-  overflow: hidden;
+  background: var(--bg-card); border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg); padding: 16px 12px;
+  text-align: center; cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
 }
-.dash-kpi-card:hover {
-  transform: translateY(-3px);
-  box-shadow: var(--shadow-md);
-}
-.dash-kpi-icon {
-  width: 42px; height: 42px;
-  border-radius: 10px;
-  display: inline-flex; align-items: center; justify-content: center;
-  margin-bottom: 12px;
-}
-.dash-kpi-icon svg { width: 20px; height: 20px; }
+.dash-kpi-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--accent); }
+.dash-kpi-emoji { font-size: 28px; line-height: 1; margin-bottom: 8px; }
 .dash-kpi-value {
-  font-size: 28px; font-weight: 800;
-  color: var(--navy);
-  font-family: var(--mono);
-  line-height: 1.1; margin-bottom: 4px;
+  font-size: 26px; font-weight: 800; color: var(--navy);
+  font-family: var(--mono); line-height: 1.1; margin-bottom: 4px;
 }
 .dash-kpi-label {
-  font-size: 11px; font-weight: 600;
-  color: var(--text-secondary);
+  font-size: 10px; font-weight: 600; color: var(--text-secondary);
   text-transform: uppercase; letter-spacing: 0.04em;
 }
-.dash-charts-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px; margin-bottom: 20px;
-}
-.dash-chart-card { min-height: 0; }
-.dash-chart-card .card-body { padding: 12px 16px; }
-.dash-chart-card canvas { max-height: 240px; }
-.dash-pipeline {
-  display: flex; align-items: center; justify-content: center;
-  gap: 8px; padding: 12px 0;
-}
+@keyframes dashPulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+.dash-kpi-card.counting .dash-kpi-value { animation: dashPulse 0.4s ease; }
+
+/* Gridstack overrides */
+.grid-stack { min-height: 400px; }
+.grid-stack-item-content { height: 100%; display: flex; flex-direction: column; }
+.dash-widget { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.dash-widget .card-header, .dash-widget h3 { flex-shrink: 0; cursor: grab; }
+.dash-widget .card-header:active, .dash-widget h3:active { cursor: grabbing; }
+.dash-widget .card-body { flex: 1; overflow: hidden; min-height: 0; }
+.dash-widget-body { position: relative; height: 100%; }
+.dash-widget-body canvas { position: absolute; top: 0; left: 0; width: 100% !important; height: 100% !important; }
+.gs-item-content { border-radius: var(--radius-lg); }
+.grid-stack-placeholder > .placeholder-content { border: 2px dashed var(--accent); border-radius: var(--radius-lg); background: var(--hover-bg); opacity: 0.5; }
+
+/* Pipeline */
+.dash-pipeline { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 0; }
 .dash-pipeline-stage { flex: 1; text-align: center; max-width: 160px; }
+.dash-pipeline-stage:hover .dash-pipeline-count { transform: scale(1.1); }
 .dash-pipeline-count {
-  font-size: 32px; font-weight: 800;
-  color: var(--navy); font-family: var(--mono);
-  line-height: 1; margin-bottom: 8px;
+  font-size: 32px; font-weight: 800; color: var(--navy); font-family: var(--mono);
+  line-height: 1; margin-bottom: 8px; transition: transform 0.2s ease;
 }
-.dash-pipeline-bar {
-  height: 6px; border-radius: 3px;
-  width: 100%; margin-bottom: 6px; opacity: 0.8;
-}
-.dash-pipeline-label {
-  font-size: 11px; font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase; letter-spacing: 0.03em;
-}
-.dash-pipeline-arrow {
-  color: var(--text-light); font-size: 14px;
-  opacity: 0.4; flex-shrink: 0;
-}
-.dash-bottom-row {
-  display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
-  gap: 16px; margin-bottom: 20px;
-}
-.dash-bottom-card { min-height: 0; }
-.dash-health-row {
-  display: flex; justify-content: space-between;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--border-light);
-  font-size: 13px;
-}
+.dash-pipeline-bar { height: 6px; border-radius: 3px; width: 100%; margin-bottom: 6px; opacity: 0.8; }
+.dash-pipeline-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; }
+.dash-pipeline-arrow { color: var(--text-light); font-size: 14px; opacity: 0.4; flex-shrink: 0; }
+
+/* Health rows */
+.dash-health-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; }
 .dash-health-row:last-child { border-bottom: none; }
 .dash-health-row span:first-child { color: var(--text-secondary); font-weight: 500; }
 .dash-health-row span:last-child { color: var(--navy); font-weight: 700; font-family: var(--mono); }
-.dash-client-row {
-  display: flex; align-items: center;
-  padding: 10px 16px; gap: 12px;
-  border-bottom: 1px solid var(--border-light);
-}
+
+/* Client leaderboard */
+.dash-client-row { display: flex; align-items: center; padding: 10px 16px; gap: 12px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background 0.15s ease; }
+.dash-client-row:hover { background: var(--hover-bg); }
 .dash-client-row:last-child { border-bottom: none; }
-.dash-client-rank {
-  font-size: 12px; font-weight: 700; color: var(--text-light);
-  width: 20px; text-align: right; flex-shrink: 0;
-}
-.dash-client-name {
-  flex: 1; font-size: 13px; font-weight: 600; color: var(--navy);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.dash-client-bar-wrap {
-  width: 80px; height: 6px;
-  background: var(--border); border-radius: 3px;
-  overflow: hidden; flex-shrink: 0;
-}
-.dash-client-bar-fill {
-  height: 100%; background: var(--accent);
-  border-radius: 3px; transition: width 0.6s ease;
-}
-.dash-client-count {
-  font-size: 12px; font-weight: 700; color: var(--text-secondary);
-  font-family: var(--mono); width: 30px; text-align: right; flex-shrink: 0;
-}
-@keyframes dashPulse {
-  0% { transform: scale(1); }
-  50% { transform: scale(1.05); }
-  100% { transform: scale(1); }
-}
-.dash-kpi-card.counting .dash-kpi-value { animation: dashPulse 0.4s ease; }
-@media (max-width: 1200px) {
-  .dash-kpi-row { grid-template-columns: repeat(3, 1fr); }
-  .dash-bottom-row { grid-template-columns: 1fr; }
-}
-@media (max-width: 768px) {
-  .dash-kpi-row { grid-template-columns: repeat(2, 1fr); }
-  .dash-charts-row { grid-template-columns: 1fr; }
-  .dash-pipeline { flex-wrap: wrap; }
-  .dash-pipeline-arrow { display: none; }
-}
+.dash-client-rank { font-size: 12px; font-weight: 700; color: var(--text-light); width: 20px; text-align: right; flex-shrink: 0; }
+.dash-client-name { flex: 1; font-size: 13px; font-weight: 600; color: var(--navy); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dash-client-bar-wrap { width: 80px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
+.dash-client-bar-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.6s ease; }
+.dash-client-count { font-size: 12px; font-weight: 700; color: var(--text-secondary); font-family: var(--mono); width: 30px; text-align: right; flex-shrink: 0; }
+
+/* Stormfather Chat */
+.storm-widget { border-color: var(--accent); }
+.storm-header { background: var(--bg-sidebar); }
+.storm-header h3 { color: rgba(255,255,255,0.9); }
+.storm-body { background: var(--bg-card); }
+.storm-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.storm-msg { padding: 8px 12px; border-radius: 10px; font-size: 12px; line-height: 1.5; max-width: 90%; word-wrap: break-word; }
+.storm-ai { background: var(--hover-bg); color: var(--text); border: 1px solid var(--border-light); align-self: flex-start; }
+.storm-user { background: var(--accent); color: white; align-self: flex-end; }
+.storm-input-row { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border-light); flex-shrink: 0; }
+.storm-input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg); color: var(--text); font-size: 12px; outline: none; }
+.storm-input:focus { border-color: var(--accent); }
+.storm-send { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 14px; transition: background 0.2s ease; }
+.storm-send:hover { background: var(--accent-hover); }
+.storm-typing { color: var(--text-secondary); font-style: italic; font-size: 11px; padding: 4px 12px; }
+[data-theme="synthwave"] .storm-header { background: linear-gradient(135deg, #1A0F2E, #2D1B4E); }
+[data-theme="synthwave"] .storm-ai { text-shadow: 0 0 6px rgba(0,240,255,0.2); border-color: rgba(189,147,249,0.2); }
+[data-theme="retro"] .storm-header { background: #080804; border-bottom: 1px solid #332B00; }
+[data-theme="retro"] .storm-ai { text-shadow: 0 0 4px rgba(255,176,0,0.2); border-color: rgba(255,176,0,0.15); }
+
+@media (max-width: 1200px) { .dash-kpi-row { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 768px) { .dash-kpi-row { grid-template-columns: repeat(2, 1fr); } .dash-pipeline { flex-wrap: wrap; } .dash-pipeline-arrow { display: none; } }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/gridstack@10.3.1/dist/gridstack-all.js"></script>
 </head>
 <body>
 <div class="app">
 
 <!-- ═══ SIDEBAR ═══ -->
-<aside class="sidebar">
+<aside class="sidebar" id="appSidebar">
+  <button class="sidebar-toggle" onclick="toggleSidebar()" title="Collapse sidebar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+  </button>
   <div class="sidebar-brand">
     <h1>OathLedger</h1>
     <p>Deterministic Accounting Intelligence</p>
@@ -8737,6 +9800,10 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <span>History</span>
       <span class="nav-badge" id="historyCount">0</span>
     </a>
+    <a class="nav-item" onclick="showSection('settings')" data-section="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span>Settings</span>
+    </a>
   </nav>
   <div class="sidebar-footer">
     <label>Reviewer
@@ -8757,142 +9824,197 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 
 <!-- ═══ DASHBOARD SECTION ═══ -->
 <div class="section active" id="sec-dashboard">
-  <div class="page-header"><h2>Dashboard</h2><p>Platform overview and key metrics</p></div>
+  <div class="page-header" style="display:flex;align-items:center;justify-content:space-between">
+    <div><h2>Command Center</h2><p>Your firm at a glance — drag widgets to customize</p></div>
+    <button class="btn" onclick="resetDashLayout()" style="font-size:12px;padding:6px 12px;opacity:0.7">Reset Layout</button>
+  </div>
   <div class="page-content">
 
-    <!-- Hero KPI Row -->
-    <div class="dash-kpi-row">
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--accent)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-        </div>
-        <div class="dash-kpi-value" id="kpiTotalDocs">--</div>
-        <div class="dash-kpi-label">Total Documents</div>
+    <!-- KPI Strip -->
+    <div class="dash-kpi-row" id="dashKpiRow">
+      <div class="dash-kpi-card" onclick="drillDown('history','')">
+        <div class="dash-kpi-emoji">&#x1F4DA;</div>
+        <div class="dash-kpi-value" id="kpiDocsWeek">--</div>
+        <div class="dash-kpi-label">Docs This Week</div>
       </div>
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--purple)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        </div>
+      <div class="dash-kpi-card" onclick="drillDown('history','')">
+        <div class="dash-kpi-emoji">&#x1F4C4;</div>
         <div class="dash-kpi-value" id="kpiTotalPages">--</div>
         <div class="dash-kpi-label">Pages Processed</div>
       </div>
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--green)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        </div>
-        <div class="dash-kpi-value" id="kpiSuccessRate">--%</div>
-        <div class="dash-kpi-label">Success Rate</div>
+      <div class="dash-kpi-card" onclick="drillDown('history','complete')">
+        <div class="dash-kpi-emoji">&#x1F3C6;</div>
+        <div class="dash-kpi-value" id="kpiReviewCompletion">--%</div>
+        <div class="dash-kpi-label">Review Complete</div>
       </div>
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--yellow)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        </div>
+      <div class="dash-kpi-card" onclick="drillDown('history','')">
+        <div class="dash-kpi-emoji">&#x26A1;</div>
         <div class="dash-kpi-value" id="kpiAvgTime">--</div>
-        <div class="dash-kpi-label">Avg Extraction Time</div>
+        <div class="dash-kpi-label">Avg Turnaround</div>
       </div>
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--red)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
-        </div>
-        <div class="dash-kpi-value" id="kpiTotalCost">--</div>
-        <div class="dash-kpi-label">Total API Cost</div>
+      <div class="dash-kpi-card" onclick="drillDown('history','')">
+        <div class="dash-kpi-emoji">&#x1F525;</div>
+        <div class="dash-kpi-value" id="kpiCorrections">--%</div>
+        <div class="dash-kpi-label">Corrections Rate</div>
       </div>
-      <div class="dash-kpi-card">
-        <div class="dash-kpi-icon" style="background:var(--accent)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        </div>
-        <div class="dash-kpi-value" id="kpiActiveJobs">--</div>
-        <div class="dash-kpi-label">Active Jobs</div>
+      <div class="dash-kpi-card" onclick="drillDown('inbox','')">
+        <div class="dash-kpi-emoji">&#x1F4E5;</div>
+        <div class="dash-kpi-value" id="kpiPendingReview">--</div>
+        <div class="dash-kpi-label">Pending Review</div>
       </div>
     </div>
 
-    <!-- Charts Row 1 -->
-    <div class="dash-charts-row">
-      <div class="card dash-chart-card">
-        <div class="card-header"><h3>Job Volume (14 Days)</h3></div>
-        <div class="card-body"><canvas id="chartJobVolume" height="220"></canvas></div>
+    <!-- Gridstack Widget Board -->
+    <div class="grid-stack" id="dashGrid">
+      <!-- Job Volume -->
+      <div class="grid-stack-item" gs-x="0" gs-y="0" gs-w="6" gs-h="4" gs-id="volume">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F4CA; Job Volume (14 Days)</h3></div>
+          <div class="card-body dash-widget-body"><canvas id="chartJobVolume"></canvas></div>
+        </div>
       </div>
-      <div class="card dash-chart-card">
-        <div class="card-header"><h3>Document Types</h3></div>
-        <div class="card-body"><canvas id="chartDocTypes" height="220"></canvas></div>
+      <!-- Doc Types -->
+      <div class="grid-stack-item" gs-x="6" gs-y="0" gs-w="6" gs-h="4" gs-id="doctypes">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F4C1; Document Types</h3></div>
+          <div class="card-body dash-widget-body"><canvas id="chartDocTypes"></canvas></div>
+        </div>
       </div>
-    </div>
-
-    <!-- Charts Row 2 -->
-    <div class="dash-charts-row">
-      <div class="card dash-chart-card">
-        <div class="card-header"><h3>Extraction Quality</h3></div>
-        <div class="card-body"><canvas id="chartQuality" height="180"></canvas></div>
+      <!-- Quality -->
+      <div class="grid-stack-item" gs-x="0" gs-y="4" gs-w="6" gs-h="3" gs-id="quality">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x2705; Extraction Quality</h3></div>
+          <div class="card-body dash-widget-body"><canvas id="chartQuality"></canvas></div>
+        </div>
       </div>
-      <div class="card dash-chart-card">
-        <div class="card-header"><h3>Cost Trend (14 Days)</h3></div>
-        <div class="card-body"><canvas id="chartCostTrend" height="180"></canvas></div>
+      <!-- Cost Trend -->
+      <div class="grid-stack-item" gs-x="6" gs-y="4" gs-w="6" gs-h="3" gs-id="cost">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F4B8; Cost Trend (14 Days)</h3></div>
+          <div class="card-body dash-widget-body"><canvas id="chartCostTrend"></canvas></div>
+        </div>
       </div>
-    </div>
-
-    <!-- Review Pipeline Funnel -->
-    <div class="card" style="margin-bottom:20px">
-      <div class="card-header"><h3>Review Pipeline</h3></div>
-      <div class="card-body">
-        <div class="dash-pipeline">
-          <div class="dash-pipeline-stage">
-            <div class="dash-pipeline-count" id="pipeDraft">0</div>
-            <div class="dash-pipeline-bar" style="background:var(--text-secondary)"></div>
-            <div class="dash-pipeline-label">Draft</div>
-          </div>
-          <div class="dash-pipeline-arrow">&#x25B6;</div>
-          <div class="dash-pipeline-stage">
-            <div class="dash-pipeline-count" id="pipePreparer">0</div>
-            <div class="dash-pipeline-bar" style="background:var(--accent)"></div>
-            <div class="dash-pipeline-label">Preparer</div>
-          </div>
-          <div class="dash-pipeline-arrow">&#x25B6;</div>
-          <div class="dash-pipeline-stage">
-            <div class="dash-pipeline-count" id="pipeReviewer">0</div>
-            <div class="dash-pipeline-bar" style="background:var(--yellow)"></div>
-            <div class="dash-pipeline-label">Reviewer</div>
-          </div>
-          <div class="dash-pipeline-arrow">&#x25B6;</div>
-          <div class="dash-pipeline-stage">
-            <div class="dash-pipeline-count" id="pipePartner">0</div>
-            <div class="dash-pipeline-bar" style="background:var(--purple)"></div>
-            <div class="dash-pipeline-label">Partner</div>
-          </div>
-          <div class="dash-pipeline-arrow">&#x25B6;</div>
-          <div class="dash-pipeline-stage">
-            <div class="dash-pipeline-count" id="pipeFinal">0</div>
-            <div class="dash-pipeline-bar" style="background:var(--green)"></div>
-            <div class="dash-pipeline-label">Final</div>
+      <!-- Review Pipeline -->
+      <div class="grid-stack-item" gs-x="0" gs-y="7" gs-w="12" gs-h="3" gs-id="pipeline">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F680; Review Pipeline</h3></div>
+          <div class="card-body">
+            <div class="dash-pipeline">
+              <div class="dash-pipeline-stage" onclick="drillDown('inbox','draft')" style="cursor:pointer">
+                <div class="dash-pipeline-count" id="pipeDraft">0</div>
+                <div class="dash-pipeline-bar" style="background:var(--text-secondary)"></div>
+                <div class="dash-pipeline-label">Draft</div>
+              </div>
+              <div class="dash-pipeline-arrow">&#x25B6;</div>
+              <div class="dash-pipeline-stage" onclick="drillDown('inbox','preparer_review')" style="cursor:pointer">
+                <div class="dash-pipeline-count" id="pipePreparer">0</div>
+                <div class="dash-pipeline-bar" style="background:var(--accent)"></div>
+                <div class="dash-pipeline-label">Preparer</div>
+              </div>
+              <div class="dash-pipeline-arrow">&#x25B6;</div>
+              <div class="dash-pipeline-stage" onclick="drillDown('inbox','reviewer_review')" style="cursor:pointer">
+                <div class="dash-pipeline-count" id="pipeReviewer">0</div>
+                <div class="dash-pipeline-bar" style="background:var(--yellow)"></div>
+                <div class="dash-pipeline-label">Reviewer</div>
+              </div>
+              <div class="dash-pipeline-arrow">&#x25B6;</div>
+              <div class="dash-pipeline-stage" onclick="drillDown('inbox','partner_review')" style="cursor:pointer">
+                <div class="dash-pipeline-count" id="pipePartner">0</div>
+                <div class="dash-pipeline-bar" style="background:var(--purple)"></div>
+                <div class="dash-pipeline-label">Partner</div>
+              </div>
+              <div class="dash-pipeline-arrow">&#x25B6;</div>
+              <div class="dash-pipeline-stage" onclick="drillDown('history','complete')" style="cursor:pointer">
+                <div class="dash-pipeline-count" id="pipeFinal">0</div>
+                <div class="dash-pipeline-bar" style="background:var(--green)"></div>
+                <div class="dash-pipeline-label">Final</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+      <!-- Recent Activity -->
+      <div class="grid-stack-item" gs-x="0" gs-y="10" gs-w="5" gs-h="5" gs-id="activity">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F4AC; Recent Activity</h3></div>
+          <div class="card-body" style="padding:0;overflow-y:auto">
+            <table class="data-table" id="dashActivityTable">
+              <thead><tr><th>Client</th><th>Type</th><th>Status</th><th>When</th></tr></thead>
+              <tbody id="dashActivityBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <!-- Top Clients -->
+      <div class="grid-stack-item" gs-x="5" gs-y="10" gs-w="3" gs-h="5" gs-id="clients">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F465; Top Clients</h3></div>
+          <div class="card-body" style="padding:0;overflow-y:auto">
+            <div id="dashTopClients"></div>
+          </div>
+        </div>
+      </div>
+      <!-- Stormfather Chat -->
+      <div class="grid-stack-item" gs-x="8" gs-y="10" gs-w="4" gs-h="5" gs-id="stormfather">
+        <div class="grid-stack-item-content card dash-widget storm-widget">
+          <div class="card-header storm-header"><h3>&#x26C8;&#xFE0F; The Stormfather</h3></div>
+          <div class="card-body storm-body" style="padding:0;display:flex;flex-direction:column;overflow:hidden">
+            <div class="storm-messages" id="stormMessages">
+              <div class="storm-msg storm-ai">I am The Stormfather. Ask me about your data, your clients, or how things are going. I speak only established truths.</div>
+            </div>
+            <div class="storm-input-row">
+              <input type="text" class="storm-input" id="stormInput" placeholder="Ask The Stormfather..." onkeydown="if(event.key==='Enter')sendStormMessage()">
+              <button class="storm-send" onclick="sendStormMessage()">&#x26A1;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- System Health -->
+      <div class="grid-stack-item" gs-x="0" gs-y="15" gs-w="4" gs-h="3" gs-id="health">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F6E1;&#xFE0F; System Health</h3></div>
+          <div class="card-body" id="dashHealthBody">
+            <div class="dash-health-row"><span>Version</span><span id="healthVersion">--</span></div>
+            <div class="dash-health-row"><span>Uptime</span><span id="healthUptime">--</span></div>
+            <div class="dash-health-row"><span>Disk Free</span><span id="healthDisk">--</span></div>
+            <div class="dash-health-row"><span>Error Rate (7d)</span><span id="healthErrorRate">--</span></div>
+            <div class="dash-health-row"><span>Total Jobs</span><span id="healthTotalJobs">--</span></div>
+          </div>
+        </div>
+      </div>
 
-    <!-- Bottom Row -->
-    <div class="dash-bottom-row">
-      <div class="card dash-bottom-card">
-        <div class="card-header"><h3>Recent Activity</h3></div>
-        <div class="card-body" style="padding:0;max-height:360px;overflow-y:auto">
-          <table class="data-table" id="dashActivityTable">
-            <thead><tr><th>Client</th><th>Type</th><th>Status</th><th>Cost</th><th>When</th></tr></thead>
-            <tbody id="dashActivityBody"></tbody>
-          </table>
+      <div class="grid-stack-item" gs-x="4" gs-y="15" gs-w="4" gs-h="5" gs-id="timetrack">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x23F1;&#xFE0F; Client Time</h3></div>
+          <div class="card-body" style="padding:12px; overflow-y:auto;">
+            <div style="display:flex; gap:6px; margin-bottom:10px;">
+              <input id="timerClient" placeholder="Client name" style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--input-bg); color:var(--text); font-size:12px;" />
+              <select id="timerType" style="padding:6px; border:1px solid var(--border); border-radius:6px; background:var(--input-bg); color:var(--text); font-size:11px;">
+                <option value="review">Review</option>
+                <option value="prep">Tax Prep</option>
+                <option value="consult">Consult</option>
+                <option value="admin">Admin</option>
+                <option value="general">General</option>
+              </select>
+              <button onclick="toggleTimer()" id="timerBtn" style="padding:6px 12px; border:none; border-radius:6px; background:var(--accent); color:white; cursor:pointer; font-size:12px; font-weight:600;">Start</button>
+            </div>
+            <div id="timerActive" style="display:none; padding:8px; background:var(--hover-bg); border-radius:8px; margin-bottom:10px;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span id="timerLabel" style="font-size:12px; font-weight:600; color:var(--text);"></span>
+                <span id="timerElapsed" style="font-size:18px; font-weight:800; font-family:var(--mono); color:var(--accent);">0:00</span>
+              </div>
+            </div>
+            <div id="timeClientSummary" style="font-size:12px;"></div>
+          </div>
         </div>
       </div>
-      <div class="card dash-bottom-card">
-        <div class="card-header"><h3>Top Clients</h3></div>
-        <div class="card-body" style="padding:0;max-height:360px;overflow-y:auto">
-          <div id="dashTopClients"></div>
-        </div>
-      </div>
-      <div class="card dash-bottom-card">
-        <div class="card-header"><h3>System Health</h3></div>
-        <div class="card-body" id="dashHealthBody">
-          <div class="dash-health-row"><span>Version</span><span id="healthVersion">--</span></div>
-          <div class="dash-health-row"><span>Uptime</span><span id="healthUptime">--</span></div>
-          <div class="dash-health-row"><span>Disk Free</span><span id="healthDisk">--</span></div>
-          <div class="dash-health-row"><span>Error Rate (7d)</span><span id="healthErrorRate">--</span></div>
-          <div class="dash-health-row"><span>Total Jobs</span><span id="healthTotalJobs">--</span></div>
+
+      <div class="grid-stack-item" gs-x="8" gs-y="15" gs-w="4" gs-h="5" gs-id="firmcost">
+        <div class="grid-stack-item-content card dash-widget">
+          <div class="card-header"><h3>&#x1F4B0; Firm Cost Trends</h3></div>
+          <div class="card-body dash-widget-body">
+            <canvas id="firmCostChart"></canvas>
+          </div>
         </div>
       </div>
     </div>
@@ -9084,7 +10206,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <div class="section" id="sec-guided-review">
   <div class="guided-header">
     <div style="display:flex;align-items:center;gap:12px">
-      <button class="btn btn-secondary btn-sm" onclick="guidedGoBack()" id="guidedBackBtn" disabled title="Go to previous field (Backspace)">&#9664; Back</button>
+      <button class="btn btn-secondary btn-sm" onclick="guidedGoBack()" id="guidedBackBtn" disabled title="Go to previous field (Backspace)">&#9664; Previous</button>
       <div class="guided-progress">
         <span class="guided-progress-text" id="guidedProgressText">0 of 0</span>
         <div class="guided-progress-bar">
@@ -9112,7 +10234,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <div class="guided-actions" id="guidedBtns">
         <button class="btn btn-success" onclick="guidedAction('confirm')">&#x2714; Confirm <kbd>Y</kbd></button>
         <button class="btn btn-primary" onclick="guidedStartEdit()">&#x270F; Edit <kbd>E</kbd></button>
-        <button class="btn btn-danger" onclick="guidedAction('not_present')">&#x2716; Not Present <kbd>N</kbd></button>
+        <button class="btn btn-danger" onclick="guidedAction('not_present')">&#x2716; Not Relevant <kbd>N</kbd></button>
         <button class="btn btn-secondary" onclick="guidedAction('skip')">&#x23ED; Skip <kbd>S</kbd></button>
       </div>
       <div class="guided-note-area" id="guidedNoteArea">
@@ -9256,6 +10378,77 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   </div>
 </div>
 
+<!-- ═══ SETTINGS SECTION ═══ -->
+<div class="section" id="sec-settings">
+  <div class="page-header"><h2>Settings</h2><p>Integrations, preferences, and platform configuration</p></div>
+  <div class="page-content">
+
+    <!-- Muse Integration -->
+    <div class="card" style="max-width:700px">
+      <div class="card-header" style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:20px">&#x1F9E9;</span>
+        <div>
+          <h3 style="margin:0;font-size:15px">Muse Integration</h3>
+          <p style="margin:0;font-size:12px;color:var(--text-secondary)">Auto-create project management tasks when extractions complete</p>
+        </div>
+        <span id="museStatusBadge" style="margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;font-weight:600;background:var(--bg);color:var(--text-secondary)">off</span>
+      </div>
+      <div class="card-body" style="padding:16px;display:flex;flex-direction:column;gap:14px">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <input type="checkbox" id="museEnabled" onchange="saveMuseSetting('muse_enabled', this.checked ? '1' : '0')">
+          <span style="font-weight:600;font-size:13px">Enable Muse Bridge</span>
+        </label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Muse URL
+            <input type="text" class="form-input" id="museUrl" placeholder="http://localhost:3001" onchange="saveMuseSetting('muse_url', this.value)" style="margin-top:4px;width:100%">
+          </label>
+          <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Board Name
+            <input type="text" class="form-input" id="museBoard" placeholder="Tax Preparation" onchange="saveMuseSetting('muse_board', this.value)" style="margin-top:4px;width:100%">
+          </label>
+          <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Column Name
+            <input type="text" class="form-input" id="museColumn" placeholder="To Contemplate" onchange="saveMuseSetting('muse_column', this.value)" style="margin-top:4px;width:100%">
+          </label>
+          <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Assignee(s) <span style="font-weight:400;opacity:0.7">(comma-separated)</span>
+            <input type="text" class="form-input" id="museAssignee" placeholder="Charles, Susan" onchange="saveMuseSetting('muse_assignee', this.value)" style="margin-top:4px;width:100%">
+          </label>
+        </div>
+        <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Tags <span style="font-weight:400;opacity:0.7">(comma-separated, auto-added to every task)</span>
+          <input type="text" class="form-input" id="museTags" placeholder="oathledger" onchange="saveMuseSetting('muse_tags', this.value)" style="margin-top:4px;width:100%">
+        </label>
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <button class="btn btn-secondary" onclick="testMuseConnection(false)" style="font-size:12px">Test Connection</button>
+          <button class="btn" onclick="testMuseConnection(true)" style="font-size:12px">Send Test Task</button>
+          <span id="museTestResult" style="font-size:12px;line-height:32px;margin-left:8px"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- OathLedger v2 Engine -->
+    <div class="card" style="max-width:700px;margin-top:16px">
+      <div class="card-header" style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:20px">&#x2696;</span>
+        <div>
+          <h3 style="margin:0;font-size:15px">OathLedger v2 Engine</h3>
+          <p style="margin:0;font-size:12px;color:var(--text-secondary)">Deterministic payload path for Tax Review output (rules + renderer separation)</p>
+        </div>
+        <span id="v2StatusBadge" style="margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;font-weight:600;background:var(--bg);color:var(--text-secondary)">off</span>
+      </div>
+      <div class="card-body" style="padding:16px;display:flex;flex-direction:column;gap:10px">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <input type="checkbox" id="v2Enabled" onchange="toggleOathLedgerV2(this.checked)">
+          <span style="font-weight:600;font-size:13px">Route Tax Review through OathLedger v2 payload engine</span>
+        </label>
+        <p style="font-size:12px;color:var(--text-secondary);margin:0;line-height:1.5">
+          When enabled, new extractions using the <b>Tax Review</b> format will route through the v2 payload path
+          (<code>oathledger.rules_engine</code> &rarr; <code>oathledger.renderer</code>) instead of the legacy <code>inkspren._populate_tax_review</code>.
+          The old path is untouched &mdash; disable this toggle to revert instantly.
+        </p>
+      </div>
+    </div>
+
+  </div>
+</div>
+
 <!-- ═══ KEYBOARD HELP ═══ -->
 <div class="kbd-overlay" id="kbdOverlay" onclick="if(event.target===this)toggleKbdHelp()">
   <div class="kbd-card">
@@ -9272,7 +10465,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div style="font-size:11px;font-weight:700;color:var(--text-light);text-transform:uppercase;margin:10px 0 6px;padding-top:8px;border-top:1px solid var(--border)">Guided Review</div>
     <div class="kbd-row"><span>Confirm</span><kbd>Y</kbd></div>
     <div class="kbd-row"><span>Edit</span><kbd>E</kbd></div>
-    <div class="kbd-row"><span>Not Present</span><kbd>N</kbd></div>
+    <div class="kbd-row"><span>Not Relevant</span><kbd>N</kbd></div>
     <div class="kbd-row"><span>Skip</span><kbd>S</kbd></div>
     <div class="kbd-row"><span>Save correction</span><kbd>Enter</kbd></div>
     <div class="kbd-row"><span>Cancel edit</span><kbd>Esc</kbd></div>
@@ -9287,6 +10480,20 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <!-- JAVASCRIPT -->
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <script>
+// ─── Sidebar Toggle ───
+function toggleSidebar() {
+  var sb = document.getElementById('appSidebar');
+  sb.classList.toggle('collapsed');
+  localStorage.setItem('oathledger-sidebar', sb.classList.contains('collapsed') ? 'collapsed' : 'expanded');
+  // Re-render charts after transition
+  setTimeout(function() { if (typeof _dashCharts !== 'undefined') { Object.keys(_dashCharts).forEach(function(k) { if (_dashCharts[k]) _dashCharts[k].resize(); }); } }, 300);
+}
+(function(){
+  if (localStorage.getItem('oathledger-sidebar') === 'collapsed') {
+    document.getElementById('appSidebar').classList.add('collapsed');
+  }
+})();
+
 // ─── Theme ───
 function setTheme(t) {
   if (t === 'light') { document.documentElement.removeAttribute('data-theme'); }
@@ -9407,13 +10614,59 @@ function showSection(id) {
   if (id === 'clients') loadClients();
   if (id === 'batch') loadBatchData();
   if (id === 'inbox') loadInbox();
+  if (id === 'settings') { loadMuseSettings(); loadOathLedgerV2(); }
 }
 
 // ─── Dashboard ───
 var _dashCharts = {};
 var _dashRefreshTimer = null;
+var _dashGrid = null;
+
+function _initDashGrid() {
+  if (_dashGrid) return;
+  var el = document.getElementById('dashGrid');
+  if (!el || typeof GridStack === 'undefined') return;
+  _dashGrid = GridStack.init({
+    column: 12, cellHeight: 50, margin: 8,
+    animate: true, float: true,
+    handle: '.card-header, .dash-widget h3',
+    disableOneColumnMode: true,
+    minRow: 1,
+  }, el);
+  // Allow all widgets to shrink to 2×2 minimum for max flexibility
+  _dashGrid.getGridItems().forEach(function(item) {
+    _dashGrid.update(item, { minW: 2, minH: 2 });
+  });
+  // Save layout on change + resize charts
+  _dashGrid.on('change', function() { _saveDashLayout(); });
+  _dashGrid.on('resizestop', function() {
+    setTimeout(function() {
+      Object.keys(_dashCharts).forEach(function(k) { if (_dashCharts[k]) _dashCharts[k].resize(); });
+    }, 150);
+  });
+  // Load saved layout
+  var saved = localStorage.getItem('oathledger-dash-layout');
+  if (saved) {
+    try {
+      var items = JSON.parse(saved);
+      _dashGrid.load(items, true);
+    } catch(e) {}
+  }
+}
+
+function _saveDashLayout() {
+  if (!_dashGrid) return;
+  var items = _dashGrid.save(false);
+  localStorage.setItem('oathledger-dash-layout', JSON.stringify(items));
+}
+
+function resetDashLayout() {
+  localStorage.removeItem('oathledger-dash-layout');
+  location.reload();
+}
 
 function loadDashboard() {
+  _initDashGrid();
   fetch('/api/dashboard').then(function(r){ return r.json(); }).then(function(data) {
     _renderDashKpis(data.kpis);
     _renderDashCharts(data.charts);
@@ -9421,17 +10674,180 @@ function loadDashboard() {
     _renderDashActivity(data.recent_activity);
     _renderDashTopClients(data.top_clients);
     _renderDashHealth(data.health);
-    // Auto-refresh every 30s while dashboard is visible
     if (_dashRefreshTimer) clearInterval(_dashRefreshTimer);
     _dashRefreshTimer = setInterval(function() {
       if (document.getElementById('sec-dashboard').classList.contains('active')) {
         loadDashboard();
-      } else {
-        clearInterval(_dashRefreshTimer);
-        _dashRefreshTimer = null;
-      }
+      } else { clearInterval(_dashRefreshTimer); _dashRefreshTimer = null; }
     }, 30000);
   }).catch(function(e) { console.warn('Dashboard load error:', e); });
+  _loadTimeSummary();
+  _loadFirmCostTrends();
+}
+
+// ─── Client Time Tracking ───────────────────────────────────────────────
+var _timerInterval = null;
+var _timerStartTime = null;
+var _timerEntryId = null;
+
+function toggleTimer() {
+  if (_timerEntryId) { _stopTimer(); return; }
+  var client = document.getElementById('timerClient').value.trim();
+  if (!client) { document.getElementById('timerClient').focus(); return; }
+  var taskType = document.getElementById('timerType').value;
+  var now = new Date().toISOString();
+  fetch('/api/time-entries', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ client: client, task_type: taskType, start_time: now })
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.entry_id) {
+      _timerEntryId = data.entry_id;
+      _timerStartTime = Date.now();
+      document.getElementById('timerBtn').textContent = 'Stop';
+      document.getElementById('timerBtn').style.background = '#e74c3c';
+      document.getElementById('timerActive').style.display = 'block';
+      document.getElementById('timerLabel').textContent = client + ' — ' + taskType;
+      _timerInterval = setInterval(_updateTimerDisplay, 1000);
+    }
+  });
+}
+
+function _stopTimer() {
+  if (!_timerEntryId) return;
+  fetch('/api/time-entries', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ action: 'stop', entry_id: _timerEntryId, end_time: new Date().toISOString() })
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    clearInterval(_timerInterval);
+    _timerEntryId = null; _timerStartTime = null;
+    document.getElementById('timerBtn').textContent = 'Start';
+    document.getElementById('timerBtn').style.background = '';
+    document.getElementById('timerActive').style.display = 'none';
+    _loadTimeSummary();
+  });
+}
+
+function _updateTimerDisplay() {
+  if (!_timerStartTime) return;
+  var elapsed = Math.floor((Date.now() - _timerStartTime) / 1000);
+  var h = Math.floor(elapsed / 3600);
+  var m = Math.floor((elapsed % 3600) / 60);
+  var s = elapsed % 60;
+  var txt = h > 0 ? h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
+                   : m + ':' + String(s).padStart(2,'0');
+  var el = document.getElementById('timerElapsed');
+  if (el) el.textContent = txt;
+}
+
+function _loadTimeSummary() {
+  fetch('/api/time-summary?days=30').then(function(r) { return r.json(); }).then(function(data) {
+    var el = document.getElementById('timeClientSummary');
+    if (!el) return;
+    if (!data.summary || data.summary.length === 0) {
+      el.innerHTML = '<div style="color:var(--text-light); font-style:italic; padding:8px;">No time tracked yet. Start a timer above!</div>';
+      return;
+    }
+    var html = '<div style="font-weight:700; margin-bottom:6px; color:var(--navy);">Last 30 Days</div>';
+    data.summary.forEach(function(s) {
+      var pct = data.summary[0].total_hours > 0 ? Math.round(s.total_hours / data.summary[0].total_hours * 100) : 0;
+      html += '<div style="display:flex; align-items:center; gap:6px; padding:3px 0;">'
+        + '<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(s.client) + '</span>'
+        + '<div style="width:60px; height:5px; background:var(--border); border-radius:3px; overflow:hidden;"><div style="height:100%; width:' + pct + '%; background:var(--accent); border-radius:3px;"></div></div>'
+        + '<span style="font-family:var(--mono); font-weight:700; width:40px; text-align:right;">' + s.total_hours + 'h</span>'
+        + '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {});
+}
+
+// ─── Firm Cost Trends ───────────────────────────────────────────────────
+function _loadFirmCostTrends() {
+  fetch('/api/firm-cost-trends?weeks=12').then(function(r) { return r.json(); }).then(function(data) {
+    var canvas = document.getElementById('firmCostChart');
+    if (!canvas) return;
+    var trends = data.trends || [];
+    if (trends.length === 0) return;
+    var labels = trends.map(function(t) { return t.week; });
+    var apiData = trends.map(function(t) { return t.api_cost || 0; });
+    var totalData = trends.map(function(t) { return t.total || 0; });
+    if (_dashCharts.firmCost) _dashCharts.firmCost.destroy();
+    _dashCharts.firmCost = new Chart(canvas, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'API Cost', data: apiData, backgroundColor: 'rgba(52,152,219,0.7)', borderRadius: 4 },
+          { label: 'Total', data: totalData, type: 'line', borderColor: '#e67e22', borderWidth: 2, fill: false, pointRadius: 3, tension: 0.3 }
+        ]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } } },
+        scales: { x: { grid: { display: false }, ticks: { font: { size: 9 } } }, y: { beginAtZero: true, ticks: { callback: function(v) { return '$' + v; }, font: { size: 10 } } } }
+      }
+    });
+  }).catch(function() {});
+}
+
+// ─── Muse Integration Settings ───
+function loadMuseSettings() {
+  fetch('/api/integrations/muse').then(function(r) { return r.json(); }).then(function(s) {
+    document.getElementById('museEnabled').checked = s.muse_enabled === '1';
+    document.getElementById('museUrl').value = s.muse_url || '';
+    document.getElementById('museBoard').value = s.muse_board || '';
+    document.getElementById('museColumn').value = s.muse_column || '';
+    document.getElementById('museAssignee').value = s.muse_assignee || '';
+    document.getElementById('museTags').value = s.muse_tags || '';
+    var badge = document.getElementById('museStatusBadge');
+    if (s.muse_enabled !== '1') {
+      badge.textContent = 'off'; badge.style.background = 'var(--bg)'; badge.style.color = 'var(--text-secondary)';
+    } else if (s._connected) {
+      badge.textContent = 'connected'; badge.style.background = '#27ae6033'; badge.style.color = '#27ae60';
+    } else {
+      badge.textContent = 'unreachable'; badge.style.background = '#e74c3c33'; badge.style.color = '#e74c3c';
+    }
+  }).catch(function() {});
+}
+
+function saveMuseSetting(key, value) {
+  var body = {}; body[key] = value;
+  fetch('/api/integrations/muse', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+    .then(function() { loadMuseSettings(); })
+    .catch(function(e) { showToast('Save failed: ' + e, 'error'); });
+}
+
+function testMuseConnection(sendTest) {
+  var el = document.getElementById('museTestResult');
+  el.textContent = 'Testing...'; el.style.color = 'var(--text-secondary)';
+  fetch('/api/integrations/muse/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ send_test: !!sendTest }) })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      if (!data.ok) {
+        el.textContent = data.error || 'Failed'; el.style.color = '#e74c3c';
+      } else {
+        var msg = 'Connected! Boards: ' + (data.boards || []).join(', ');
+        if (data.test_task_id) msg += ' | Test task created';
+        if (data.test_task_error) msg += ' | Task error: ' + data.test_task_error;
+        el.textContent = msg; el.style.color = '#27ae60';
+        loadMuseSettings();
+      }
+    }).catch(function(e) { el.textContent = 'Error: ' + e; el.style.color = '#e74c3c'; });
+}
+
+// ─── OathLedger v2 Settings ───
+function loadOathLedgerV2() {
+  fetch('/api/integrations/oathledger-v2').then(function(r) { return r.json(); }).then(function(s) {
+    document.getElementById('v2Enabled').checked = !!s.enabled;
+    var badge = document.getElementById('v2StatusBadge');
+    if (s.enabled) {
+      badge.textContent = 'active'; badge.style.background = '#27ae6033'; badge.style.color = '#27ae60';
+    } else {
+      badge.textContent = 'off'; badge.style.background = 'var(--bg)'; badge.style.color = 'var(--text-secondary)';
+    }
+  }).catch(function() {});
+}
+
+function toggleOathLedgerV2(enabled) {
+  fetch('/api/integrations/oathledger-v2', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ enabled: enabled }) })
+    .then(function() { loadOathLedgerV2(); showToast(enabled ? 'OathLedger v2 enabled' : 'OathLedger v2 disabled', 'success'); })
+    .catch(function(e) { showToast('Save failed: ' + e, 'error'); });
 }
 
 function _animateCounter(el, target, prefix, suffix, decimals) {
@@ -9472,12 +10888,54 @@ function _dashFormatTime(secs) {
 }
 
 function _renderDashKpis(kpis) {
-  _animateCounter(document.getElementById('kpiTotalDocs'), kpis.total_docs, '', '', 0);
+  _animateCounter(document.getElementById('kpiDocsWeek'), kpis.docs_this_week || 0, '', '', 0);
   _animateCounter(document.getElementById('kpiTotalPages'), kpis.total_pages, '', '', 0);
-  _animateCounter(document.getElementById('kpiSuccessRate'), kpis.success_rate, '', '%', 1);
+  _animateCounter(document.getElementById('kpiReviewCompletion'), kpis.review_completion || 0, '', '%', 1);
   document.getElementById('kpiAvgTime').textContent = _dashFormatTime(kpis.avg_time_s);
-  _animateCounter(document.getElementById('kpiTotalCost'), kpis.total_cost, '$', '', 2);
-  _animateCounter(document.getElementById('kpiActiveJobs'), kpis.active_jobs, '', '', 0);
+  _animateCounter(document.getElementById('kpiCorrections'), kpis.corrections_rate || 0, '', '%', 1);
+  _animateCounter(document.getElementById('kpiPendingReview'), kpis.pending_review || 0, '', '', 0);
+}
+
+// ─── Drill-Down Navigation ───
+function drillDown(section, filter) {
+  showSection(section);
+  if (section === 'history' && filter) {
+    setTimeout(function() {
+      var sel = document.getElementById('historyStatusFilter');
+      if (sel) { sel.value = filter; if (typeof filterHistory === 'function') filterHistory(); }
+    }, 200);
+  }
+  if (section === 'inbox' && filter) {
+    // Inbox doesn't have built-in filter yet, but we navigate there
+  }
+}
+
+// ─── Stormfather Chat ───
+function sendStormMessage() {
+  var input = document.getElementById('stormInput');
+  var msg = (input.value || '').trim();
+  if (!msg) return;
+  input.value = '';
+  var container = document.getElementById('stormMessages');
+  container.innerHTML += '<div class="storm-msg storm-user">' + esc(msg) + '</div>';
+  container.innerHTML += '<div class="storm-typing" id="stormTyping">The Stormfather is thinking...</div>';
+  container.scrollTop = container.scrollHeight;
+  fetch('/api/stormfather', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: msg })
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    var typing = document.getElementById('stormTyping');
+    if (typing) typing.remove();
+    var reply = data.reply || data.error || 'The storms are silent.';
+    container.innerHTML += '<div class="storm-msg storm-ai">' + esc(reply) + '</div>';
+    container.scrollTop = container.scrollHeight;
+  }).catch(function() {
+    var typing = document.getElementById('stormTyping');
+    if (typing) typing.remove();
+    container.innerHTML += '<div class="storm-msg storm-ai">The storms are silent. (No API key configured)</div>';
+    container.scrollTop = container.scrollHeight;
+  });
 }
 
 function _getChartColors() {
@@ -9575,7 +11033,7 @@ function _renderDashPipeline(pipeline) {
 function _renderDashActivity(items) {
   var body = document.getElementById('dashActivityBody');
   if (!items || !items.length) {
-    body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-light)">No activity yet — upload your first document!</td></tr>';
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:24px;color:var(--text-light)">No activity yet — upload your first document!</td></tr>';
     return;
   }
   var statusBadge = function(s) {
@@ -9585,12 +11043,10 @@ function _renderDashActivity(items) {
   var dtShort = {'tax_returns':'Tax','bank_statements':'Bank','trust_documents':'Trust','bookkeeping':'Books','payroll':'Payroll','other':'Other'};
   body.innerHTML = items.map(function(a) {
     var when = a.created ? new Date(a.created).toLocaleDateString('en-US', {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}) : '';
-    var cost = a.cost_usd != null ? '$' + Number(a.cost_usd).toFixed(4) : '\u2014';
-    return '<tr>' +
+    return '<tr style="cursor:pointer" onclick="drillDown(\'history\',\'\')">' +
       '<td><strong>' + esc(a.client_name || '\u2014') + '</strong></td>' +
       '<td><span class="badge badge-blue">' + esc(dtShort[a.doc_type] || a.doc_type || '') + '</span></td>' +
       '<td>' + statusBadge(a.status) + '</td>' +
-      '<td style="font-family:var(--mono);font-size:12px">' + cost + '</td>' +
       '<td style="font-size:12px;color:var(--text-secondary)">' + when + '</td></tr>';
   }).join('');
 }
@@ -9604,7 +11060,7 @@ function _renderDashTopClients(clients) {
   var maxCount = clients[0].count || 1;
   el.innerHTML = clients.map(function(c, i) {
     var pct = Math.round((c.count / maxCount) * 100);
-    return '<div class="dash-client-row">' +
+    return '<div class="dash-client-row" onclick="drillDown(\'clients\',\'' + esc(c.name) + '\')" title="View ' + esc(c.name) + '">' +
       '<span class="dash-client-rank">' + (i + 1) + '</span>' +
       '<span class="dash-client-name">' + esc(c.name) + '</span>' +
       '<div class="dash-client-bar-wrap"><div class="dash-client-bar-fill" style="width:' + pct + '%"></div></div>' +
@@ -10172,10 +11628,72 @@ function pollPartialStatus() {
 }
 
 // Fields to hide from review panel — metadata, PII, and non-tax-relevant details
+// ── Field aliases: map duplicate extraction names to canonical name ──
+// Mirrors Python _FIELD_ALIASES — keeps list view dedup in sync with guided review
+const FIELD_ALIASES = {
+  'social_security_wages': 'ss_wages',
+  'social_security_tax': 'ss_wh',
+  'ss_tax': 'ss_wh',
+  'medicare_tax': 'medicare_wh',
+  'nonqualified_plans': 'nonqualified_plans_12a',
+  'federal_tax_withheld': 'federal_wh',
+  'state_tax_withheld': 'state_wh',
+  'local_tax_withheld': 'local_wh',
+  'federal_income_tax_withheld': 'federal_wh',
+  'state_income_tax_withheld': 'state_wh',
+  'b_total_gain_loss': 'total_gain_loss',
+};
+
 const REVIEW_SKIP_FIELDS = new Set([
-  // PII / identifiers
-  'payer_ein','recipient_ssn_last4','tax_year','entity_type','partner_type','state_id',
-  'account_number_last4','account_number','employee_ssn','card_number','card_number_last_four',
+  // ── Auto-confirm fields (mirrors Python _REVIEW_AUTO_CONFIRM_FIELDS) ──
+  // Entity / payer / employer identification
+  'payer_or_entity','payer_name','payer_ein','payer_tin',
+  'payer_address','payer_city','payer_state','payer_zip',
+  'employer_name','employer_ein','employer_address',
+  'employer_city','employer_state','employer_zip',
+  'institution_name','institution_address',
+  'trustee_name','custodian_name','issuer_name',
+  // Recipient / employee identification
+  'recipient','recipient_name','recipient_tin','recipient_ssn',
+  'employee_name','employee_ssn','employee_address',
+  'employee_city','employee_state','employee_zip',
+  'borrower_name','borrower_ssn','borrower_address',
+  'insured_name','policyholder_name','student_name',
+  // Account and control numbers
+  'account_number','control_number','loan_number',
+  'policy_number','fein','plan_number',
+  // State / locality identification
+  'state_id','state','locality_name','locality',
+  'state_payer_id','state_number',
+  // Document metadata
+  'tax_year','document_type','form_type','form_number',
+  'corrected','void','amended','final',
+  'filing_status','exemptions',
+  // Receipt / transaction metadata (numeric but not dollar amounts)
+  'confirmation_number','reference_number','receipt_number',
+  'transaction_id','check_number','register_number',
+  'authorization_code','auth_code','auth_number','cc_auth',
+  'response_message_code','guarantor_id','guarantor_number',
+  'patient_id','rx_number','ndc_number','dea_number',
+  'bill_number','invoice_number','claim_number',
+  'routing_number','trace_number','batch_number',
+  'sequence_number','record_number',
+  // Property / assessment identifiers
+  'property_id','map_code','parcel_number','parcel_id',
+  'district','tax_district',
+  // Date fields
+  'date','due_date','receipt_date','transaction_date',
+  'billing_date','statement_date','payment_date',
+  'date_filled','prescription_date','appointment_date',
+  'service_date','mortgage_origination_date','mortgage_acquisition_date',
+  'assessment_notice_date','appeal_deadline',
+  // Quantity / count fields
+  'quantity','credit_hours','number_of_properties',
+  'acreage','acres',
+  // ── Original skip fields (PII, property, medical, etc.) ──
+  'entity_type','partner_type',
+  'recipient_ssn_last4','account_number_last4',
+  'card_number','card_number_last_four',
   'card_number_last_4','card_type','card_holder_name','auth_code','auth_number','authorization_code',
   'cc_auth','response_message_code','confirmation_number','receipt_number','register_number',
   'check_number','guarantor_id','guarantor_name','guarantor_number','patient_id','patient_name',
@@ -10474,6 +11992,7 @@ function loadPage(page, focusIdx) {
   }
 
   const skipFields = REVIEW_SKIP_FIELDS;
+  const _pageSeenValues = new Set(); // Cross-extraction value dedup (same page)
 
   pageExts.forEach((ext, extIdx) => {
     const fields = ext.fields || {};
@@ -10499,9 +12018,25 @@ function loadPage(page, focusIdx) {
     txnKeys.forEach(k => { const m = k.match(txnRegex); if(m) { if(!txnGroups[m[1]]) txnGroups[m[1]]={}; txnGroups[m[1]][m[2]]=k; }});
     const txnNums = Object.keys(txnGroups).sort((a,b)=>parseInt(a)-parseInt(b));
 
-    // Split monetary vs info, filter out $0.00 unless significant
-    const monetaryKeys = summaryKeys.filter(k => {
+    // ── Alias dedup + skip filter (mirrors guided review logic) ──
+    const _extSeenCanonical = new Set(); // Within-extraction alias dedup
+    const dedupedKeys = summaryKeys.filter(k => {
       if (skipFields.has(k)) return false;
+      if (k.startsWith('_')) return false;
+      const canonical = FIELD_ALIASES[k] || k;
+      // Within-extraction: skip alias duplicates (e.g. social_security_wages & ss_wages)
+      if (_extSeenCanonical.has(canonical)) return false;
+      _extSeenCanonical.add(canonical);
+      // Cross-extraction: skip identical canonical:value pairs on same page
+      const v = fields[k] ? String(fields[k].value || '') : '';
+      const valKey = canonical + ':' + v;
+      if (_pageSeenValues.has(valKey)) return false;
+      _pageSeenValues.add(valKey);
+      return true;
+    });
+
+    // Split monetary vs info from deduped keys, filter out $0.00 unless significant
+    const monetaryKeys = dedupedKeys.filter(k => {
       const v = fields[k].value;
       const isNumeric = typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim()));
       if (!isNumeric) return false;
@@ -10510,8 +12045,7 @@ function loadPage(page, focusIdx) {
       if (numVal === 0 && !/(balance|total|net)/i.test(k)) return false;
       return true;
     });
-    const infoKeys = summaryKeys.filter(k => {
-      if (skipFields.has(k)) return false;  // Hide skipped fields entirely
+    const infoKeys = dedupedKeys.filter(k => {
       const v = fields[k].value;
       return !(typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim())));
     });
@@ -10808,7 +12342,13 @@ function monitorJob(id) {
 
 // ─── Clients ───
 function loadClientSuggestions() {
-  fetch('/api/clients').then(r=>r.json()).then(data => {
+  fetch('/api/clients').then(function(r) {
+    if (!r.ok) return Promise.reject('http_' + r.status);
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') === -1) return Promise.reject('not_json');
+    return r.json();
+  }).then(function(data) {
+    if (!data) return;
     const sel = document.getElementById('clientName');
     const current = sel.value;
     sel.innerHTML = '<option value="">\u2014 Select client \u2014</option>' +
@@ -10817,15 +12357,31 @@ function loadClientSuggestions() {
         return '<option value="' + esc(c.name) + '">' + esc(label) + '</option>';
       }).join('');
     if (current) sel.value = current;
-  }).catch(()=>{});
+  }).catch(function(){});
 }
 
 let allClientsData = [];
 function loadClients() {
-  fetch('/api/clients').then(r=>r.json()).then(data => {
+  fetch('/api/clients').then(function(r) {
+    if (!r.ok) {
+      showToast('Could not load clients (HTTP ' + r.status + ')', 'error');
+      return Promise.reject('http_' + r.status);
+    }
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') === -1) {
+      showToast('Session expired — please log in again', 'error');
+      setTimeout(function(){ window.location.href = '/login'; }, 1500);
+      return Promise.reject('not_json');
+    }
+    return r.json();
+  }).then(function(data) {
+    if (!data) return;
     allClientsData = data;
     renderClientGrid(data);
-  }).catch(()=>{});
+  }).catch(function(err) {
+    if (err === 'not_json') return;
+    console.error('loadClients error:', err);
+  });
 }
 function filterClients() {
   const q = (document.getElementById('clientSearch').value||'').toLowerCase();
@@ -11419,47 +12975,73 @@ function loadGuidedItem(skipHistory) {
     document.getElementById('guidedBackBtn').disabled = false;
   }
 
-  document.getElementById('guidedDetail').style.opacity = '0.5';
   document.getElementById('guidedEditArea').style.display = 'none';
   document.getElementById('guidedBtns').style.display = '';
-  // Clear note field
   document.getElementById('guidedNoteInput').value = '';
 
-  fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(item.field_id))
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) { showToast(data.error, 'error'); return; }
-      guidedCurrentItem = data;
-      renderGuidedItem(data);
-      // Acquire lock
-      var reviewer = _getGuidedReviewer();
-      if (reviewer) {
-        fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(item.field_id), {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ reviewer: reviewer })
-        }).then(function(r) { return r.json(); }).then(function(lockData) {
-          if (lockData.error) {
-            document.getElementById('guidedLockBanner').textContent = lockData.error;
-            document.getElementById('guidedLockBanner').style.display = '';
-          } else {
-            document.getElementById('guidedLockBanner').style.display = 'none';
+  // ── INSTANT RENDER from queue data (no blocking /item/ fetch) ──
+  guidedCurrentItem = {
+    field_id: item.field_id,
+    field_name: item.field_name,
+    display_name: item.display_name || item.field_name,
+    value: item.value,
+    page_num: item.page_num,
+    document_type: item.document_type,
+    entity: item.entity,
+    confidence: item.confidence,
+    method: item.method || '',
+    page_url: '/api/page-image/' + guidedJobId + '/' + item.page_num,
+    evidence_url: null,
+    evidence_available: false,
+  };
+  renderGuidedItem(guidedCurrentItem);
+  document.getElementById('guidedDetail').style.opacity = '1';
+
+  // ── ASYNC: fetch evidence image in background, swap in when ready ──
+  (function(fieldId, pageNum) {
+    fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(fieldId))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        // Only update if user hasn't moved to a different field
+        if (data.evidence_url && guidedCurrentItem && guidedCurrentItem.field_id === fieldId) {
+          guidedCurrentItem.evidence_url = data.evidence_url;
+          guidedCurrentItem.evidence_available = true;
+          var evEl = document.getElementById('guidedEvidence');
+          if (evEl) {
+            evEl.innerHTML = '<img src="' + esc(data.evidence_url) + '" alt="Evidence" style="max-width:100%;height:auto">';
           }
-        });
-      }
-      // Heartbeat
-      if (guidedHeartbeatTimer) clearInterval(guidedHeartbeatTimer);
-      guidedHeartbeatTimer = setInterval(function() {
-        if (reviewer && guidedCurrentItem) {
-          fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(guidedCurrentItem.field_id), {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ reviewer: reviewer })
-          });
         }
-      }, 120000);
-    })
-    .catch(function(e) { showToast('Failed to load item: ' + e, 'error'); });
+      })
+      .catch(function() {}); // Evidence is non-critical
+  })(item.field_id, item.page_num);
+
+  // ── ASYNC: Acquire lock ──
+  var reviewer = _getGuidedReviewer();
+  if (reviewer) {
+    fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(item.field_id), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ reviewer: reviewer })
+    }).then(function(r) { return r.json(); }).then(function(lockData) {
+      if (lockData.error) {
+        document.getElementById('guidedLockBanner').textContent = lockData.error;
+        document.getElementById('guidedLockBanner').style.display = '';
+      } else {
+        document.getElementById('guidedLockBanner').style.display = 'none';
+      }
+    });
+  }
+  // Heartbeat
+  if (guidedHeartbeatTimer) clearInterval(guidedHeartbeatTimer);
+  guidedHeartbeatTimer = setInterval(function() {
+    if (reviewer && guidedCurrentItem) {
+      fetch('/api/guided-review/lock/' + guidedJobId + '/' + encodeURIComponent(guidedCurrentItem.field_id), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ reviewer: reviewer })
+      });
+    }
+  }, 120000);
 }
 
 function guidedGoBack() {
@@ -11548,7 +13130,7 @@ function guidedAction(action) {
     .then(function(data) {
       btns.forEach(function(b) { b.disabled = false; });
       if (!data.ok) { showToast(data.error || 'Action failed', 'error'); return; }
-      var msg = action === 'confirm' ? 'Confirmed' : action === 'correct' ? 'Corrected' : action === 'not_present' ? 'Marked not present' : 'Skipped';
+      var msg = action === 'confirm' ? 'Confirmed' : action === 'correct' ? 'Corrected' : action === 'not_present' ? 'Marked not relevant' : 'Skipped';
       showToast(msg, action === 'skip' ? 'info' : 'success');
       updateGuidedProgress(data.reviewed || 0, data.total || 0);
       if (action === 'skip') {
@@ -12084,7 +13666,7 @@ atexit.register(_drain_aftercare)
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5050))
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("\n  ⚠  ANTHROPIC_API_KEY not set!")

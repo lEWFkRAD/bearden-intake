@@ -1304,7 +1304,7 @@ TEMPLATE_SECTIONS = [
     },
     {
         "id": "1098",
-        "header": "Form 1098 (Mortgage Interest):",
+        "header": "Schedule A — Mortgage Interest (1098):",
         "match_types": ["1098"],
         "columns": {"A": "payer_or_entity", "B": "mortgage_interest", "C": "property_tax", "D": "mortgage_insurance_premiums"},
         "col_headers": {"B": "Mortgage Int", "C": "Property Tax", "D": "PMI"},
@@ -1322,7 +1322,7 @@ TEMPLATE_SECTIONS = [
     },
     {
         "id": "property_tax",
-        "header": "Property Tax Bills:",
+        "header": "Schedule A — Property Taxes:",
         "match_types": ["property_tax_bill"],
         "columns": {"A": "property_address", "B": "tax_amount"},
         "field_aliases": {"tax_amount": ["total_due", "total_tax", "total_amount_due", "total_estimated_tax"]},
@@ -1340,7 +1340,7 @@ TEMPLATE_SECTIONS = [
     },
     {
         "id": "charitable",
-        "header": "Charitable Contributions:",
+        "header": "Schedule A — Charitable Contributions:",
         "match_types": ["charitable_receipt"],
         "columns": {"A": "organization_name", "B": "donation_amount", "C": "donation_type"},
         "col_headers": {"B": "Amount", "C": "Type"},
@@ -1504,7 +1504,7 @@ TEMPLATE_SECTIONS = [
     },
 ]
 
-ALWAYS_SHOW = ["w2", "interest", "dividends", "schedule_d", "k1"]
+ALWAYS_SHOW = []  # Skip empty sections entirely — only show sections with actual documents
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -4171,7 +4171,10 @@ DARK_HEADER_FILL = PatternFill("solid", fgColor="2C3E50")
 DARK_HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
 THIN_BORDER = openpyxl.styles.Border()                     # No cell borders on data rows
 SECTION_BORDER = openpyxl.styles.Border()                  # No border on section headers
-SUM_BORDER = openpyxl.styles.Border()                      # No border on totals
+SUM_BORDER = openpyxl.styles.Border(                        # Line above + double underline on totals
+    top=openpyxl.styles.Side(style="thin", color="000000"),
+    bottom=openpyxl.styles.Side(style="double", color="000000"),
+)
 
 def populate_template(extractions, template_path, output_path, year, output_format="tax_review"):
     """Router: create workbook, delegate to format-specific function, save."""
@@ -4305,17 +4308,25 @@ def _dedup_by_ein(exts):
 
     return [seen[k][0] for k in order]
 
-def _write_title(ws, title, year):
-    """Write title rows, return next row number."""
-    ws["A1"] = f"{title} — {year}"
-    ws["A1"].font = Font(bold=True, size=14, color="000000")
-    ws["A1"].alignment = Alignment(horizontal="center")
-    ws.merge_cells("A1:F1")
-    ws["A2"] = f"Extracted {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
-    ws["A2"].font = Font(italic=True, color="999999", size=9)
-    ws["A2"].alignment = Alignment(horizontal="center")
-    ws.merge_cells("A2:F2")
-    return 4
+def _write_title(ws, title, year, client_name=""):
+    """Write title rows with optional client name, return next row number."""
+    row = 1
+    if client_name:
+        ws["A1"] = client_name
+        ws["A1"].font = Font(bold=True, size=16, color="000000")
+        ws["A1"].alignment = Alignment(horizontal="center")
+        ws.merge_cells("A1:F1")
+        row = 2
+    ws[f"A{row}"] = f"{title} — {year}"
+    ws[f"A{row}"].font = Font(bold=True, size=14, color="000000")
+    ws[f"A{row}"].alignment = Alignment(horizontal="center")
+    ws.merge_cells(f"A{row}:F{row}")
+    row += 1
+    ws[f"A{row}"] = f"Extracted {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
+    ws[f"A{row}"].font = Font(italic=True, color="999999", size=9)
+    ws[f"A{row}"].alignment = Alignment(horizontal="center")
+    ws.merge_cells(f"A{row}:F{row}")
+    return row + 2
 
 def _write_cell_value(ws, col, row, fields, field_name, ext, matched):
     """Write a single field cell with formatting and confidence coloring."""
@@ -4370,7 +4381,22 @@ def _write_cell_value(ws, col, row, fields, field_name, ext, matched):
 # ─── TAX REVIEW (original format) ────────────────────────────────────────────
 
 def _populate_tax_review(ws, extractions, year):
-    row = _write_title(ws, "Document Intake", year)
+    # Extract client name from first W-2 employee or first recipient
+    client_name = ""
+    for ext in extractions:
+        fields = ext.get("fields", {})
+        name = get_str(fields, "employee_name") or get_str(fields, "recipient_name") or get_str(fields, "recipient") or get_str(fields, "borrower_name")
+        if name and len(name) > 2:
+            client_name = name
+            break
+    if not client_name:
+        for ext in extractions:
+            name = ext.get("recipient", "")
+            if name and len(name) > 2:
+                client_name = name
+                break
+
+    row = _write_title(ws, "Document Intake", year, client_name=client_name)
     k1_extras = []
 
     for section in TEMPLATE_SECTIONS:
@@ -4412,7 +4438,17 @@ def _populate_tax_review(ws, extractions, year):
         sum_cols = section.get("sum_cols", [])
         flags = section.get("flags", [])
 
-        if not matched and sid not in ALWAYS_SHOW:
+        matched = _dedup_by_ein(matched) if matched else []
+
+        # Filter out zero-value entries for interest/dividend sections
+        if sid in ("interest", "dividends") and matched:
+            matched = [e for e in matched if any(
+                (get_val(e.get("fields", {}), fn) or 0) != 0
+                for fn in columns.values() if not fn.startswith("_")
+            )]
+
+        # Skip empty sections entirely
+        if not matched:
             continue
 
         ws[f"A{row}"] = section["header"]
@@ -4429,26 +4465,6 @@ def _populate_tax_review(ws, extractions, year):
             if c not in col_headers:
                 ws[f"{c}{row}"].fill = SECTION_FILL
         row += 1
-
-        if not matched:
-            ws[f"A{row}"] = "(no documents found)"
-            ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
-            row += 2
-            continue
-
-        matched = _dedup_by_ein(matched)
-
-        # Filter out zero-value entries for interest/dividend sections
-        if sid in ("interest", "dividends"):
-            matched = [e for e in matched if any(
-                (get_val(e.get("fields", {}), fn) or 0) != 0
-                for fn in columns.values() if not fn.startswith("_")
-            )]
-            if not matched:
-                ws[f"A{row}"] = "(no documents found)"
-                ws[f"A{row}"].font = Font(italic=True, color="BBBBBB")
-                row += 2
-                continue
 
         data_start = row
         all_cols = list(columns.keys())
@@ -4573,12 +4589,14 @@ def _populate_tax_review(ws, extractions, year):
     ws[f"A{row}"] = "Total Medical"
     ws[f"A{row}"].font = SUM_FONT
     ws[f"A{row}"].fill = SUM_FILL
+    ws[f"A{row}"].border = SUM_BORDER
     mcell = ws[f"D{row}"]
     mcell.value = total_medical
     mcell.number_format = MONEY_FMT
     mcell.alignment = Alignment(horizontal="right")
     mcell.font = SUM_FONT
     mcell.fill = SUM_FILL
+    mcell.border = SUM_BORDER
     row += 1
 
     # Taxes
@@ -4601,12 +4619,14 @@ def _populate_tax_review(ws, extractions, year):
     ws[f"A{row}"] = "Total State Tax"
     ws[f"A{row}"].font = SUM_FONT
     ws[f"A{row}"].fill = SUM_FILL
+    ws[f"A{row}"].border = SUM_BORDER
     tcell = ws[f"D{row}"]
     tcell.value = total_state_wh
     tcell.number_format = MONEY_FMT
     tcell.alignment = Alignment(horizontal="right")
     tcell.font = SUM_FONT
     tcell.fill = SUM_FILL
+    tcell.border = SUM_BORDER
     row += 1
 
     # Real Estate Taxes — from 1098 property_tax + property_tax_bill
@@ -4649,28 +4669,33 @@ def _populate_tax_review(ws, extractions, year):
     ws[f"A{row}"] = "Total Real Estate Tax"
     ws[f"A{row}"].font = SUM_FONT
     ws[f"A{row}"].fill = SUM_FILL
+    ws[f"A{row}"].border = SUM_BORDER
     rcell = ws[f"D{row}"]
     rcell.value = total_re_tax
     rcell.number_format = MONEY_FMT
     rcell.alignment = Alignment(horizontal="right")
     rcell.font = SUM_FONT
     rcell.fill = SUM_FILL
+    rcell.border = SUM_BORDER
     row += 1
 
     # Total Taxes
     total_taxes = total_state_wh + total_re_tax
     ws[f"A{row}"] = "Total Taxes:"
     ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].border = SUM_BORDER
     tcell = ws[f"D{row}"]
     tcell.value = total_taxes
     tcell.number_format = MONEY_FMT
     tcell.alignment = Alignment(horizontal="right")
     tcell.font = SUM_FONT
+    tcell.border = SUM_BORDER
     ecell = ws[f"E{row}"]
     ecell.value = total_taxes
     ecell.number_format = MONEY_FMT
     ecell.alignment = Alignment(horizontal="right")
     ecell.font = SUM_FONT
+    ecell.border = SUM_BORDER
     row += 1
 
     # Mortgage Interest — from 1098
@@ -4697,16 +4722,19 @@ def _populate_tax_review(ws, extractions, year):
         row += 1
     ws[f"A{row}"] = "Total Mortgage Interest"
     ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].border = SUM_BORDER
     mcell = ws[f"D{row}"]
     mcell.value = total_mortgage
     mcell.number_format = MONEY_FMT
     mcell.alignment = Alignment(horizontal="right")
     mcell.font = SUM_FONT
+    mcell.border = SUM_BORDER
     ecell = ws[f"E{row}"]
     ecell.value = total_mortgage
     ecell.number_format = MONEY_FMT
     ecell.alignment = Alignment(horizontal="right")
     ecell.font = SUM_FONT
+    ecell.border = SUM_BORDER
     row += 1
 
     # Charitable Contributions
@@ -4732,26 +4760,33 @@ def _populate_tax_review(ws, extractions, year):
         row += 1
     ws[f"A{row}"] = "Total Donations"
     ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].border = SUM_BORDER
     dcell = ws[f"D{row}"]
     dcell.value = total_donations
     dcell.number_format = MONEY_FMT
     dcell.alignment = Alignment(horizontal="right")
     dcell.font = SUM_FONT
+    dcell.border = SUM_BORDER
     ecell = ws[f"E{row}"]
     ecell.value = total_donations
     ecell.number_format = MONEY_FMT
     ecell.alignment = Alignment(horizontal="right")
     ecell.font = SUM_FONT
+    ecell.border = SUM_BORDER
     row += 1
 
     # Schedule A grand total
     sched_a_total = total_taxes + total_mortgage + total_donations
     row += 1
+    ws[f"A{row}"] = "Total Schedule A"
+    ws[f"A{row}"].font = SUM_FONT
+    ws[f"A{row}"].border = SUM_BORDER
     gcell = ws[f"E{row}"]
     gcell.value = sched_a_total
     gcell.number_format = MONEY_FMT
     gcell.alignment = Alignment(horizontal="right")
     gcell.font = SUM_FONT
+    gcell.border = SUM_BORDER
     row += 1
 
     # Column widths
@@ -6147,7 +6182,7 @@ def main():
                         choices=["tax_returns", "bank_statements", "trust_documents", "bookkeeping"],
                         help="Document type category (affects classification and extraction)")
     parser.add_argument("--output-format", default="tax_review",
-                        choices=["tax_review", "journal_entries", "account_balances", "trial_balance", "transaction_register"],
+                        choices=["tax_review", "tax_review_payload", "journal_entries", "account_balances", "trial_balance", "transaction_register"],
                         help="Output Excel format")
     parser.add_argument("--user-notes", default="",
                         help="Operator notes providing additional context for extraction")
@@ -6163,7 +6198,7 @@ def main():
                         help="Skip page cache (force full reprocessing)")
     args = parser.parse_args()
 
-    # ─── Regen-only mode: read log JSON → populate_template → done ───
+    # ─── Regen-only mode: read log JSON → InkSpren → done ───
     if args.regen_excel:
         if not args.log_input or not args.output:
             sys.exit("ERROR: --regen-excel requires --log-input <log.json> and --output <file.xlsx>")
@@ -6177,7 +6212,9 @@ def main():
         # Normalize brokerage data (in case corrections changed composite fields)
         extractions = normalize_brokerage_data(extractions)
         fmt = log_data.get("output_format", args.output_format)
-        populate_template(extractions, args.template, args.output, args.year, output_format=fmt)
+        # Use InkSpren output engine
+        from inkspren import populate_template as inkspren_populate
+        inkspren_populate(extractions, args.template, args.output, args.year, output_format=fmt)
         print(f"  Regenerated: {args.output}")
         return
 
@@ -6470,7 +6507,9 @@ def main():
              throughput_stats=throughput,
              streaming_stats=streaming_meta)
     if not args.log_only:
-        populate_template(extractions, args.template, output, args.year, output_format=args.output_format)
+        # Use InkSpren output engine
+        from inkspren import populate_template as inkspren_populate
+        inkspren_populate(extractions, args.template, output, args.year, output_format=args.output_format)
 
     # Clean up checkpoint + partial results on success
     clear_checkpoint(output)
