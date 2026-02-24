@@ -547,6 +547,20 @@ def _init_db():
         """)
         # ─── End Transaction Ledger Tables ──────────────────────────────────
 
+        # ─── Lite Platform: Event Store ───────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lite_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lite_events_job ON lite_events(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lite_events_type ON lite_events(event_type)")
+        # ─── End Lite Platform Tables ─────────────────────────────────────────
+
         conn.commit()
         _secure_file(DB_PATH)
         _migrate_from_json(conn)
@@ -619,6 +633,25 @@ def _migrate_from_json(conn):
             os.rename(str(VENDOR_CATEGORIES_FILE), str(VENDOR_CATEGORIES_FILE) + ".migrated")
         except (json.JSONDecodeError, IOError, OSError) as e:
             print(f"  Warning: Could not migrate vendor_categories.json: {e}")
+
+
+def _persist_lite_event(job_id, event_type, event_data_json):
+    """Store a Lite platform event (VerificationAction, ArdentResult, etc.).
+
+    Feature-flagged — only called when LITE_VERIFICATION_ENABLED is set.
+    Non-fatal: swallows all exceptions to avoid disrupting the review flow.
+    """
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT INTO lite_events (job_id, event_type, event_data, created_at) VALUES (?,?,?,?)",
+            (job_id, event_type, event_data_json, datetime.now().isoformat())
+        )
+        conn.commit()
+    except Exception:
+        pass  # Non-fatal — Lite event persistence should never break production
+    finally:
+        conn.close()
 
 
 def _client_dir(client_name, doc_type, year):
@@ -4847,6 +4880,19 @@ def guided_review_action(job_id, field_id):
 
         # Excel regen deferred to Finish Review (no auto-regen per field)
 
+        # ── Lite: VerificationAction capture (feature-flagged) ──
+        if os.environ.get("LITE_VERIFICATION_ENABLED"):
+            try:
+                from lite.adapters.oathledger import review_payload_to_action
+                _va = review_payload_to_action(
+                    payload, field_id=field_id, job_id=job_id,
+                    review_stage=stage if job else "draft",
+                )
+                _va.reviewer_id = reviewer_id
+                _persist_lite_event(job_id, "verification_action", _va.model_dump_json())
+            except Exception:
+                pass  # Non-fatal — Lite capture should never break production
+
         # ── AFTERCARE: defer heavy work to background thread ──
         _enqueue_aftercare({
             "job_id": job_id,
@@ -8031,6 +8077,24 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <button class="btn btn-primary btn-sm" onclick="sendAiChat()">Send</button>
     </div>
   </div>
+  <!-- Lite Findings Panel (data-guarded: only visible when ardent_summary exists) -->
+  <div id="liteFindingsPanel" style="display:none; border-top:2px solid var(--purple); background:var(--bg-card);">
+    <details>
+      <summary style="padding:10px 20px; cursor:pointer; font-size:13px; font-weight:700; color:var(--navy); user-select:none; display:flex; align-items:center; gap:10px;">
+        <span>Lite Findings</span>
+        <span id="liteFindingsStatusBadge" style="font-size:11px; font-weight:700; padding:2px 10px; border-radius:10px; color:#fff;"></span>
+        <span id="liteFindingsCounts" style="font-size:11px; color:var(--text-secondary); margin-left:auto;"></span>
+      </summary>
+      <div style="padding:0 20px 16px;">
+        <!-- Severity count pills -->
+        <div id="liteFindingsSeverityRow" style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap;"></div>
+        <!-- Findings list -->
+        <div id="liteFindingsList" style="max-height:320px; overflow-y:auto;"></div>
+        <!-- Provenance -->
+        <div id="liteFindingsProvenance" style="margin-top:8px; font-size:11px; color:var(--text-light);"></div>
+      </div>
+    </details>
+  </div>
 </div>
 
 <!-- ═══ GUIDED REVIEW SECTION ═══ -->
@@ -8618,8 +8682,9 @@ function _loadReviewData(job, callback) {
     countTotalFields();
     updateVerifyBar();
     loadPage(1);
+    renderLiteFindings();
     if (callback) callback();
-  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); if (callback) callback(); });
+  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); renderLiteFindings(); if (callback) callback(); });
 }
 
 // Open grid view explicitly (from "List View" button in guided review)
@@ -8654,6 +8719,7 @@ function openEarlyReview() {
     countTotalFields();
     updateVerifyBar();
     loadPage(1);
+    renderLiteFindings();
     // Switch to slower polling while reviewing
     clearInterval(pollTimer);
     pollTimer = setInterval(pollPartialStatus, 2000);
@@ -8679,6 +8745,7 @@ function pollPartialStatus() {
         countTotalFields();
         updateVerifyBar();
         loadPage(savedPage);
+        renderLiteFindings();
       }).catch(() => {});
       return;
     }
@@ -8703,6 +8770,7 @@ function pollPartialStatus() {
           countTotalFields();
           updateVerifyBar();
           loadPage(savedPage);
+          renderLiteFindings();
         }
       }).catch(() => {});
     }
@@ -10493,6 +10561,100 @@ function showAuditComplete(passCount, failCount, flaggedIds) {
 
   document.getElementById('guidedDetail').innerHTML = html;
   document.getElementById('guidedDetail').style.opacity = '1';
+}
+
+// ─── Lite Findings Panel (3C-1.2) ───────────────────────────────────────────
+function renderLiteFindings() {
+  const panel = document.getElementById('liteFindingsPanel');
+  if (!panel) return;
+
+  // Data-level guard: only show when ardent_summary exists
+  if (!reviewData || !reviewData.ardent_summary) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  const s = reviewData.ardent_summary;
+  panel.style.display = '';
+
+  // Status badge
+  const badge = document.getElementById('liteFindingsStatusBadge');
+  if (s.blocked) {
+    badge.textContent = 'BLOCKED';
+    badge.style.background = 'var(--red)';
+  } else if (s.needs_review) {
+    badge.textContent = 'REVIEW REQUIRED';
+    badge.style.background = 'var(--yellow)';
+    badge.style.color = '#7C5800';
+  } else {
+    badge.textContent = 'OK';
+    badge.style.background = 'var(--green)';
+  }
+
+  // Counts summary
+  const counts = document.getElementById('liteFindingsCounts');
+  counts.textContent = (s.findings || []).length + ' finding' + ((s.findings || []).length !== 1 ? 's' : '');
+
+  // Severity pills
+  const sevRow = document.getElementById('liteFindingsSeverityRow');
+  const pills = [];
+  if (s.critical_count) pills.push('<span style="background:var(--red-bg);color:var(--red);padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600">Critical: ' + s.critical_count + '</span>');
+  if (s.error_count) pills.push('<span style="background:var(--red-bg);color:var(--red);padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600">Error: ' + s.error_count + '</span>');
+  if (s.warning_count) pills.push('<span style="background:var(--yellow-bg);color:#B7791F;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600">Warning: ' + s.warning_count + '</span>');
+  if (s.info_count) pills.push('<span style="background:#EBF5FB;color:var(--accent);padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600">Info: ' + s.info_count + '</span>');
+  if (s.verification_requests_count) pills.push('<span style="background:var(--purple-bg);color:var(--purple);padding:2px 8px;border-radius:8px;font-size:11px;font-weight:600">Verification Requests: ' + s.verification_requests_count + '</span>');
+  sevRow.innerHTML = pills.join('');
+
+  // Severity color map
+  const sevColors = { critical: 'var(--red)', error: 'var(--red)', warning: 'var(--yellow)', info: 'var(--accent)' };
+  const sevBgColors = { critical: 'var(--red-bg)', error: 'var(--red-bg)', warning: 'var(--yellow-bg)', info: '#EBF5FB' };
+
+  // Findings list
+  const list = document.getElementById('liteFindingsList');
+  if (!s.findings || s.findings.length === 0) {
+    list.innerHTML = '<div style="padding:12px;color:var(--text-light);font-size:12px;">No findings.</div>';
+  } else {
+    let html = '';
+    s.findings.forEach(function(f) {
+      const sevColor = sevColors[f.severity] || 'var(--text-secondary)';
+      const sevBg = sevBgColors[f.severity] || '#F5F5F5';
+      const passIcon = f.passed ? '<span style="color:var(--green)" title="Passed">&#x2713;</span>' : '<span style="color:' + sevColor + '" title="Failed">&#x2717;</span>';
+
+      html += '<div style="padding:8px 0;border-bottom:1px solid var(--border-light);font-size:12px;">';
+      html += '  <div style="display:flex;align-items:center;gap:8px;">';
+      html += '    ' + passIcon;
+      html += '    <span style="background:' + sevBg + ';color:' + sevColor + ';padding:1px 6px;border-radius:6px;font-size:10px;font-weight:700;text-transform:uppercase;">' + esc(f.severity) + '</span>';
+      html += '    <span style="font-family:var(--mono);font-size:11px;color:var(--text-secondary);">' + esc(f.rule_id) + '</span>';
+      html += '    <span style="color:var(--text);">' + esc(f.message || f.rule_name) + '</span>';
+      html += '  </div>';
+
+      // Evidence items
+      if (f.evidence && f.evidence.length > 0) {
+        html += '  <div style="margin:4px 0 0 24px;">';
+        f.evidence.forEach(function(ev) {
+          html += '<div style="font-size:11px;color:var(--text-secondary);padding:2px 0;">';
+          if (ev.field) html += '<span style="font-family:var(--mono);">' + esc(ev.field) + '</span>: ';
+          if (ev.extracted_value !== null && ev.extracted_value !== undefined) html += 'extracted=' + esc(String(ev.extracted_value));
+          if (ev.expected_value !== null && ev.expected_value !== undefined) html += ', expected=' + esc(String(ev.expected_value));
+          if (ev.expected_range) html += ' (' + esc(ev.expected_range) + ')';
+          if (ev.detail) html += ' &mdash; ' + esc(ev.detail);
+          html += '</div>';
+        });
+        html += '  </div>';
+      }
+      html += '</div>';
+    });
+    list.innerHTML = html;
+  }
+
+  // Provenance footer
+  const prov = document.getElementById('liteFindingsProvenance');
+  const parts = [];
+  if (s.ruleset_version) parts.push('Ruleset v' + s.ruleset_version);
+  if (s.evaluated_at) parts.push('Evaluated: ' + s.evaluated_at);
+  if (s.deterministic_match_pct !== null && s.deterministic_match_pct !== undefined) parts.push('Match: ' + s.deterministic_match_pct.toFixed(1) + '%');
+  if (s.schema_version) parts.push('Schema v' + s.schema_version);
+  prov.textContent = parts.join(' \u2022 ');
 }
 
 </script>

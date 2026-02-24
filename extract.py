@@ -3833,11 +3833,11 @@ def validate(extractions, prior_year_context=None):
             if isinstance(fdata, dict):
                 conf = fdata.get("confidence", "")
                 if conf == "verified_corrected":
-                    warnings.append(f"CORRECTED: {label} — {fname}: {fdata.get('original_value')} → {fdata.get('value')}")
+                    warnings.append(f"CORRECTED[CONF_FIELD_CORRECTED]: {label} — {fname}: {fdata.get('original_value')} → {fdata.get('value')}")
                 elif conf == "low":
-                    warnings.append(f"LOW CONFIDENCE: {label} — {fname} = {fdata.get('value')}")
+                    warnings.append(f"LOW CONFIDENCE[CONF_FIELD_LOW]: {label} — {fname} = {fdata.get('value')}")
                 elif conf == "found_in_verification":
-                    warnings.append(f"FOUND IN VERIFY: {label} — {fname} = {fdata.get('value')}")
+                    warnings.append(f"FOUND IN VERIFY[CONF_FIELD_FOUND_VERIFY]: {label} — {fname} = {fdata.get('value')}")
 
         # ─── W-2: wage relationship checks ───
         if dtype == "W-2":
@@ -3850,32 +3850,32 @@ def validate(extractions, prior_year_context=None):
             med_wh = get_val(fields, "medicare_wh")
 
             if wages and medicare_wages and medicare_wages < wages * 0.8:
-                warnings.append(f"CHECK: {label} — Medicare wages ({medicare_wages:,.2f}) << Box 1 wages ({wages:,.2f})")
+                warnings.append(f"CHECK[REL_W2_MEDICARE_WAGES_LOW]: {label} — Medicare wages ({medicare_wages:,.2f}) << Box 1 wages ({wages:,.2f})")
             # SS wages capped at wage base ($168,600 for 2024, $176,100 for 2025)
             if wages and ss_wages and ss_wages > wages * 1.01:
-                warnings.append(f"ARITH: {label} — SS wages ({ss_wages:,.2f}) > Box 1 wages ({wages:,.2f})")
+                warnings.append(f"ARITH[ACC_W2_SS_WAGES_EXCEEDS_BOX1]: {label} — SS wages ({ss_wages:,.2f}) > Box 1 wages ({wages:,.2f})")
             # SS withholding ≈ 6.2% of SS wages
             if ss_wages and ss_wh:
                 expected_ss = ss_wages * 0.062
                 if abs(ss_wh - expected_ss) > max(1.0, expected_ss * 0.02):
-                    warnings.append(f"CHECK: {label} — SS WH ({ss_wh:,.2f}) ≠ 6.2% of SS wages ({expected_ss:,.2f})")
+                    warnings.append(f"CHECK[REL_W2_SS_WH_RATE]: {label} — SS WH ({ss_wh:,.2f}) ≠ 6.2% of SS wages ({expected_ss:,.2f})")
             # Medicare withholding ≈ 1.45% of Medicare wages (plus 0.9% above $200k)
             if medicare_wages and med_wh:
                 expected_med = medicare_wages * 0.0145
                 if medicare_wages > 200000:
                     expected_med += (medicare_wages - 200000) * 0.009
                 if abs(med_wh - expected_med) > max(1.0, expected_med * 0.05):
-                    warnings.append(f"CHECK: {label} — Medicare WH ({med_wh:,.2f}) vs expected ({expected_med:,.2f})")
+                    warnings.append(f"CHECK[REL_W2_MEDICARE_WH_RATE]: {label} — Medicare WH ({med_wh:,.2f}) vs expected ({expected_med:,.2f})")
             # Federal WH sanity: shouldn't exceed wages
             if wages and fed_wh and fed_wh > wages:
-                warnings.append(f"ARITH: {label} — Federal WH ({fed_wh:,.2f}) > wages ({wages:,.2f})")
+                warnings.append(f"ARITH[ACC_W2_FED_WH_EXCEEDS_WAGES]: {label} — Federal WH ({fed_wh:,.2f}) > wages ({wages:,.2f})")
 
         # ─── 1099-DIV: qualified ≤ ordinary ───
         if "1099-DIV" in dtype:
             ordinary = get_val(fields, "ordinary_dividends") or get_val(fields, "div_ordinary_dividends")
             qualified = get_val(fields, "qualified_dividends") or get_val(fields, "div_qualified_dividends")
             if ordinary and qualified and qualified > ordinary + 0.01:
-                warnings.append(f"ARITH: {label} — Qualified ({qualified:,.2f}) > Ordinary ({ordinary:,.2f})")
+                warnings.append(f"ARITH[ACC_1099DIV_QUALIFIED_EXCEEDS_ORDINARY]: {label} — Qualified ({qualified:,.2f}) > Ordinary ({ordinary:,.2f})")
 
         # ─── 1099-R: taxable ≤ gross ───
         if "1099-R" in dtype:
@@ -3883,9 +3883,9 @@ def validate(extractions, prior_year_context=None):
             taxable = get_val(fields, "taxable_amount")
             fed_wh = get_val(fields, "federal_wh")
             if gross and taxable and taxable > gross + 0.01:
-                warnings.append(f"ARITH: {label} — Taxable ({taxable:,.2f}) > Gross distribution ({gross:,.2f})")
+                warnings.append(f"ARITH[ACC_1099R_TAXABLE_EXCEEDS_GROSS]: {label} — Taxable ({taxable:,.2f}) > Gross distribution ({gross:,.2f})")
             if gross and fed_wh and fed_wh > gross:
-                warnings.append(f"ARITH: {label} — Federal WH ({fed_wh:,.2f}) > Gross ({gross:,.2f})")
+                warnings.append(f"ARITH[ACC_1099R_FED_WH_EXCEEDS_GROSS]: {label} — Federal WH ({fed_wh:,.2f}) > Gross ({gross:,.2f})")
 
         # ─── K-1: Box 2 / Box 15 confusion ───
         if "K-1" in dtype:
@@ -3893,9 +3893,9 @@ def validate(extractions, prior_year_context=None):
             box15 = get_val(fields, "box15_credits")
             box1 = get_val(fields, "box1_ordinary_income")
             if box2 and box15 and box2 == box15 and box2 != 0:
-                warnings.append(f"CHECK: {label} — Box 2 ({box2:,.2f}) = Box 15 ({box15:,.2f}), possible misassignment")
+                warnings.append(f"CHECK[REL_K1_BOX2_BOX15_MISMATCH]: {label} — Box 2 ({box2:,.2f}) = Box 15 ({box15:,.2f}), possible misassignment")
             if box2 and box2 > 0 and not box1:
-                warnings.append(f"CHECK: {label} — Box 2 positive ({box2:,.2f}) with no Box 1; verify not credits")
+                warnings.append(f"CHECK[REL_K1_BOX2_NO_BOX1]: {label} — Box 2 positive ({box2:,.2f}) with no Box 1; verify not credits")
 
         # ─── 1099-K: monthly totals ≈ gross ───
         if "1099-K" in dtype:
@@ -3904,7 +3904,7 @@ def validate(extractions, prior_year_context=None):
                       "jul", "aug", "sep", "oct", "nov", "dec"]
             monthly_sum = sum(get_val(fields, m) or 0 for m in months)
             if gross and monthly_sum > 0 and abs(gross - monthly_sum) > 1.0:
-                warnings.append(f"ARITH: {label} — Gross ({gross:,.2f}) ≠ sum of monthly ({monthly_sum:,.2f})")
+                warnings.append(f"ARITH[ACC_1099K_GROSS_MONTHLY_MISMATCH]: {label} — Gross ({gross:,.2f}) ≠ sum of monthly ({monthly_sum:,.2f})")
 
         # ─── Bank statement reconciliation ───
         if "bank_statement" in dtype:
@@ -3922,7 +3922,7 @@ def validate(extractions, prior_year_context=None):
                 diff = abs(end - expected_end)
                 if diff > 1.0:
                     warnings.append(
-                        f"ARITH: {label} — Balance doesn't reconcile: "
+                        f"ARITH[ACC_BANK_BALANCE_RECONCILIATION]: {label} — Balance doesn't reconcile: "
                         f"begin ({begin:,.2f}) + dep ({deposits:,.2f}) - wdl ({withdrawals:,.2f}) "
                         f"- fees ({fees:,.2f}) + int ({interest:,.2f}) = {expected_end:,.2f}, "
                         f"but ending = {end:,.2f} (diff: {diff:,.2f})")
@@ -3937,7 +3937,7 @@ def validate(extractions, prior_year_context=None):
                                    ("deposit", "transfer in", "credit"))
                 if txn_deposits > 0 and abs(txn_deposits - deposits) > 1.0:
                     warnings.append(
-                        f"CHECK: {label} — Sum of deposit txns ({txn_deposits:,.2f}) "
+                        f"CHECK[REL_BANK_TXN_DEPOSIT_MISMATCH]: {label} — Sum of deposit txns ({txn_deposits:,.2f}) "
                         f"≠ total deposits ({deposits:,.2f})")
 
         # ─── Credit card statement reconciliation ───
@@ -3955,7 +3955,7 @@ def validate(extractions, prior_year_context=None):
                 diff = abs(new_bal - expected)
                 if diff > 1.0:
                     warnings.append(
-                        f"ARITH: {label} — CC balance doesn't reconcile: "
+                        f"ARITH[ACC_CC_BALANCE_RECONCILIATION]: {label} — CC balance doesn't reconcile: "
                         f"expected {expected:,.2f}, got {new_bal:,.2f} (diff: {diff:,.2f})")
 
         # ─── Invoice arithmetic ───
@@ -3967,7 +3967,7 @@ def validate(extractions, prior_year_context=None):
                 expected = subtotal + tax
                 if abs(total - expected) > 0.05:
                     warnings.append(
-                        f"ARITH: {label} — subtotal ({subtotal:,.2f}) + tax ({tax:,.2f}) "
+                        f"ARITH[ACC_INVOICE_ARITHMETIC]: {label} — subtotal ({subtotal:,.2f}) + tax ({tax:,.2f}) "
                         f"= {expected:,.2f}, but total = {total:,.2f}")
 
         # ─── Receipt arithmetic ───
@@ -3979,7 +3979,7 @@ def validate(extractions, prior_year_context=None):
                 expected = subtotal + tax
                 if abs(total - expected) > 0.10:
                     warnings.append(
-                        f"ARITH: {label} — subtotal ({subtotal:,.2f}) + tax ({tax:,.2f}) "
+                        f"ARITH[ACC_RECEIPT_ARITHMETIC]: {label} — subtotal ({subtotal:,.2f}) + tax ({tax:,.2f}) "
                         f"= {expected:,.2f}, but total = {total:,.2f}")
 
         # ─── Payroll arithmetic ───
@@ -3997,7 +3997,7 @@ def validate(extractions, prior_year_context=None):
                 # (401k, insurance, garnishments) we didn't extract
                 if expected_net > 0 and abs(net - expected_net) > expected_net * 0.20:
                     warnings.append(
-                        f"CHECK: {label} — gross ({gross:,.2f}) - known deductions ({total_deductions:,.2f}) "
+                        f"CHECK[REL_CHECKSTUB_PAYROLL_DEDUCTIONS]: {label} — gross ({gross:,.2f}) - known deductions ({total_deductions:,.2f}) "
                         f"= {expected_net:,.2f}, but net = {net:,.2f} "
                         f"(possible unextracted deductions: {expected_net - net:,.2f})")
 
@@ -4011,7 +4011,7 @@ def validate(extractions, prior_year_context=None):
                 component_sum = principal + interest + escrow
                 if abs(payment - component_sum) > 1.0:
                     warnings.append(
-                        f"CHECK: {label} — Payment ({payment:,.2f}) ≠ principal ({principal:,.2f}) "
+                        f"CHECK[REL_LOAN_PAYMENT_COMPONENTS]: {label} — Payment ({payment:,.2f}) ≠ principal ({principal:,.2f}) "
                         f"+ interest ({interest:,.2f}) + escrow ({escrow:,.2f}) = {component_sum:,.2f}")
 
     # ─── Cross-document checks ───
@@ -4028,7 +4028,7 @@ def validate(extractions, prior_year_context=None):
                 ent2 = e2.get("payer_or_entity", "")
                 if ent1.upper() == ent2.upper():
                     warnings.append(
-                        f"CROSS-DOC: {ent1} — ending balance ({end1:,.2f}) ≠ "
+                        f"CROSS-DOC[XDOC_BANK_CONTINUITY]: {ent1} — ending balance ({end1:,.2f}) ≠ "
                         f"next beginning balance ({begin2:,.2f})")
 
     # ─── Duplicate document detection ───
@@ -4066,7 +4066,7 @@ def validate(extractions, prior_year_context=None):
             if fingerprint in seen_docs:
                 prev_entity, prev_page, _ = seen_docs[fingerprint]
                 warnings.append(
-                    f"CROSS-DOC: Possible duplicate — {dtype} from {entity} "
+                    f"CROSS-DOC[XDOC_DUPLICATE_DOCUMENT]: Possible duplicate — {dtype} from {entity} "
                     f"(page {page}) has same amounts as page {prev_page}. "
                     f"Check if scanned twice.")
             else:
@@ -4123,7 +4123,7 @@ def validate(extractions, prior_year_context=None):
                             if pct_change > 50:
                                 direction = "↑" if current_amt > prior_amt else "↓"
                                 warnings.append(
-                                    f"VARIANCE: {entity} {dtype} — {direction} "
+                                    f"VARIANCE[VAR_PRIOR_YEAR_THRESHOLD]: {entity} {dtype} — {direction} "
                                     f"{pct_change:.0f}% vs prior year "
                                     f"(${current_amt:,.2f} vs PY ${prior_amt:,.2f})")
                         break
@@ -5886,7 +5886,7 @@ def _tr_col_widths(ws):
 
 # ─── LOG + SUMMARY ───────────────────────────────────────────────────────────
 
-def save_log(extractions, classifications, warnings, output_path, output_format="tax_review", user_notes="", ai_instructions="", cost_data=None, text_layer_stats=None, page_preprocessing=None, routing_plan=None, consensus_data=None, sections_by_page=None, timing_data=None, throughput_stats=None, streaming_stats=None):
+def save_log(extractions, classifications, warnings, output_path, output_format="tax_review", user_notes="", ai_instructions="", cost_data=None, text_layer_stats=None, page_preprocessing=None, routing_plan=None, consensus_data=None, sections_by_page=None, timing_data=None, throughput_stats=None, streaming_stats=None, ardent_result=None, ardent_diff=None, ardent_summary=None):
     global _cost_tracker
     log_path = output_path.replace(".xlsx", "_log.json")
 
@@ -5990,6 +5990,19 @@ def save_log(extractions, classifications, warnings, output_path, output_format=
         log["cost"] = cost_data
     elif _cost_tracker:
         log["cost"] = _cost_tracker.to_dict()
+    # ── Lite: Ardent result + diff artifact ──
+    if ardent_result is not None:
+        try:
+            log["ardent_result"] = ardent_result.model_dump(mode="json")
+        except Exception:
+            log["ardent_result"] = str(ardent_result)
+    if ardent_diff is not None:
+        log["ardent_diff"] = ardent_diff
+    if ardent_summary is not None:
+        try:
+            log["ardent_summary"] = ardent_summary.model_dump(mode="json")
+        except Exception:
+            log["ardent_summary"] = str(ardent_summary)
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2, default=str)
     print(f"  Log: {log_path}")
@@ -6421,6 +6434,58 @@ def main():
     # Phase 5: Validate
     warnings = validate(extractions, prior_year_context=context_data)
 
+    # ─── [ARDENT] Shadow evaluation (feature-flagged) ────────────────────
+    _ardent_result = None
+    _ardent_diff = None
+    _ardent_summary = None
+    if os.environ.get("LITE_ARDENT_ENABLED"):
+        try:
+            from lite.adapters.oathledger import (
+                extractions_to_candidates, diff_ardent_vs_warnings,
+            )
+            from lite.ardent.engine import evaluate as ardent_evaluate
+            from lite.ardent.summary import build_ardent_summary
+            from lite.lens import Lens
+
+            _ardent_candidates = extractions_to_candidates(
+                extractions,
+                job_id=os.path.basename(args.pdf or ""),
+                client_id="",
+            )
+            _ardent_context = Lens.build_bundle_from_files(
+                context_file=args.context_file,
+                tax_year=str(args.year),
+            )
+            _ardent_result = ardent_evaluate(_ardent_candidates, _ardent_context)
+            _ardent_diff = diff_ardent_vs_warnings(_ardent_result, warnings)
+
+            # Build UI-facing summary
+            _ardent_summary = build_ardent_summary(
+                _ardent_result,
+                evaluated_at_iso=_ardent_result.evaluated_at.isoformat() if _ardent_result.evaluated_at else "",
+                deterministic_match_pct=_ardent_diff.get("deterministic_match_pct") if _ardent_diff else None,
+            )
+
+            print(f"\n── [ARDENT] Shadow evaluation ──")
+            print(f"  Ruleset: {_ardent_result.ruleset_id} "
+                  f"({_ardent_result.ruleset_hash[:12]})")
+            print(f"  Rules: {_ardent_result.total_rules_evaluated} evaluated, "
+                  f"{_ardent_result.rules_passed} passed, "
+                  f"{_ardent_result.rules_failed} failed")
+            if _ardent_result.evaluation_duration_ms:
+                print(f"  Duration: {_ardent_result.evaluation_duration_ms:.1f}ms")
+            if _ardent_diff:
+                n_match = len(_ardent_diff.get("matches", []))
+                n_disc = len(_ardent_diff.get("discrepancies", []))
+                print(f"  Diff: {n_match} matches, {n_disc} discrepancies")
+            if _ardent_summary:
+                _status = "BLOCKED" if _ardent_summary.blocked else ("REVIEW" if _ardent_summary.needs_review else "OK")
+                print(f"  Summary: {_status} ({len(_ardent_summary.findings)} findings)")
+        except Exception as _ardent_err:
+            print(f"\n── [ARDENT] Shadow evaluation failed "
+                  f"(non-fatal): {_ardent_err} ──")
+    # ─── End ARDENT shadow ───────────────────────────────────────────────
+
     # Summary
     print_summary(extractions)
 
@@ -6462,7 +6527,10 @@ def main():
              sections_by_page=sections_by_page,
              timing_data=_pipeline_timer.to_dict(),
              throughput_stats=throughput,
-             streaming_stats=streaming_meta)
+             streaming_stats=streaming_meta,
+             ardent_result=_ardent_result,
+             ardent_diff=_ardent_diff,
+             ardent_summary=_ardent_summary)
     if not args.log_only:
         populate_template(extractions, args.template, output, args.year, output_format=args.output_format)
 
