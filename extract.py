@@ -89,6 +89,13 @@ try:
 except ImportError:
     HAS_PYMUPDF = False
 
+# Fix Windows cp1252 console encoding — allow UTF-8 box-drawing / symbols in print()
+import io as _io
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = _io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 
 MODEL = "claude-sonnet-4-20250514"
