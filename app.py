@@ -7629,8 +7629,8 @@ td.actions { white-space: nowrap; text-align: right; }
 @keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 
 /* ═══ UPLOAD SECTION ═══ */
-.upload-area { border: 2px dashed var(--border); border-radius: var(--radius-lg); padding: 48px 24px; text-align: center; cursor: pointer; transition: var(--transition); background: #FAFAF8; }
-.upload-area:hover, .upload-area.dragover { border-color: var(--accent); background: #F0F8FF; }
+.upload-area { border: 2px dashed var(--border); border-radius: var(--radius-lg); padding: 48px 24px; text-align: center; cursor: pointer; transition: var(--transition); background: var(--upload-bg, #FAFAF8); }
+.upload-area:hover, .upload-area.dragover { border-color: var(--accent); background: var(--upload-hover-bg, #F0F8FF); }
 .upload-area svg { width: 48px; height: 48px; color: var(--text-light); margin-bottom: 12px; }
 .upload-area h3 { font-size: 16px; color: var(--text); margin-bottom: 4px; }
 .upload-area p { font-size: 13px; color: var(--text-secondary); }
@@ -8166,6 +8166,11 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
             <div class="pill-group" id="docTypePills"></div>
           </div>
 
+          <div class="form-group">
+            <label class="form-label">Output Format</label>
+            <div class="pill-group" id="outputFormatPills"></div>
+          </div>
+
           <details style="margin-top:8px">
             <summary style="cursor:pointer;font-size:13px;color:var(--text-muted);user-select:none">&#x2699; Advanced Options</summary>
             <div style="margin-top:8px">
@@ -8520,7 +8525,7 @@ function setTheme(t) {
   else { document.documentElement.setAttribute('data-theme', t); }
   localStorage.setItem('oathledger-theme', t);
   document.querySelectorAll('.theme-dot').forEach(d => d.classList.toggle('active', d.dataset.theme === t));
-  if (document.getElementById('sec-dashboard') && document.getElementById('sec-dashboard').classList.contains('active')) {
+  if (typeof loadDashboard === 'function' && document.getElementById('sec-dashboard') && document.getElementById('sec-dashboard').classList.contains('active')) {
     setTimeout(loadDashboard, 50);
   }
 }
@@ -8600,12 +8605,14 @@ function buildPills() {
   DOC_TYPES.forEach(dt => {
     dh += '<div class="pill' + (dt.id === selectedDocType ? ' active' : '') + '" onclick="selectDocType(\'' + dt.id + '\')">' + dt.icon + ' ' + dt.label + '</div>';
   });
-  document.getElementById('docTypePills').innerHTML = dh;
+  var dtp = document.getElementById('docTypePills');
+  if (dtp) dtp.innerHTML = dh;
   let oh = '';
   OUTPUT_FORMATS.forEach(of_ => {
     oh += '<div class="pill' + (of_.id === selectedOutputFormat ? ' active' : '') + '" onclick="selectOutputFormat(\'' + of_.id + '\')">' + of_.label + '</div>';
   });
-  document.getElementById('outputFormatPills').innerHTML = oh;
+  var ofp = document.getElementById('outputFormatPills');
+  if (ofp) ofp.innerHTML = oh;
 }
 
 function selectDocType(id) { selectedDocType = id; buildPills(); }
@@ -11013,18 +11020,18 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n  ⚠  ANTHROPIC_API_KEY not set!")
+        print("\n  WARNING:  ANTHROPIC_API_KEY not set!")
         print("  Run: export ANTHROPIC_API_KEY=sk-ant-...")
         print()
 
     if not (BASE_DIR / "extract.py").exists():
-        print("\n  ⚠  extract.py not found in", BASE_DIR)
+        print("\n  WARNING:  extract.py not found in", BASE_DIR)
         print("  Place extract.py in the same folder as app.py\n")
 
     print("=" * 52)
     print(f"  Starting OathLedger on :{port}")
     print(f"  (Bearden Document Intake Platform v{_app_version})")
-    print("  ─────────────────────────────────────")
+    print("  -------------------------------------")
     print(f"  Open in browser:  http://localhost:{port}")
     print(f"  Database:         {DB_PATH}")
     print(f"  Uploads:          {UPLOAD_DIR}")
