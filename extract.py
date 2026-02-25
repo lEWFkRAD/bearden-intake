@@ -103,6 +103,34 @@ MAX_TOKENS = 8000
 DPI = 250
 MAX_CONCURRENT = 4  # Parallel API calls (Anthropic rate limit friendly)
 
+# Auto-detect poppler on Windows (pdf2image needs it for PDF → image conversion)
+POPPLER_PATH = None
+if sys.platform == "win32":
+    import glob as _glob
+    _candidates = _glob.glob(r"C:\tools\poppler*\Library\bin") + \
+                  _glob.glob(r"C:\tools\poppler*\bin") + \
+                  _glob.glob(r"C:\Program Files\poppler*\Library\bin") + \
+                  _glob.glob(r"C:\Program Files\poppler*\bin")
+    for _p in _candidates:
+        if os.path.isfile(os.path.join(_p, "pdftoppm.exe")):
+            POPPLER_PATH = _p
+            break
+    if not POPPLER_PATH:
+        # Check if pdftoppm is on PATH already
+        import shutil
+        if not shutil.which("pdftoppm"):
+            print("WARNING: poppler not found. PDF conversion will fail.")
+            print("  Install: download from https://github.com/oschwartz10612/poppler-windows/releases")
+            print("  Extract to C:\\tools\\poppler-XX.XX.X\\")
+
+# Auto-detect Tesseract on Windows
+if sys.platform == "win32" and HAS_TESSERACT:
+    import shutil as _shutil
+    if not _shutil.which("tesseract"):
+        _tess_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.isfile(_tess_path):
+            pytesseract.pytesseract.tesseract_cmd = _tess_path
+
 # Minimum OCR character count to consider OCR usable
 OCR_MIN_CHARS = 100
 
@@ -1984,7 +2012,10 @@ def pdf_to_images(pdf_path, dpi=DPI, page_texts=None):
         page_preprocessing: list[dict] — per-page preprocessing metadata
     """
     print(f"Converting PDF at {dpi} DPI...")
-    raw_images = convert_from_path(pdf_path, dpi=dpi)
+    convert_kwargs = {"dpi": dpi}
+    if POPPLER_PATH:
+        convert_kwargs["poppler_path"] = POPPLER_PATH
+    raw_images = convert_from_path(pdf_path, **convert_kwargs)
     b64_images = []
     page_preprocessing = []
     rotated_count = 0
