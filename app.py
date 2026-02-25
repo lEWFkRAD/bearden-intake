@@ -7489,6 +7489,10 @@ MAIN_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OathLedger — Document Intake</title>
+<script>
+// Apply saved theme before paint to prevent flash
+(function(){var t=localStorage.getItem('oathledger-theme');if(t)document.documentElement.setAttribute('data-theme',t);})();
+</script>
 <style>
 /* ═══ DESIGN SYSTEM ═══ */
 :root {
@@ -7814,7 +7818,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 /* ═══ RESPONSIVE ═══ */
 @media (max-width: 900px) {
   .sidebar { width: 60px; }
-  .sidebar-brand h1, .sidebar-brand p, .nav-item span, .sidebar-footer { display: none; }
+  .sidebar-brand h1, .sidebar-brand p, .nav-item span, .sidebar-footer label, .sidebar-footer .theme-picker, .sidebar-footer p { display: none; }
   .nav-item { justify-content: center; padding: 12px; }
   .main { margin-left: 60px; }
   .review-split { grid-template-columns: 1fr; }
@@ -7859,6 +7863,207 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   .guided-field-value { font-size: 24px; padding: 16px; }
   .guided-actions { grid-template-columns: 1fr; }
 }
+
+/* ═══ DARK THEME ═══ */
+[data-theme="dark"] {
+  --bg: #0D1117;
+  --bg-card: #161B22;
+  --bg-sidebar: #010409;
+  --bg-sidebar-hover: #1C2333;
+  --bg-sidebar-active: #253044;
+  --navy: #E6EDF3;
+  --navy-light: #B1BAC4;
+  --accent: #58A6FF;
+  --accent-hover: #79C0FF;
+  --green: #3FB950;
+  --green-bg: #0D2818;
+  --yellow: #D29922;
+  --yellow-bg: #2A1F00;
+  --red: #F85149;
+  --red-bg: #2D0B0E;
+  --purple: #BC8CFF;
+  --purple-bg: #1C0F2B;
+  --text: #E6EDF3;
+  --text-secondary: #8B949E;
+  --text-light: #6E7681;
+  --border: #30363D;
+  --border-light: #21262D;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,0.5);
+  --hover-bg: #1C2128;
+  --focus-bg: #1A2332;
+  --confirmed-bg: #0D2818;
+  --corrected-bg: #2A1F00;
+  --flagged-bg: #2D1500;
+  --entity-bg: #1C2128;
+  --console-bg: #010409;
+  --console-text: #8B949E;
+  --console-hl: #58A6FF;
+  --pdf-bg: #010409;
+  --upload-bg: #161B22;
+  --upload-hover-bg: #1A2332;
+  --badge-blue-bg: #1A2332;
+  --badge-gray-bg: #21262D;
+  --pill-bg: #21262D;
+  --btn-bg: #21262D;
+  --input-bg: #0D1117;
+}
+[data-theme="dark"] ::selection { background: var(--accent); color: #0D1117; }
+[data-theme="dark"] .sidebar { border-right: 1px solid var(--border); }
+
+/* ═══ SYNTHWAVE THEME ═══ */
+[data-theme="synthwave"] {
+  --bg: #13081E;
+  --bg-card: #1A0F2E;
+  --bg-sidebar: #0A0514;
+  --bg-sidebar-hover: #241542;
+  --bg-sidebar-active: #331D5C;
+  --navy: #F0E6FF;
+  --navy-light: #C4A8FF;
+  --accent: #FF2D95;
+  --accent-hover: #FF5CAF;
+  --green: #00F0FF;
+  --green-bg: #001A1F;
+  --yellow: #FFD700;
+  --yellow-bg: #2A2200;
+  --red: #FF3860;
+  --red-bg: #2D0A14;
+  --purple: #BD93F9;
+  --purple-bg: #1C0D35;
+  --text: #F0E6FF;
+  --text-secondary: #A78BCC;
+  --text-light: #7B5EAA;
+  --border: #2D1B4E;
+  --border-light: #1F1336;
+  --shadow-sm: 0 1px 4px rgba(255,45,149,0.1);
+  --shadow-md: 0 4px 14px rgba(255,45,149,0.15);
+  --shadow-lg: 0 8px 28px rgba(255,45,149,0.2);
+  --hover-bg: #221340;
+  --focus-bg: #261850;
+  --confirmed-bg: #001A1F;
+  --corrected-bg: #2A2200;
+  --flagged-bg: #2D0A14;
+  --entity-bg: #1F1336;
+  --console-bg: #0A0514;
+  --console-text: #A78BCC;
+  --console-hl: #FF2D95;
+  --pdf-bg: #0A0514;
+  --upload-bg: #1A0F2E;
+  --upload-hover-bg: #261850;
+  --badge-blue-bg: #1C0D35;
+  --badge-gray-bg: #1F1336;
+  --pill-bg: #1F1336;
+  --btn-bg: #1F1336;
+  --input-bg: #13081E;
+}
+[data-theme="synthwave"] ::selection { background: #FF2D95; color: #13081E; }
+[data-theme="synthwave"] .sidebar { border-right: 1px solid #2D1B4E; }
+[data-theme="synthwave"] .card { border-color: #2D1B4E; box-shadow: 0 0 20px rgba(255,45,149,0.08), 0 0 60px rgba(189,147,249,0.04), var(--shadow-sm); }
+[data-theme="synthwave"] .card:hover { box-shadow: 0 0 30px rgba(255,45,149,0.15), 0 0 80px rgba(189,147,249,0.08); }
+[data-theme="synthwave"] .nav-item.active { border-left-color: #FF2D95; }
+[data-theme="synthwave"] .btn.primary { background: linear-gradient(135deg, #FF2D95, #BD93F9); border: none; }
+[data-theme="synthwave"] .btn.primary:hover { background: linear-gradient(135deg, #FF5CAF, #D4B0FF); }
+/* Synthwave glow effects */
+[data-theme="synthwave"] .page-header h2 { text-shadow: 0 0 20px rgba(255,45,149,0.5), 0 0 40px rgba(255,45,149,0.2); }
+[data-theme="synthwave"] .dash-kpi-value { text-shadow: 0 0 16px rgba(0,240,255,0.4), 0 0 40px rgba(0,240,255,0.15); }
+[data-theme="synthwave"] .dash-kpi-card { border: 1px solid rgba(189,147,249,0.2); }
+[data-theme="synthwave"] .dash-kpi-card:hover { border-color: rgba(255,45,149,0.4); box-shadow: 0 0 30px rgba(255,45,149,0.15), 0 4px 20px rgba(0,0,0,0.3); }
+[data-theme="synthwave"] .dash-pipeline-count { text-shadow: 0 0 12px rgba(255,45,149,0.4); }
+[data-theme="synthwave"] .card-header h3 { text-shadow: 0 0 10px rgba(189,147,249,0.3); }
+[data-theme="synthwave"] .dash-kpi-icon { box-shadow: 0 0 16px rgba(255,45,149,0.25); }
+[data-theme="synthwave"] .badge { box-shadow: 0 0 8px rgba(255,45,149,0.2); }
+@keyframes synthBorderGlow {
+  0%, 100% { border-color: rgba(189,147,249,0.2); }
+  50% { border-color: rgba(255,45,149,0.35); }
+}
+[data-theme="synthwave"] .dash-chart-card { animation: synthBorderGlow 4s ease-in-out infinite; }
+
+/* ═══ RETRO THEME (Amber Terminal) ═══ */
+[data-theme="retro"] {
+  --bg: #0C0C0C;
+  --bg-card: #141410;
+  --bg-sidebar: #080804;
+  --bg-sidebar-hover: #1A1A10;
+  --bg-sidebar-active: #2A2A18;
+  --navy: #FFB000;
+  --navy-light: #CC8C00;
+  --accent: #FFB000;
+  --accent-hover: #FFC84D;
+  --green: #33FF33;
+  --green-bg: #0A1A0A;
+  --yellow: #FFB000;
+  --yellow-bg: #1A1400;
+  --red: #FF3333;
+  --red-bg: #1A0808;
+  --purple: #FF8C00;
+  --purple-bg: #1A1000;
+  --text: #FFB000;
+  --text-secondary: #CC8C00;
+  --text-light: #8A6000;
+  --border: #332B00;
+  --border-light: #1F1A00;
+  --shadow-sm: 0 0 4px rgba(255,176,0,0.08);
+  --shadow-md: 0 0 10px rgba(255,176,0,0.1);
+  --shadow-lg: 0 0 20px rgba(255,176,0,0.12);
+  --sans: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
+  --hover-bg: #1A1A10;
+  --focus-bg: #1F1F0A;
+  --confirmed-bg: #0A1A0A;
+  --corrected-bg: #1A1400;
+  --flagged-bg: #1A0808;
+  --entity-bg: #1A1A10;
+  --console-bg: #080804;
+  --console-text: #CC8C00;
+  --console-hl: #FFB000;
+  --pdf-bg: #080804;
+  --upload-bg: #141410;
+  --upload-hover-bg: #1F1F0A;
+  --badge-blue-bg: #1A1400;
+  --badge-gray-bg: #1A1A10;
+  --pill-bg: #1A1A10;
+  --btn-bg: #1A1A10;
+  --input-bg: #0C0C0C;
+}
+[data-theme="retro"] ::selection { background: #FFB000; color: #0C0C0C; }
+[data-theme="retro"] .sidebar { border-right: 1px solid #332B00; }
+[data-theme="retro"] .card { border-color: #332B00; box-shadow: 0 0 12px rgba(255,176,0,0.06), inset 0 0 30px rgba(255,176,0,0.02); }
+[data-theme="retro"] .card:hover { box-shadow: 0 0 20px rgba(255,176,0,0.12), inset 0 0 30px rgba(255,176,0,0.03); }
+[data-theme="retro"] .nav-item.active { border-left-color: #FFB000; }
+[data-theme="retro"] body::after {
+  content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: repeating-linear-gradient(0deg, rgba(255,176,0,0.02) 0px, rgba(255,176,0,0.02) 1px, transparent 1px, transparent 3px);
+  pointer-events: none; z-index: 9999;
+}
+[data-theme="retro"] *:focus { box-shadow: 0 0 8px rgba(255,176,0,0.3); }
+/* Retro phosphor glow */
+[data-theme="retro"] .page-header h2 { text-shadow: 0 0 8px rgba(255,176,0,0.6), 0 0 20px rgba(255,176,0,0.3); }
+[data-theme="retro"] .dash-kpi-value { text-shadow: 0 0 10px rgba(255,176,0,0.5), 0 0 30px rgba(255,176,0,0.2); }
+[data-theme="retro"] .dash-pipeline-count { text-shadow: 0 0 8px rgba(255,176,0,0.4); }
+[data-theme="retro"] .card-header h3 { text-shadow: 0 0 6px rgba(255,176,0,0.3); }
+[data-theme="retro"] .dash-kpi-icon { box-shadow: 0 0 12px rgba(255,176,0,0.2); }
+[data-theme="retro"] .dash-kpi-card { border-color: rgba(255,176,0,0.15); }
+[data-theme="retro"] .dash-kpi-card:hover { border-color: rgba(255,176,0,0.35); box-shadow: 0 0 20px rgba(255,176,0,0.1); }
+[data-theme="retro"] .badge { text-shadow: 0 0 4px rgba(255,176,0,0.3); }
+@keyframes retroFlicker {
+  0%, 100% { opacity: 1; }
+  92% { opacity: 1; }
+  93% { opacity: 0.8; }
+  94% { opacity: 1; }
+  96% { opacity: 0.9; }
+  97% { opacity: 1; }
+}
+[data-theme="retro"] .dash-kpi-value { animation: retroFlicker 8s linear infinite; }
+
+/* ═══ THEME PICKER ═══ */
+.theme-picker { display: flex; gap: 6px; margin-top: 10px; justify-content: center; }
+.theme-dot { width: 20px; height: 20px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: var(--transition); position: relative; }
+.theme-dot:hover { transform: scale(1.2); }
+.theme-dot.active { border-color: white; box-shadow: 0 0 6px rgba(255,255,255,0.4); }
+.theme-dot[data-theme="light"] { background: linear-gradient(135deg, #F7F6F3, #3498DB); }
+.theme-dot[data-theme="dark"] { background: linear-gradient(135deg, #0D1117, #58A6FF); }
+.theme-dot[data-theme="synthwave"] { background: linear-gradient(135deg, #13081E, #FF2D95); }
+.theme-dot[data-theme="retro"] { background: linear-gradient(135deg, #0C0C0C, #FFB000); }
 </style>
 </head>
 <body>
@@ -7906,7 +8111,12 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <label>Reviewer
       <input type="text" id="reviewerInitials" maxlength="4" placeholder="JW" value="">
     </label>
-    <p style="font-size:9px;color:rgba(255,255,255,0.25);margin-top:8px;text-align:center;">OathLedger — Deterministic Accounting Intelligence</p>
+    <div class="theme-picker">
+      <div class="theme-dot active" data-theme="light" title="Light" onclick="setTheme('light')"></div>
+      <div class="theme-dot" data-theme="dark" title="Dark" onclick="setTheme('dark')"></div>
+      <div class="theme-dot" data-theme="synthwave" title="Synthwave" onclick="setTheme('synthwave')"></div>
+      <div class="theme-dot" data-theme="retro" title="Retro" onclick="setTheme('retro')"></div>
+    </div>
   </div>
 </aside>
 
@@ -8304,6 +8514,22 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <!-- JAVASCRIPT -->
 <!-- ═══════════════════════════════════════════════════════════════════════════ -->
 <script>
+// ─── Theme ───
+function setTheme(t) {
+  if (t === 'light') { document.documentElement.removeAttribute('data-theme'); }
+  else { document.documentElement.setAttribute('data-theme', t); }
+  localStorage.setItem('oathledger-theme', t);
+  document.querySelectorAll('.theme-dot').forEach(d => d.classList.toggle('active', d.dataset.theme === t));
+  if (document.getElementById('sec-dashboard') && document.getElementById('sec-dashboard').classList.contains('active')) {
+    setTimeout(loadDashboard, 50);
+  }
+}
+// Mark active dot on load
+(function(){
+  var t = localStorage.getItem('oathledger-theme') || 'light';
+  document.querySelectorAll('.theme-dot').forEach(d => d.classList.toggle('active', d.dataset.theme === t));
+})();
+
 // ─── State ───
 let currentJobId = null;
 let pollTimer = null;

@@ -1,0 +1,37 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Reset PIN — OathLedger</title>
+  <link rel="stylesheet" href="/static/admin.css"/>
+</head>
+<body>
+  <div class="container" style="align-items:flex-start">
+    <main class="main" style="max-width:520px;margin:32px auto">
+      <div class="card">
+        <h2>Reset Your PIN</h2>
+        <p class="small">Your account requires a new 6-digit PIN before continuing.</p>
+        {% if error %}
+          <div class="pill bad" style="margin:10px 0">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="/reset-pin">
+          <div class="form-row">
+            <div>
+              <label class="small">New PIN</label>
+              <input name="pin" type="password" inputmode="numeric" pattern="\d{6}" maxlength="6" class="input" required />
+            </div>
+            <div>
+              <label class="small">Confirm PIN</label>
+              <input name="pin_confirm" type="password" inputmode="numeric" pattern="\d{6}" maxlength="6" class="input" required />
+            </div>
+          </div>
+          <div style="margin-top:14px">
+            <button class="btn" type="submit">Update PIN</button>
+          </div>
+        </form>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
