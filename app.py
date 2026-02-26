@@ -7750,9 +7750,9 @@ td.actions { white-space: nowrap; text-align: right; }
 .btn-accent { background: var(--accent); color: white; border: none; }
 .btn-accent:hover { background: var(--accent-hover); box-shadow: var(--shadow-sm); }
 .review-split { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 112px); }
-.review-pdf { background: var(--pdf-bg); overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 24px; }
-.review-pdf-wrap { position: relative; display: inline-block; max-width: 95%; }
-.review-pdf img { width: 100%; height: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; display: block; }
+.review-pdf { background: var(--pdf-bg); overflow: auto; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.review-pdf-wrap { position: relative; display: inline-block; max-width: 95%; max-height: calc(100vh - 160px); }
+.review-pdf img { max-width: 100%; max-height: calc(100vh - 170px); width: auto; height: auto; object-fit: contain; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; display: block; }
 .review-pdf img:hover { box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 2px rgba(0,0,0,0.25); }
 .pdf-highlight { position: absolute; background: rgba(255, 230, 0, 0.30); border: 2px solid rgba(255, 60, 0, 0.8); border-radius: 3px; pointer-events: none; transition: opacity 0.25s ease; z-index: 2; }
 .pdf-highlight-pulse { animation: highlightPulse 1.5s ease-in-out infinite; }
@@ -9233,10 +9233,13 @@ function countTotalFields() {
 function updateVerifyBar() {
   const reviewed = Object.keys(verifications).length;
   const pct = totalFieldCount > 0 ? Math.min(100, Math.round(reviewed / totalFieldCount * 100)) : 0;
-  document.getElementById('verifyBar').style.width = pct + '%';
-  document.getElementById('verifyStats').innerHTML = '<span>' + reviewed + '</span> of <span>' + totalFieldCount + '</span> fields verified (' + pct + '%)';
+  var bar = document.getElementById('verifyBar');
+  if (bar) bar.style.width = pct + '%';
+  var stats = document.getElementById('verifyStats');
+  if (stats) stats.innerHTML = '<span>' + reviewed + '</span> of <span>' + totalFieldCount + '</span> fields verified (' + pct + '%)';
   // When all fields are reviewed, show completion panel
-  if (totalFieldCount > 0 && reviewed >= totalFieldCount && document.getElementById('review').style.display !== 'none') {
+  var sec = document.getElementById('sec-review');
+  if (totalFieldCount > 0 && reviewed >= totalFieldCount && sec && sec.style.display !== 'none') {
     _showGridComplete(reviewed, totalFieldCount);
   }
 }
@@ -9509,8 +9512,9 @@ function loadPage(page, focusIdx) {
     _loadedImagePage = page;
     _pageWordData = null;
     _pageWordPage = null;
-    _fetchPageWords(page);
   }
+  // Always ensure word data is available (even if image was cached from prior session)
+  _fetchPageWords(page);
 
   const pageExts = reviewData.page_map[currentPage];
   let html = '';
