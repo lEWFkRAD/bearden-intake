@@ -4357,7 +4357,9 @@ Be concise and helpful. If the operator asks about a specific value, reference t
 def page_image(job_id, page_num):
     img_path = PAGES_DIR / job_id / f"page_{page_num}.jpg"
     if img_path.exists():
-        return send_file(str(img_path), mimetype="image/jpeg")
+        resp = send_file(str(img_path), mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
     abort(404)
 
 # ─── Guided Review: Backend Functions ────────────────────────────────────────
@@ -4790,10 +4792,7 @@ def guided_review_item(job_id, field_id):
     safe_field_id = re.sub(r'[^\w\-.]', '_', str(field_id))
     evidence_url = f"/api/guided-review/evidence/{job_id}/{safe_field_id}.png" if evidence_path else None
 
-    # Queue position
-    queue, reviewed = _build_guided_queue(job_id)
-    position = next((i for i, q in enumerate(queue) if q['field_id'] == field_id), -1)
-
+    # Queue position removed — client tracks position locally from queue fetch
     return jsonify({
         "field_id": field_id,
         "field_name": field_name,
@@ -4807,8 +4806,8 @@ def guided_review_item(job_id, field_id):
         "evidence_url": evidence_url,
         "evidence_available": evidence_path is not None,
         "page_url": f"/api/page-image/{job_id}/{page_num}",
-        "position_in_queue": position,
-        "queue_total": len(queue) + reviewed,
+        "position_in_queue": None,
+        "queue_total": None,
     })
 
 
@@ -4820,7 +4819,9 @@ def guided_review_evidence(job_id, filename):
     safe_name = re.sub(r'[^\w\-.]', '_', filename)
     path = EVIDENCE_DIR / job_id / safe_name
     if path.exists():
-        return send_file(str(path), mimetype="image/png")
+        resp = send_file(str(path), mimetype="image/png")
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
     abort(404)
 
 
@@ -5476,8 +5477,11 @@ def _resolve_field_value(log_data, field_key):
     return fdata.get("value") if isinstance(fdata, dict) else fdata
 
 
+_extraction_log_cache = {}  # job_id -> (mtime, data)
+
 def _load_extraction_log(job_id):
-    """Load the raw extraction log JSON for a job. Returns dict or None."""
+    """Load the raw extraction log JSON for a job. Returns dict or None.
+    Caches in memory by mtime to avoid redundant disk reads."""
     job = jobs.get(job_id)
     if not job:
         return None
@@ -5485,9 +5489,15 @@ def _load_extraction_log(job_id):
     if not log_path or not os.path.exists(log_path):
         return None
     try:
+        mtime = os.path.getmtime(log_path)
+        cached = _extraction_log_cache.get(job_id)
+        if cached and cached[0] == mtime:
+            return cached[1]
         with open(log_path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+            data = json.load(f)
+        _extraction_log_cache[job_id] = (mtime, data)
+        return data
+    except (json.JSONDecodeError, IOError, OSError):
         return None
 
 
@@ -7544,6 +7554,14 @@ MAIN_HTML = r"""<!DOCTYPE html>
   --mono: 'SF Mono', 'Menlo', 'Consolas', monospace;
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
   --transition: 0.2s ease;
+  --hover-bg: #FAFAF8;
+  --focus-bg: #EBF5FB;
+  --confirmed-bg: #F0FBF4;
+  --corrected-bg: #FFF8E8;
+  --flagged-bg: #FFF0E0;
+  --entity-bg: #F8F8F6;
+  --pdf-bg: #3D3D3D;
+  --input-bg: #FFFFFF;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -7667,70 +7685,88 @@ td.actions { white-space: nowrap; text-align: right; }
 .console-output { background: #1E2A38; color: #BDC3C7; font-family: var(--mono); font-size: 11px; padding: 12px; border-radius: 6px; max-height: 320px; overflow-y: auto; margin-top: 12px; line-height: 1.6; }
 .console-output .line-highlight { color: #5DADE2; }
 
-/* ═══ REVIEW ═══ */
-.review-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
-.review-nav { display: flex; align-items: center; gap: 8px; }
-.review-nav button { padding: 6px 12px; }
-.review-pager { font-size: 13px; font-weight: 600; color: var(--navy); min-width: 80px; text-align: center; }
-.review-split { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 120px); }
-.review-pdf { background: #3D3D3D; overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
-.review-pdf img { max-width: 100%; height: auto; box-shadow: var(--shadow-lg); border-radius: 4px; }
-.review-fields { overflow-y: auto; padding: 16px; background: var(--bg); }
-.verify-progress { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
-.verify-progress-fill { height: 100%; background: var(--green); transition: width 0.3s ease; }
-.verify-stats { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); padding: 8px 0; }
+/* ═══ REVIEW (modernized) ═══ */
+.review-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 24px; background: var(--bg-card); border-bottom: 1px solid var(--border); gap: 16px; min-height: 56px; }
+.review-nav { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.review-nav-btn { width: 34px; height: 34px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-card); cursor: pointer; transition: all 0.15s ease; color: var(--text-secondary); }
+.review-nav-btn:hover { background: var(--hover-bg); border-color: var(--accent); color: var(--accent); box-shadow: var(--shadow-sm); }
+.review-pager { font-size: 13px; font-weight: 700; color: var(--text); min-width: 70px; text-align: center; font-variant-numeric: tabular-nums; }
+.review-center { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; max-width: 400px; }
+.review-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.btn-accent { background: var(--accent); color: white; border: none; }
+.btn-accent:hover { background: var(--accent-hover); box-shadow: var(--shadow-sm); }
+.review-split { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 112px); }
+.review-pdf { background: var(--pdf-bg); overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 24px; }
+.review-pdf img { max-width: 95%; height: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; }
+.review-pdf img:hover { box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 2px rgba(0,0,0,0.25); }
+.review-fields { overflow-y: auto; padding: 20px; background: var(--bg); scroll-behavior: smooth; }
+.verify-progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; width: 100%; max-width: 300px; }
+.verify-progress-fill { height: 100%; background: linear-gradient(90deg, var(--green), var(--accent)); border-radius: 3px; transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 8px rgba(39, 174, 96, 0.3); }
+.verify-stats { display: flex; gap: 12px; font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .verify-stats span { font-weight: 600; }
 
-/* ─── Field rendering ─── */
-.field-group { background: var(--bg-card); border-radius: var(--radius); margin-bottom: 12px; box-shadow: var(--shadow-sm); border: 1px solid var(--border-light); overflow: hidden; }
-.field-group-title { font-size: 13px; font-weight: 700; padding: 10px 14px; background: var(--navy); color: white; display: flex; align-items: center; justify-content: space-between; }
-.field-entity { font-size: 12px; color: var(--text-secondary); padding: 6px 14px; background: #F8F8F6; border-bottom: 1px solid var(--border-light); display: flex; align-items: center; justify-content: space-between; }
+/* ─── Field rendering (modernized) ─── */
+.field-group { background: var(--bg-card); border-radius: var(--radius-lg); margin-bottom: 16px; box-shadow: var(--shadow-sm); border: 1px solid var(--border-light); overflow: hidden; transition: box-shadow 0.2s ease; }
+.field-group:hover { box-shadow: var(--shadow-md); }
+.field-group-title { font-size: 13px; font-weight: 700; padding: 12px 16px; background: var(--navy); color: white; display: flex; align-items: center; justify-content: space-between; letter-spacing: 0.01em; }
+.field-entity { font-size: 12px; color: var(--text-secondary); padding: 8px 16px; background: var(--entity-bg); border-bottom: 1px solid var(--border-light); display: flex; align-items: center; justify-content: space-between; }
 .field-entity .all-done { color: var(--green); font-size: 11px; font-weight: 600; }
-.field-row { display: flex; align-items: center; padding: 6px 14px; border-bottom: 1px solid var(--border-light); transition: background 0.1s; min-height: 36px; }
-.field-row:hover { background: #FAFAF8; }
-.field-row.focused { background: #EBF5FB; }
-.field-row.vf-confirmed { background: #F0FBF4; }
-.field-row.vf-corrected { background: #FFF8E8; }
-.field-row.vf-flagged { background: #FFF0E0; }
-.field-name { flex: 0 0 45%; font-size: 12px; color: var(--text-secondary); font-weight: 500; padding-right: 8px; }
-.field-val-wrap { flex: 1; display: flex; align-items: center; gap: 6px; }
-.field-val { font-size: 13px; font-weight: 600; font-family: var(--mono); color: var(--text); cursor: pointer; }
-.field-val:hover { color: var(--accent); }
-.field-actions { display: flex; gap: 4px; margin-left: auto; }
-.field-edit-input { font-size: 13px; font-family: var(--mono); padding: 2px 6px; border: 1px solid var(--accent); border-radius: 4px; width: 120px; }
+.field-row { display: flex; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--border-light); transition: background 0.2s ease, box-shadow 0.2s ease; min-height: 44px; cursor: pointer; position: relative; }
+.field-row:last-child { border-bottom: none; }
+.field-row:hover { background: var(--hover-bg); }
+.field-row.focused { background: var(--focus-bg); box-shadow: inset 3px 0 0 var(--accent); }
+.field-row.vf-confirmed { background: var(--confirmed-bg); box-shadow: inset 3px 0 0 var(--green); }
+.field-row.vf-corrected { background: var(--corrected-bg); box-shadow: inset 3px 0 0 var(--yellow); }
+.field-row.vf-flagged { background: var(--flagged-bg); box-shadow: inset 3px 0 0 var(--red); }
+.field-name { flex: 0 0 42%; font-size: 13px; color: var(--text-secondary); font-weight: 500; padding-right: 12px; line-height: 1.4; }
+.field-val-wrap { flex: 1; display: flex; align-items: center; gap: 8px; }
+.field-val { font-size: 14px; font-weight: 600; font-family: var(--mono); color: var(--text); cursor: pointer; padding: 2px 6px; border-radius: 4px; transition: color 0.15s ease, background 0.15s ease; }
+.field-val:hover { color: var(--accent); background: rgba(52, 152, 219, 0.06); }
+.field-actions { display: flex; gap: 4px; margin-left: auto; opacity: 0.35; transition: opacity 0.2s ease; }
+.field-row:hover .field-actions, .field-row.focused .field-actions { opacity: 1; }
+.field-edit-input { font-size: 14px; font-family: var(--mono); padding: 4px 10px; border: 2px solid var(--accent); border-radius: 6px; width: 140px; background: var(--input-bg); color: var(--text); outline: none; box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.15); }
+.field-edit-input:focus { box-shadow: 0 0 0 4px rgba(52, 152, 219, 0.25); }
 
 /* Confidence dots */
-.conf-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.conf-dual { background: #1A8C42; }
-.conf-confirmed { background: #5CB85C; }
-.conf-corrected { background: #FFCC00; }
-.conf-low { background: #FF9800; }
+.conf-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; transition: transform 0.2s ease; }
+.conf-dual { background: #1A8C42; box-shadow: 0 0 4px rgba(26, 140, 66, 0.4); }
+.conf-confirmed { background: #5CB85C; box-shadow: 0 0 4px rgba(92, 184, 92, 0.3); }
+.conf-corrected { background: #FFCC00; box-shadow: 0 0 4px rgba(255, 204, 0, 0.3); }
+.conf-low { background: #FF9800; box-shadow: 0 0 4px rgba(255, 152, 0, 0.3); }
 .conf-other { background: #BDC3C7; }
 
 /* Verify buttons */
-.vf-btn { width: 26px; height: 26px; border-radius: 5px; border: 1px solid var(--border); background: white; cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; transition: var(--transition); color: var(--text-light); }
-.vf-btn:hover { border-color: var(--navy-light); color: var(--text); }
-.vf-btn-confirm.active { background: var(--green); color: white; border-color: var(--green); }
-.vf-btn-flag.active { background: var(--yellow); color: white; border-color: var(--yellow); }
-.vf-btn-note.has-note { background: #E8F4FD; border-color: #5B9BD5; color: #5B9BD5; }
-.vf-note { font-size: 11px; color: var(--text-secondary); padding: 2px 14px 4px 14px; }
-.vf-note-input { display:flex; align-items:center; gap:4px; padding:4px 14px; }
-.vf-note-input input { font-size:12px; padding:3px 6px; border:1px solid var(--border); border-radius:4px; flex:1; font-family:var(--sans); }
-.vf-note-input button { font-size:11px; padding:2px 8px; border-radius:4px; border:1px solid var(--border); background:var(--accent); color:white; cursor:pointer; }
+.vf-btn { width: 30px; height: 30px; border-radius: 8px; border: 1px solid transparent; background: transparent; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; transition: all 0.2s ease; color: var(--text-light); }
+.vf-btn:hover { background: var(--hover-bg); border-color: var(--border); color: var(--text); transform: scale(1.1); }
+.vf-btn-confirm.active { background: var(--green); color: white; border-color: var(--green); box-shadow: 0 2px 8px rgba(39, 174, 96, 0.3); }
+.vf-btn-flag.active { background: var(--yellow); color: white; border-color: var(--yellow); box-shadow: 0 2px 8px rgba(243, 156, 18, 0.3); }
+.vf-btn-note.has-note { background: rgba(52, 152, 219, 0.1); border-color: var(--accent); color: var(--accent); }
+.vf-note { font-size: 11px; color: var(--text-secondary); padding: 4px 16px 6px 16px; line-height: 1.4; }
+.vf-note-input { display:flex; align-items:center; gap:6px; padding:6px 16px; background: var(--entity-bg); border-bottom: 1px solid var(--border-light); }
+.vf-note-input input { font-size:12px; padding:5px 10px; border:1px solid var(--border); border-radius:6px; flex:1; font-family:var(--sans); background: var(--input-bg); color: var(--text); transition: border-color 0.15s ease; }
+.vf-note-input input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.1); }
+.vf-note-input button { font-size:11px; padding:4px 12px; border-radius:6px; border:none; background:var(--accent); color:white; cursor:pointer; transition: background 0.15s ease; }
+.vf-note-input button:hover { background: var(--accent-hover); }
 .vf-original { text-decoration: line-through; color: var(--red); }
+
+/* ─── Confirm/Flag flash animations ─── */
+@keyframes confirmFlash { 0% { box-shadow: inset 3px 0 0 var(--green), 0 0 0 0 rgba(39,174,96,0.4); } 50% { box-shadow: inset 3px 0 0 var(--green), 0 0 12px 2px rgba(39,174,96,0.15); } 100% { box-shadow: inset 3px 0 0 var(--green), 0 0 0 0 rgba(39,174,96,0); } }
+@keyframes flagFlash { 0% { box-shadow: inset 3px 0 0 var(--red), 0 0 0 0 rgba(231,76,60,0.4); } 50% { box-shadow: inset 3px 0 0 var(--red), 0 0 12px 2px rgba(231,76,60,0.15); } 100% { box-shadow: inset 3px 0 0 var(--red), 0 0 0 0 rgba(231,76,60,0); } }
+.field-row.vf-just-confirmed { animation: confirmFlash 0.5s ease; }
+.field-row.vf-just-flagged { animation: flagFlash 0.5s ease; }
 
 /* ─── Transaction table ─── */
 .txn-section { margin: 8px 0; }
-.txn-header { font-size: 11px; font-weight: 700; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 14px; }
+.txn-header { font-size: 11px; font-weight: 700; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 16px; }
 .txn-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .txn-table thead th { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-light); padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--border); }
-.txn-table tbody tr { border-bottom: 1px solid var(--border-light); transition: background 0.1s; }
-.txn-table tbody tr:hover { background: #FAFAF8; }
-.txn-table tbody tr.vf-confirmed { background: var(--green-bg); }
-.txn-table tbody tr.vf-flagged { background: var(--yellow-bg); }
-.txn-table td { padding: 5px 6px; vertical-align: middle; }
+.txn-table tbody tr { border-bottom: 1px solid var(--border-light); transition: background 0.15s ease; }
+.txn-table tbody tr:hover { background: var(--hover-bg); }
+.txn-table tbody tr.vf-confirmed { background: var(--confirmed-bg); }
+.txn-table tbody tr.vf-flagged { background: var(--flagged-bg); }
+.txn-table td { padding: 6px 6px; vertical-align: middle; }
 .txn-amt { text-align: right; font-family: var(--mono); font-weight: 600; white-space: nowrap; }
-.txn-type { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; }
+.txn-type { font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 4px; text-transform: uppercase; }
 .txn-type-deposit { background: #D5F5E3; color: #1B7A3D; }
 .txn-type-withdrawal { background: #FADBD8; color: #A93226; }
 .txn-type-check { background: #FFF3CD; color: #856404; }
@@ -7738,18 +7774,18 @@ td.actions { white-space: nowrap; text-align: right; }
 .txn-type-transfer { background: #D6EAF8; color: #1F618D; }
 
 /* Category dropdown */
-.cat-select { font-size: 11px; padding: 2px 4px; border: 1px solid var(--border); border-radius: 4px; background: white; max-width: 150px; cursor: pointer; }
+.cat-select { font-size: 11px; padding: 2px 4px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); max-width: 150px; cursor: pointer; }
 .cat-select:focus { border-color: var(--accent); outline: none; }
 .cat-select.cat-set { background: var(--green-bg); border-color: var(--green); font-weight: 600; }
 .cat-select.cat-suggested { background: var(--yellow-bg); border-color: #D4B95E; }
 .cat-learned-badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: var(--purple-bg); color: var(--purple); font-weight: 600; }
-.field-cat-row { display: flex; align-items: center; gap: 8px; padding: 2px 14px 4px; font-size: 11px; color: var(--text-light); }
+.field-cat-row { display: flex; align-items: center; gap: 8px; padding: 2px 16px 4px; font-size: 11px; color: var(--text-light); }
 .field-cat-row label { font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; font-size: 10px; }
 
 /* ─── Info section (collapsible) ─── */
-.info-section { margin: 4px 0; border: 1px solid var(--border-light); border-radius: 6px; overflow: hidden; }
-.info-toggle { display: flex; align-items: center; gap: 6px; padding: 7px 12px; background: #F8F7F5; cursor: pointer; user-select: none; font-size: 11px; font-weight: 700; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.04em; transition: background 0.1s; }
-.info-toggle:hover { background: #F0EFEC; }
+.info-section { margin: 4px 0; border: 1px solid var(--border-light); border-radius: 8px; overflow: hidden; }
+.info-toggle { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: var(--entity-bg); cursor: pointer; user-select: none; font-size: 11px; font-weight: 700; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.04em; transition: background 0.15s ease; }
+.info-toggle:hover { background: var(--hover-bg); }
 .info-toggle-arrow { font-size: 10px; transition: transform 0.2s; }
 .info-toggle-arrow.open { transform: rotate(90deg); }
 .info-field { display: flex; padding: 4px 12px; font-size: 12px; border-bottom: 1px solid var(--border-light); }
@@ -7849,27 +7885,30 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 .modal-content { background:white; border-radius:12px; padding:24px; width:420px; max-width:90vw; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
 
 /* ═══ GUIDED REVIEW ═══ */
-.guided-header { padding: 12px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.guided-header { padding: 12px 24px; background: var(--bg-card); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; }
 .guided-progress { display: flex; align-items: center; gap: 12px; }
-.guided-progress-text { font-size: 14px; font-weight: 700; color: var(--navy); white-space: nowrap; }
-.guided-progress-bar { width: 200px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
-.guided-progress-fill { height: 100%; background: var(--green); transition: width 0.3s ease; }
-.guided-actions-top { display: flex; gap: 8px; }
-.guided-split { display: grid; grid-template-columns: 3fr 2fr; height: calc(100vh - 80px); }
-.guided-evidence { background: #3D3D3D; overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 16px; }
-.guided-evidence img { max-width: 100%; height: auto; box-shadow: var(--shadow-lg); border-radius: 4px; }
-.guided-detail { padding: 32px; display: flex; flex-direction: column; gap: 16px; background: var(--bg-card); overflow-y: auto; }
-.guided-field-label { font-size: 14px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
-.guided-field-dest { font-size: 13px; color: var(--text-light); }
-.guided-field-value { font-size: 36px; font-weight: 700; color: var(--navy); font-family: var(--mono); padding: 24px; background: var(--bg); border-radius: var(--radius-lg); border: 2px solid var(--border); text-align: center; word-break: break-all; }
+.guided-progress-text { font-size: 14px; font-weight: 700; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.guided-progress-bar { width: 220px; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+.guided-progress-fill { height: 100%; background: linear-gradient(90deg, var(--green), var(--accent)); border-radius: 4px; transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 8px rgba(39, 174, 96, 0.3); }
+.guided-actions-top { display: flex; gap: 8px; align-items: center; }
+.guided-split { display: grid; grid-template-columns: 3fr 2fr; height: calc(100vh - 68px); }
+.guided-evidence { background: var(--pdf-bg); overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 24px; }
+.guided-evidence img { max-width: 95%; height: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; }
+.guided-detail { padding: 36px; display: flex; flex-direction: column; gap: 20px; background: var(--bg-card); overflow-y: auto; }
+.guided-field-label { font-size: 14px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+.guided-field-dest { font-size: 13px; color: var(--text-light); margin-top: -8px; }
+.guided-field-value { font-size: 36px; font-weight: 700; color: var(--text); font-family: var(--mono); padding: 28px; background: var(--bg); border-radius: var(--radius-lg); border: 2px solid var(--border); text-align: center; word-break: break-all; transition: border-color 0.3s ease, box-shadow 0.3s ease; box-shadow: var(--shadow-sm); }
+.guided-field-value:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
 .guided-field-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; }
 .guided-field-meta .badge { font-size: 11px; }
-.guided-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-.guided-actions .btn { padding: 14px 20px; font-size: 14px; font-weight: 700; justify-content: center; border-radius: 8px; }
-.guided-actions .btn kbd { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); padding: 1px 6px; border-radius: 3px; font-size: 11px; margin-left: 6px; }
-.guided-edit-area { background: var(--bg); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-.guided-edit-input { font-size: 24px; padding: 12px; text-align: center; font-family: var(--mono); font-weight: 700; border: 2px solid var(--accent); border-radius: 8px; }
-.guided-edit-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(52,152,219,0.2); }
+.guided-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+.guided-actions .btn { padding: 16px 20px; font-size: 15px; font-weight: 700; justify-content: center; border-radius: 10px; transition: all 0.2s ease; box-shadow: var(--shadow-sm); }
+.guided-actions .btn:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.guided-actions .btn:active { transform: translateY(0); box-shadow: var(--shadow-sm); }
+.guided-actions .btn kbd { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
+.guided-edit-area { background: var(--bg); border-radius: var(--radius-lg); padding: 20px; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--border-light); }
+.guided-edit-input { font-size: 24px; padding: 14px; text-align: center; font-family: var(--mono); font-weight: 700; border: 2px solid var(--accent); border-radius: 10px; background: var(--input-bg); color: var(--text); transition: box-shadow 0.2s ease; }
+.guided-edit-input:focus { outline: none; box-shadow: 0 0 0 4px rgba(52,152,219,0.2); }
 .guided-edit-btns { display: flex; gap: 8px; justify-content: center; }
 .guided-complete { text-align: center; padding: 60px 24px; }
 .guided-complete h2 { font-size: 24px; color: var(--green); margin-bottom: 8px; }
@@ -7997,6 +8036,14 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 }
 [data-theme="synthwave"] .dash-chart-card { animation: synthBorderGlow 4s ease-in-out infinite; }
 
+/* Synthwave review enhancements */
+[data-theme="synthwave"] .field-row.vf-confirmed { box-shadow: inset 3px 0 0 var(--green), 0 0 8px rgba(0, 240, 255, 0.08); }
+[data-theme="synthwave"] .vf-btn-confirm.active { box-shadow: 0 0 12px rgba(0, 240, 255, 0.3); }
+[data-theme="synthwave"] .verify-progress-fill, [data-theme="synthwave"] .guided-progress-fill { background: linear-gradient(90deg, var(--green), #FF2D95); box-shadow: 0 0 12px rgba(255, 45, 149, 0.4); }
+[data-theme="synthwave"] .guided-field-value { border-color: #2D1B4E; box-shadow: 0 0 20px rgba(189, 147, 249, 0.08); }
+[data-theme="synthwave"] .guided-field-value:hover { border-color: #FF2D95; box-shadow: 0 0 30px rgba(255, 45, 149, 0.15); }
+[data-theme="synthwave"] .review-pdf img, [data-theme="synthwave"] .guided-evidence img { box-shadow: 0 4px 20px rgba(0,0,0,0.5), 0 0 20px rgba(189, 147, 249, 0.06); }
+
 /* ═══ RETRO THEME (Amber Terminal) ═══ */
 [data-theme="retro"] {
   --bg: #0C0C0C;
@@ -8072,6 +8119,12 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   97% { opacity: 1; }
 }
 [data-theme="retro"] .dash-kpi-value { animation: retroFlicker 8s linear infinite; }
+
+/* Retro review enhancements */
+[data-theme="retro"] .review-pdf img, [data-theme="retro"] .guided-evidence img { box-shadow: 0 0 20px rgba(255, 176, 0, 0.1), 0 4px 16px rgba(0,0,0,0.6); border: 1px solid rgba(255, 176, 0, 0.15); }
+[data-theme="retro"] .verify-progress-fill, [data-theme="retro"] .guided-progress-fill { background: var(--green); box-shadow: 0 0 8px rgba(51, 255, 51, 0.4); }
+[data-theme="retro"] .vf-btn-confirm.active { box-shadow: 0 0 8px rgba(51, 255, 51, 0.3); }
+[data-theme="retro"] .field-row.vf-confirmed { box-shadow: inset 3px 0 0 var(--green), 0 0 6px rgba(51, 255, 51, 0.06); }
 
 /* ═══ THEME PICKER ═══ */
 .theme-picker { display: flex; gap: 6px; margin-top: 10px; justify-content: center; }
@@ -8273,24 +8326,20 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   <div id="reviewPartialBanner" style="display:none;padding:8px 16px;background:#FFF3CD;color:#856404;text-align:center;font-size:13px;border-bottom:1px solid #E0C96B"></div>
   <div class="review-header">
     <div class="review-nav">
-      <button class="btn btn-secondary btn-sm" onclick="prevPage()">&#9664; Prev</button>
+      <button class="review-nav-btn" onclick="prevPage()" title="Previous page (\u2190)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
       <span class="review-pager" id="reviewPager">1 / 1</span>
-      <button class="btn btn-secondary btn-sm" onclick="nextPage()">Next &#9654;</button>
-      <button class="btn btn-secondary btn-sm" onclick="reextractPage()" title="Re-extract this page with AI instructions" style="margin-left:8px">&#x21BB; Re-extract</button>
+      <button class="review-nav-btn" onclick="nextPage()" title="Next page (\u2192)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button>
     </div>
-    <div class="verify-stats" id="verifyStats"></div>
-    <div style="display:flex;gap:8px;align-items:center">
-      <button class="btn btn-success btn-sm" onclick="downloadFile('xlsx')">&#x2B73; Excel</button>
-      <button class="btn btn-secondary btn-sm" onclick="downloadFile('log')">&#x2B73; JSON</button>
-      <button class="btn btn-secondary btn-sm" onclick="regenExcel()" title="Regenerate Excel with corrections">&#x21BB; Regen Excel</button>
-      <button class="btn btn-sm" style="background:#1565C0;color:#fff" onclick="generateWorkpaper()" title="Generate professional workpaper from verified facts" id="btnWorkpaper">&#x1F4CB; Workpaper</button>
+    <div class="review-center">
+      <div class="verify-stats" id="verifyStats"></div>
+      <div class="verify-progress"><div class="verify-progress-fill" id="verifyBar" style="width:0%"></div></div>
+    </div>
+    <div class="review-actions">
+      <button class="btn btn-secondary btn-sm" onclick="reextractPage()" title="Re-extract this page with AI instructions">&#x21BB; Re-extract</button>
       <button class="btn btn-secondary btn-sm" onclick="toggleAiChat()" title="Ask AI about this page" id="aiChatToggle">&#x1F4AC; Ask AI</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
-      <button class="btn btn-sm" style="background:#8E44AD;color:#fff" onclick="openGuidedReview()" title="Review one field at a time with evidence highlights">&#x2714; Guided</button>
+      <button class="btn btn-accent btn-sm" onclick="openGuidedReview()" title="Review one field at a time with evidence highlights">&#x2714; Guided</button>
     </div>
-  </div>
-  <div style="padding:0 20px 4px; background:var(--bg-card); border-bottom:1px solid var(--border)">
-    <div class="verify-progress"><div class="verify-progress-fill" id="verifyBar" style="width:0%"></div></div>
   </div>
   <!-- Client instructions banner (if any) -->
   <div id="reviewInstructionsBanner" style="display:none; padding:8px 20px; background:#FFF8E8; border-bottom:1px solid #F5E6C8; font-size:12px;"></div>
@@ -8567,6 +8616,36 @@ let focusedFieldIdx = -1;
 let pageFieldKeys = [];
 let selectedDocType = 'tax_returns';
 let earlyReviewActive = false;
+let _loadedImagePage = null;
+
+// ─── Performance Instrumentation ───
+const _perfTimers = {};
+const _perfLog = {};  // label -> [ms, ms, ...]
+function _perf(label) { _perfTimers[label] = performance.now(); }
+function _perfEnd(label) {
+  const t0 = _perfTimers[label];
+  if (t0 === undefined) return;
+  const ms = performance.now() - t0;
+  delete _perfTimers[label];
+  if (!_perfLog[label]) _perfLog[label] = [];
+  _perfLog[label].push(ms);
+  if (_perfLog[label].length > 200) _perfLog[label].shift();
+  console.log('[PERF] ' + label + ': ' + ms.toFixed(1) + 'ms');
+  return ms;
+}
+function _perfSummary() {
+  const out = {};
+  for (const [label, times] of Object.entries(_perfLog)) {
+    if (times.length === 0) continue;
+    const sorted = [...times].sort((a, b) => a - b);
+    const avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
+    const p95 = sorted[Math.floor(sorted.length * 0.95)] || sorted[sorted.length - 1];
+    const max = sorted[sorted.length - 1];
+    out[label] = { n: sorted.length, avg: avg.toFixed(1) + 'ms', p95: p95.toFixed(1) + 'ms', max: max.toFixed(1) + 'ms' };
+  }
+  console.table(out);
+  return out;
+}
 
 // Field display order by document type (matches extract.py TEMPLATE_SECTIONS)
 const FIELD_ORDER = {
@@ -8903,6 +8982,7 @@ function openReview(job) {
 // Load review data without switching section (used by both guided and grid)
 function _loadReviewData(job, callback) {
   currentJobId = job.id || job.job_id || currentJobId;
+  _loadedImagePage = null;  // reset image cache on job change
 
   Promise.all([
     fetch('/api/results/' + currentJobId).then(r => r.json()),
@@ -9117,6 +9197,7 @@ function saveVerification(key, status, correctedValue, note, category, vendorDes
 }
 
 function confirmField(key) {
+  _perf('confirmField');
   // If an edit input is active for this field, finish the edit first
   const activeInput = document.querySelector('.field-edit-input[data-key="' + key.replace(/"/g, '\\"') + '"]');
   if (activeInput) {
@@ -9129,7 +9210,9 @@ function confirmField(key) {
       const nextIdx = focusedFieldIdx + 1;
       saveVerification(key, 'corrected', nv);
       showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' ') + ' corrected', 'success');
+      // Correction changes displayed value — need full row rebuild
       loadPage(currentPage, nextIdx);
+      _perfEnd('confirmField');
       return;
     }
   }
@@ -9141,8 +9224,9 @@ function confirmField(key) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fields: { [key]: { status: '_remove' } }, reviewer: getReviewer() })
     }).catch(() => {});
+    _updateRowVerification(key, null);
     updateVerifyBar();
-    loadPage(currentPage, focusedFieldIdx);
+    _perfEnd('confirmField');
     return;
   }
   if (current && current.status === 'corrected' && current._justCorrected) {
@@ -9151,31 +9235,39 @@ function confirmField(key) {
     delete current._justCorrected;
     const nextIdx = focusedFieldIdx + 1;
     showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' ') + ' corrected', 'success');
-    loadPage(currentPage, nextIdx);
+    _updateRowVerification(key, 'corrected');
+    moveFocus(nextIdx);
+    _perfEnd('confirmField');
     return;
   }
   const nextIdx = focusedFieldIdx + 1;
   saveVerification(key, 'confirmed', current && current.corrected_value !== undefined ? current.corrected_value : null);
   showToast('\u2713 ' + key.split(':').pop().replace(/_/g,' '), 'success');
-  loadPage(currentPage, nextIdx);
+  _updateRowVerification(key, 'confirmed');
+  moveFocus(nextIdx);
+  _perfEnd('confirmField');
 }
 
 function flagField(key) {
+  _perf('flagField');
   const curIdx = focusedFieldIdx;
   const current = verifications[key];
   if (current && current.status === 'flagged') {
+    // Toggle off — un-flag
     delete verifications[key];
     fetch('/api/verify/' + currentJobId, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fields: { [key]: { status: '_remove' } }, reviewer: getReviewer() })
     }).catch(() => {});
+    _updateRowVerification(key, null);
     updateVerifyBar();
   } else {
     const note = prompt('Flag note (optional):') || '';
     saveVerification(key, 'flagged', null, note);
+    _updateRowVerification(key, 'flagged');
     showToast('\u26A0 Flagged: ' + key.split(':').pop().replace(/_/g,' '), 'error');
   }
-  loadPage(currentPage, curIdx);
+  _perfEnd('flagField');
 }
 
 function startEdit(key, currentVal) {
@@ -9304,6 +9396,7 @@ function toggleInfoSection(id, toggle) {
 
 // ─── Page Rendering ───
 function loadPage(page, focusIdx) {
+  _perf('loadPage');
   if (!reviewData || !reviewData.page_map) return;
   totalPages = reviewData.total_pages || Object.keys(reviewData.page_map).length;
   if (page < 1) page = 1;
@@ -9313,7 +9406,10 @@ function loadPage(page, focusIdx) {
   pageFieldKeys = [];
 
   document.getElementById('reviewPager').textContent = page + ' / ' + totalPages;
-  document.getElementById('pdfViewer').innerHTML = '<img src="/api/page-image/' + currentJobId + '/' + page + '" alt="Page ' + page + '">';
+  if (_loadedImagePage !== page) {
+    document.getElementById('pdfViewer').innerHTML = '<img src="/api/page-image/' + currentJobId + '/' + page + '" alt="Page ' + page + '">';
+    _loadedImagePage = page;
+  }
 
   const pageExts = reviewData.page_map[currentPage];
   let html = '';
@@ -9408,7 +9504,7 @@ function loadPage(page, focusIdx) {
       let dotClass = 'conf-other';
       if (conf.includes('dual')) dotClass='conf-dual'; else if (conf.includes('confirmed')||conf==='ocr_accepted') dotClass='conf-confirmed'; else if (conf.includes('corrected')) dotClass='conf-corrected'; else if (conf==='low') dotClass='conf-low';
 
-      html += '<div class="' + rowClass + '" data-key="' + esc(vk) + '" onclick="setFocus(' + idx + ')">';
+      html += '<div class="' + rowClass + '" data-key="' + esc(vk) + '" data-idx="' + idx + '" onclick="setFocus(' + idx + ')">';
       const boxLabel = (FIELD_BOX_LABELS[ext.document_type] || {})[k];
       const displayName = (boxLabel ? boxLabel + ' \u2014 ' : '') + k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
       html += '<span class="field-name">' + esc(displayName) + '</span>';
@@ -9470,15 +9566,53 @@ function loadPage(page, focusIdx) {
 
   document.getElementById('fieldsPanel').innerHTML = html;
   if (focusedFieldIdx >= pageFieldKeys.length) focusedFieldIdx = Math.max(0, pageFieldKeys.length - 1);
+  _perfEnd('loadPage');
+}
+
+function moveFocus(newIdx) {
+  // Lightweight focus change: swap CSS classes only, no DOM rebuild
+  if (newIdx < 0 || newIdx >= pageFieldKeys.length) return;
+  _perf('moveFocus');
+  const oldRow = document.querySelector('.field-row.focused');
+  if (oldRow) oldRow.classList.remove('focused');
+  focusedFieldIdx = newIdx;
+  const newRow = document.querySelector('.field-row[data-idx="' + newIdx + '"]');
+  if (newRow) {
+    newRow.classList.add('focused');
+    newRow.scrollIntoView({ block: 'nearest' });
+  }
+  _perfEnd('moveFocus');
+}
+
+function _updateRowVerification(key, status) {
+  // Update a single row's visual state after confirm/flag without full rebuild
+  const row = document.querySelector('.field-row[data-key="' + key.replace(/"/g, '\\\\"') + '"]');
+  if (!row) return;
+  row.classList.remove('vf-confirmed', 'vf-corrected', 'vf-flagged');
+  if (status) row.classList.add('vf-' + status);
+  // Toggle button active states
+  const confirmBtn = row.querySelector('.vf-btn-confirm');
+  if (confirmBtn) confirmBtn.classList.toggle('active', status === 'confirmed');
+  const flagBtn = row.querySelector('.vf-btn-flag');
+  if (flagBtn) flagBtn.classList.toggle('active', status === 'flagged');
+  // Flash animation on confirm/flag
+  row.classList.remove('vf-just-confirmed', 'vf-just-flagged');
+  if (status === 'confirmed') {
+    row.classList.add('vf-just-confirmed');
+    setTimeout(function() { row.classList.remove('vf-just-confirmed'); }, 500);
+  } else if (status === 'flagged') {
+    row.classList.add('vf-just-flagged');
+    setTimeout(function() { row.classList.remove('vf-just-flagged'); }, 500);
+  }
 }
 
 function setFocus(idx) {
-  // Don't rebuild page if an edit input is active (would destroy it)
+  // Don't change focus if an edit input is active (would destroy it)
   if (document.querySelector('.field-edit-input')) return;
-  focusedFieldIdx = idx; loadPage(currentPage, idx);
+  moveFocus(idx);
 }
-function prevPage() { if (currentPage > 1) loadPage(currentPage - 1); }
-function nextPage() { if (currentPage < totalPages) loadPage(currentPage + 1); }
+function prevPage() { _loadedImagePage = null; if (currentPage > 1) loadPage(currentPage - 1); }
+function nextPage() { _loadedImagePage = null; if (currentPage < totalPages) loadPage(currentPage + 1); }
 
 function reextractPage() {
   if (!currentJobId || !currentPage) return;
@@ -10023,11 +10157,11 @@ document.addEventListener('keydown', function(e) {
   else if (e.key === 'ArrowLeft') { prevPage(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || e.key === 'Tab' && !e.shiftKey) {
     e.preventDefault();
-    if (focusedFieldIdx < pageFieldKeys.length - 1) loadPage(currentPage, focusedFieldIdx + 1);
+    if (focusedFieldIdx < pageFieldKeys.length - 1) moveFocus(focusedFieldIdx + 1);
   }
   else if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
     e.preventDefault();
-    if (focusedFieldIdx > 0) loadPage(currentPage, focusedFieldIdx - 1);
+    if (focusedFieldIdx > 0) moveFocus(focusedFieldIdx - 1);
   }
   else if (e.key === 'Enter') { if (pageFieldKeys[focusedFieldIdx]) confirmField(pageFieldKeys[focusedFieldIdx]); }
   else if (e.key === 'f' || e.key === 'F') { if (pageFieldKeys[focusedFieldIdx]) flagField(pageFieldKeys[focusedFieldIdx]); }
@@ -10288,6 +10422,12 @@ function loadGuidedItem(skipHistory) {
       if (data.error) { showToast(data.error, 'error'); return; }
       guidedCurrentItem = data;
       renderGuidedItem(data);
+      // Prefetch next item's evidence (fire-and-forget)
+      if (guidedIdx + 1 < guidedQueue.length) {
+        var nextItem = guidedQueue[guidedIdx + 1];
+        fetch('/api/guided-review/item/' + guidedJobId + '/' + encodeURIComponent(nextItem.field_id))
+          .catch(function() {});
+      }
       // Acquire lock
       var reviewer = _getGuidedReviewer();
       if (reviewer) {
@@ -10386,6 +10526,7 @@ function renderGuidedItem(data) {
 }
 
 function guidedAction(action) {
+  _perf('guidedAction');
   if (!guidedCurrentItem || !guidedJobId) return;
   var noteVal = (document.getElementById('guidedNoteInput').value || '').trim();
   var body = { action: action, reviewer: _getGuidedReviewer(), note: noteVal };
@@ -10407,6 +10548,7 @@ function guidedAction(action) {
       if (!data.ok) { showToast(data.error || 'Action failed', 'error'); return; }
       var msg = action === 'confirm' ? 'Confirmed' : action === 'correct' ? 'Corrected' : action === 'not_present' ? 'Marked not present' : 'Skipped';
       showToast(msg, action === 'skip' ? 'info' : 'success');
+      _perfEnd('guidedAction');
       updateGuidedProgress(data.reviewed || 0, data.total || 0);
       if (action === 'skip') {
         guidedIdx++;
