@@ -9289,7 +9289,8 @@ function _renderGridComplete(panel, reviewed, total, stageInfo) {
     '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">' +
     '<button class="btn btn-accent" onclick="openGuidedReview()" style="font-size:13px;padding:8px 16px">&#x1F50D; Audit Check</button>' +
     '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:13px;padding:8px 16px">&#x27A1; Submit</button>' +
-    '<button class="btn btn-secondary" onclick="finishReviewGenerate()" style="font-size:13px;padding:8px 16px">&#x1F4C4; Reports</button>' +
+    '<button class="btn btn-secondary" onclick="finishReviewGenerate()" style="font-size:13px;padding:8px 16px">&#x1F4C4; Generate Report</button>' +
+    '<button class="btn btn-secondary" onclick="window.open(\'/api/download/\'+currentJobId,\'_blank\')" style="font-size:13px;padding:8px 16px">&#x2B73; Download Excel</button>' +
     '</div></div>';
   panel.insertBefore(banner, panel.firstChild);
   banner.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -10983,13 +10984,21 @@ function sendBackToPrev() {
 }
 
 function finishReviewGenerate() {
-  if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
+  var jobId = guidedJobId || currentJobId;
+  if (!jobId) { showToast('No job loaded', 'error'); return; }
   var formats = [];
-  if (document.getElementById('frFmtTaxReview').checked) formats.push('tax_review');
-  if (document.getElementById('frFmtJournal').checked) formats.push('journal_entries');
-  if (document.getElementById('frFmtAcctBal').checked) formats.push('account_balances');
-  if (document.getElementById('frFmtTrialBal').checked) formats.push('trial_balance');
-  if (document.getElementById('frFmtTxnReg').checked) formats.push('transaction_register');
+  // Checkboxes may not exist in grid view — default to tax_review
+  var cb = document.getElementById('frFmtTaxReview');
+  if (cb) {
+    if (cb.checked) formats.push('tax_review');
+    if (document.getElementById('frFmtJournal') && document.getElementById('frFmtJournal').checked) formats.push('journal_entries');
+    if (document.getElementById('frFmtAcctBal') && document.getElementById('frFmtAcctBal').checked) formats.push('account_balances');
+    if (document.getElementById('frFmtTrialBal') && document.getElementById('frFmtTrialBal').checked) formats.push('trial_balance');
+    if (document.getElementById('frFmtTxnReg') && document.getElementById('frFmtTxnReg').checked) formats.push('transaction_register');
+  } else {
+    // Grid view: default to tax_review
+    formats.push('tax_review');
+  }
   if (formats.length === 0) { showToast('Select at least one report format', 'error'); return; }
 
   showToast('Generating ' + formats.length + ' report(s)...', 'info');
@@ -10998,20 +11007,22 @@ function finishReviewGenerate() {
   var completed = 0;
   var failed = 0;
   formats.forEach(function(fmt) {
-    fetch('/api/regen-excel/' + guidedJobId, {
+    fetch('/api/regen-excel/' + jobId, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ output_format: fmt })
     }).then(function(r) { return r.json(); })
       .then(function(data) {
         completed++;
-        if (data.error) { failed++; showToast('Failed: ' + fmt + ' — ' + data.error, 'error'); }
+        if (data.error) { failed++; showToast('Failed: ' + fmt + ' \u2014 ' + data.error, 'error'); }
         if (completed === formats.length) {
           if (failed === 0) {
-            showToast('Reports generated. Starting audit sample...', 'success');
+            showToast('\u2713 Reports generated!', 'success');
+            // Open download in new tab
+            window.open('/api/download/' + jobId, '_blank');
           }
-          // Chain into post-run audit
-          startPostRunAudit();
+          // Chain into post-run audit if in guided view
+          if (guidedJobId) startPostRunAudit();
         }
       })
       .catch(function() { completed++; failed++; });
