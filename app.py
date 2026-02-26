@@ -70,18 +70,48 @@ if sys.platform == "win32":
             _POPPLER_PATH = _p
             break
 
-# Auto-detect Tesseract on Windows (needed for page-word OCR / highlighting)
-if sys.platform == "win32":
-    _tess_paths = [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                   r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
-    for _tp in _tess_paths:
-        if os.path.isfile(_tp):
-            try:
-                import pytesseract as _pt
-                _pt.pytesseract.tesseract_cmd = _tp
-            except ImportError:
-                pass
-            break
+# Auto-detect Tesseract (needed for page-word OCR / highlighting)
+# Priority: TESSERACT_CMD env var > PATH > common install locations
+_tesseract_found = False
+if os.environ.get("TESSERACT_CMD"):
+    try:
+        import pytesseract as _pt
+        _pt.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+        _tesseract_found = True
+    except ImportError:
+        pass
+if not _tesseract_found:
+    # Check if tesseract is already in PATH
+    import shutil
+    if shutil.which("tesseract"):
+        _tesseract_found = True  # pytesseract will find it automatically
+    else:
+        # Search common install locations (Windows + Mac + Linux)
+        _tess_search = []
+        if sys.platform == "win32":
+            import glob as _tg
+            _tess_search = (
+                _tg.glob(r"C:\Program Files\Tesseract-OCR\tesseract.exe") +
+                _tg.glob(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe") +
+                _tg.glob(r"C:\tools\Tesseract*\tesseract.exe") +
+                _tg.glob(os.path.expanduser(r"~\AppData\Local\Programs\Tesseract*\tesseract.exe"))
+            )
+        else:
+            _tess_search = ["/usr/local/bin/tesseract", "/opt/homebrew/bin/tesseract",
+                            "/usr/bin/tesseract"]
+        for _tp in _tess_search:
+            if os.path.isfile(_tp):
+                try:
+                    import pytesseract as _pt
+                    _pt.pytesseract.tesseract_cmd = _tp
+                    _tesseract_found = True
+                except ImportError:
+                    pass
+                break
+        if not _tesseract_found:
+            print("  ⚠ Tesseract not found — PDF highlighting will be unavailable.")
+            print("    Install: https://github.com/tesseract-ocr/tesseract")
+            print("    Or set: TESSERACT_CMD=/path/to/tesseract")
 
 # ─── CAS: Telemetry Store (lazy init) ─────────────────────────────────────────
 _telemetry_store = None
