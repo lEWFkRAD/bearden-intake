@@ -4307,7 +4307,7 @@ def _dedup_by_ein(exts):
     for ext in exts:
         ein = ext.get("payer_ein", "")
         fields = ext.get("fields", {})
-        name = get_str(fields, "partnership_name") or get_str(fields, "employer_name") or ext.get("payer_or_entity", "")
+        name = get_str(fields, "partnership_name") or get_str(fields, "employer_name") or ext.get("payer_or_entity") or ""
         recip = ext.get("recipient", "")
         if ein:
             key = f"EIN:{ein}|{recip}".upper()
