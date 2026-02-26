@@ -58,6 +58,18 @@ try:
 except ImportError:
     sys.exit("Install Pillow: pip3 install Pillow")
 
+# Auto-detect poppler on Windows (pdf2image needs it for PDF -> image conversion)
+_POPPLER_PATH = None
+if sys.platform == "win32":
+    import glob as _glob
+    for _p in (_glob.glob(r"C:\tools\poppler*\Library\bin") +
+               _glob.glob(r"C:\tools\poppler*\bin") +
+               _glob.glob(r"C:\Program Files\poppler*\Library\bin") +
+               _glob.glob(r"C:\Program Files\poppler*\bin")):
+        if os.path.isfile(os.path.join(_p, "pdftoppm.exe")):
+            _POPPLER_PATH = _p
+            break
+
 # ─── CAS: Telemetry Store (lazy init) ─────────────────────────────────────────
 _telemetry_store = None
 
@@ -1868,7 +1880,10 @@ def _parse_context_document(file_path, doc_label=""):
     if ext == ".pdf":
         try:
             # Use Tesseract OCR via the same method as extract.py
-            images = convert_from_path(str(file_path), dpi=200, fmt="jpeg")
+            _cfp_kwargs = {"dpi": 200, "fmt": "jpeg"}
+            if _POPPLER_PATH:
+                _cfp_kwargs["poppler_path"] = _POPPLER_PATH
+            images = convert_from_path(str(file_path), **_cfp_kwargs)
             import pytesseract
             text_parts = []
             for img in images:
@@ -2234,7 +2249,10 @@ def generate_page_images(job_id, pdf_path):
     job_pages_dir = PAGES_DIR / job_id
     job_pages_dir.mkdir(exist_ok=True)
     try:
-        images = convert_from_path(str(pdf_path), dpi=150)
+        _cfp_kw = {"dpi": 150}
+        if _POPPLER_PATH:
+            _cfp_kw["poppler_path"] = _POPPLER_PATH
+        images = convert_from_path(str(pdf_path), **_cfp_kw)
         for i, img in enumerate(images):
             img = auto_rotate_page(img)
             page_path = job_pages_dir / f"page_{i+1}.jpg"
