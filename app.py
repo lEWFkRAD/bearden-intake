@@ -4188,6 +4188,26 @@ def results(job_id):
             data = json.load(f)
         data["page_map"] = _build_page_map(data.get("extractions", []))
         data["total_pages"] = job.get("total_pages") or max((int(k) for k in data["page_map"].keys()), default=1)
+        # ── Doctrine drift detection ──
+        try:
+            from lite.doctrine.registry import get_current_manifest
+            from lite.doctrine.drift import doctrine_drift_status
+            manifest = get_current_manifest()
+            # Extract doctrine fields from stored ardent_result or ardent_summary
+            ar = data.get("ardent_result") or {}
+            ars = data.get("ardent_summary") or {}
+            log_dv = ar.get("doctrine_version") or ars.get("doctrine_version")
+            log_dh = ar.get("doctrine_hash") or ars.get("doctrine_hash")
+            drift = doctrine_drift_status(log_dv, log_dh, manifest.doctrine_version, manifest.doctrine_hash)
+            data["doctrine_drift"] = drift
+            data["doctrine_current"] = {
+                "version": manifest.doctrine_version,
+                "hash_short": manifest.doctrine_hash[:8],
+            }
+            if drift["status"] not in ("ok", "legacy"):
+                print(f"  [DOCTRINE] DRIFT: {drift['message']}")
+        except Exception:
+            pass  # Doctrine unavailable — non-fatal
         return jsonify(data)
     return jsonify({"error": "Results not ready"}), 404
 
@@ -11265,6 +11285,43 @@ function renderLiteFindings() {
   if (s.deterministic_match_pct !== null && s.deterministic_match_pct !== undefined) parts.push('Match: ' + s.deterministic_match_pct.toFixed(1) + '%');
   if (s.schema_version) parts.push('Schema v' + s.schema_version);
   prov.textContent = parts.join(' \u2022 ');
+
+  // ── Doctrine provenance + drift badge ──
+  _renderDoctrineBadge();
+}
+
+function _renderDoctrineBadge() {
+  // Find or create the doctrine provenance line in the Lite Findings header
+  var header = document.querySelector('#liteFindingsPanel summary');
+  if (!header) return;
+  var existing = document.getElementById('doctrineBadge');
+  if (existing) existing.remove();
+
+  var dc = reviewData.doctrine_current;
+  var drift = reviewData.doctrine_drift;
+  if (!dc) return;
+
+  var span = document.createElement('span');
+  span.id = 'doctrineBadge';
+  span.style.cssText = 'font-size:10px; font-family:var(--mono); color:var(--text-secondary); margin-left:8px; display:inline-flex; align-items:center; gap:4px;';
+  span.textContent = 'Doctrine v' + dc.version + ' \u2022 ' + dc.hash_short;
+
+  // Drift badge
+  if (drift && drift.status !== 'ok' && drift.status !== 'legacy') {
+    var badge = document.createElement('span');
+    badge.style.cssText = 'background:var(--yellow);color:#7C5800;padding:1px 6px;border-radius:6px;font-size:9px;font-weight:700;cursor:help;';
+    badge.textContent = 'DOCTRINE DRIFT';
+    badge.title = drift.message || 'Governance rules have changed since this document was evaluated.';
+    span.appendChild(badge);
+  } else if (drift && drift.status === 'legacy') {
+    var badge = document.createElement('span');
+    badge.style.cssText = 'background:var(--border);color:var(--text-light);padding:1px 6px;border-radius:6px;font-size:9px;font-weight:600;cursor:help;';
+    badge.textContent = 'PRE-DOCTRINE';
+    badge.title = drift.message || 'This log was created before Doctrine governance was enabled.';
+    span.appendChild(badge);
+  }
+
+  header.appendChild(span);
 }
 
 </script>
