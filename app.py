@@ -70,6 +70,19 @@ if sys.platform == "win32":
             _POPPLER_PATH = _p
             break
 
+# Auto-detect Tesseract on Windows (needed for page-word OCR / highlighting)
+if sys.platform == "win32":
+    _tess_paths = [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                   r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
+    for _tp in _tess_paths:
+        if os.path.isfile(_tp):
+            try:
+                import pytesseract as _pt
+                _pt.pytesseract.tesseract_cmd = _tp
+            except ImportError:
+                pass
+            break
+
 # ─── CAS: Telemetry Store (lazy init) ─────────────────────────────────────────
 _telemetry_store = None
 
@@ -4362,6 +4375,17 @@ def page_image(job_id, page_num):
         return resp
     abort(404)
 
+
+@app.route("/api/page-words/<job_id>/<int:page_num>")
+@require_login
+def page_words(job_id, page_num):
+    """Return OCR word data for a page (used by grid review highlighting)."""
+    words = _get_page_word_data(job_id, page_num)
+    resp = jsonify(words)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 # ─── Guided Review: Backend Functions ────────────────────────────────────────
 
 def _get_page_word_data(job_id, page_num):
@@ -7697,8 +7721,12 @@ td.actions { white-space: nowrap; text-align: right; }
 .btn-accent:hover { background: var(--accent-hover); box-shadow: var(--shadow-sm); }
 .review-split { display: grid; grid-template-columns: 1fr 1fr; height: calc(100vh - 112px); }
 .review-pdf { background: var(--pdf-bg); overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 24px; }
-.review-pdf img { max-width: 95%; height: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; }
+.review-pdf-wrap { position: relative; display: inline-block; max-width: 95%; }
+.review-pdf img { width: 100%; height: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 1px rgba(0,0,0,0.2); border-radius: 6px; background: white; transition: box-shadow 0.3s ease; display: block; }
 .review-pdf img:hover { box-shadow: 0 8px 32px rgba(0,0,0,0.45), 0 0 2px rgba(0,0,0,0.25); }
+.pdf-highlight { position: absolute; background: rgba(255, 230, 0, 0.30); border: 2px solid rgba(255, 60, 0, 0.8); border-radius: 3px; pointer-events: none; transition: opacity 0.25s ease; z-index: 2; }
+.pdf-highlight-pulse { animation: highlightPulse 1.5s ease-in-out infinite; }
+@keyframes highlightPulse { 0%,100% { box-shadow: 0 0 6px rgba(255,60,0,0.3); } 50% { box-shadow: 0 0 16px rgba(255,60,0,0.6); } }
 .review-fields { overflow-y: auto; padding: 20px; background: var(--bg); scroll-behavior: smooth; }
 .verify-progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; width: 100%; max-width: 300px; }
 .verify-progress-fill { height: 100%; background: linear-gradient(90deg, var(--green), var(--accent)); border-radius: 3px; transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 8px rgba(39, 174, 96, 0.3); }
@@ -8162,7 +8190,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     </a>
     <a class="nav-item" onclick="openGuidedReview()" data-section="guided-review" id="navGuidedReview" style="display:none">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
-      <span>Guided Review</span>
+      <span>Audit Check</span>
     </a>
     <a class="nav-item" onclick="showSection('clients')" data-section="clients">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -8338,7 +8366,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
       <button class="btn btn-secondary btn-sm" onclick="reextractPage()" title="Re-extract this page with AI instructions">&#x21BB; Re-extract</button>
       <button class="btn btn-secondary btn-sm" onclick="toggleAiChat()" title="Ask AI about this page" id="aiChatToggle">&#x1F4AC; Ask AI</button>
       <button class="btn btn-ghost btn-sm" title="Keyboard shortcuts (?)" onclick="toggleKbdHelp()">&#x2328;</button>
-      <button class="btn btn-accent btn-sm" onclick="openGuidedReview()" title="Review one field at a time with evidence highlights">&#x2714; Guided</button>
+      <button class="btn btn-accent btn-sm" onclick="openGuidedReview()" title="Audit check — review one field at a time with evidence">&#x1F50D; Audit Check</button>
     </div>
   </div>
   <!-- Client instructions banner (if any) -->
@@ -8568,7 +8596,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="kbd-row"><span>Prev field</span><kbd>&#x2191; / Shift+Tab</kbd></div>
     <div class="kbd-row"><span>Next page</span><kbd>&#x2192;</kbd></div>
     <div class="kbd-row"><span>Prev page</span><kbd>&#x2190;</kbd></div>
-    <div style="font-size:11px;font-weight:700;color:var(--text-light);text-transform:uppercase;margin:10px 0 6px;padding-top:8px;border-top:1px solid var(--border)">Guided Review</div>
+    <div style="font-size:11px;font-weight:700;color:var(--text-light);text-transform:uppercase;margin:10px 0 6px;padding-top:8px;border-top:1px solid var(--border)">Audit Check</div>
     <div class="kbd-row"><span>Confirm</span><kbd>Y</kbd></div>
     <div class="kbd-row"><span>Edit</span><kbd>E</kbd></div>
     <div class="kbd-row"><span>Not Present</span><kbd>N</kbd></div>
@@ -8617,6 +8645,10 @@ let pageFieldKeys = [];
 let selectedDocType = 'tax_returns';
 let earlyReviewActive = false;
 let _loadedImagePage = null;
+let _pageWordData = null;    // OCR word bboxes for current page
+let _pageWordPage = null;    // which page _pageWordData is for
+let _pageImgNatW = 0;        // natural width of page image (for scaling bboxes)
+let _pageImgNatH = 0;        // natural height of page image
 
 // ─── Performance Instrumentation ───
 const _perfTimers = {};
@@ -8975,14 +9007,15 @@ function openReview(job) {
   currentJobId = job.id || job.job_id || currentJobId;
   document.getElementById('navReview').style.display = '';
   document.getElementById('navGuidedReview').style.display = '';
-  // Load review data first, then open guided review as default
-  _loadReviewData(job, function() { openGuidedReview(); });
+  // Load review data first, then open grid (list) review as default
+  _loadReviewData(job, function() { openGridReview(); });
   return;
 }
 // Load review data without switching section (used by both guided and grid)
 function _loadReviewData(job, callback) {
   currentJobId = job.id || job.job_id || currentJobId;
   _loadedImagePage = null;  // reset image cache on job change
+  _pageWordData = null; _pageWordPage = null;  // reset highlight data
 
   Promise.all([
     fetch('/api/results/' + currentJobId).then(r => r.json()),
@@ -9172,6 +9205,41 @@ function updateVerifyBar() {
   const pct = totalFieldCount > 0 ? Math.min(100, Math.round(reviewed / totalFieldCount * 100)) : 0;
   document.getElementById('verifyBar').style.width = pct + '%';
   document.getElementById('verifyStats').innerHTML = '<span>' + reviewed + '</span> of <span>' + totalFieldCount + '</span> fields verified (' + pct + '%)';
+  // When all fields are reviewed, show completion panel
+  if (totalFieldCount > 0 && reviewed >= totalFieldCount && document.getElementById('review').style.display !== 'none') {
+    _showGridComplete(reviewed, totalFieldCount);
+  }
+}
+function _showGridComplete(reviewed, total) {
+  // Show completion overlay in the fields panel
+  var panel = document.getElementById('fieldsPanel');
+  if (!panel || panel.querySelector('.grid-complete-banner')) return; // already showing
+  fetch('/api/jobs/' + currentJobId + '/stage').then(function(r) { return r.json(); }).then(function(stageInfo) {
+    _renderGridComplete(panel, reviewed, total, stageInfo);
+  }).catch(function() {
+    _renderGridComplete(panel, reviewed, total, { stage: 'preparer_review', can_act: true, can_submit: true, display: 'Preparer Review' });
+  });
+}
+function _renderGridComplete(panel, reviewed, total, stageInfo) {
+  var stage = stageInfo.stage || 'preparer_review';
+  var stageDisplay = stageInfo.display || stage;
+  var stageColors = { 'preparer_review': '#3B82F6', 'reviewer_review': '#F59E0B', 'partner_review': '#8B5CF6', 'final': '#10B981', 'draft': '#94A3B8' };
+  var stageColor = stageColors[stage] || '#94A3B8';
+  var banner = document.createElement('div');
+  banner.className = 'grid-complete-banner';
+  banner.innerHTML =
+    '<div style="text-align:center;padding:24px 16px;background:var(--bg-card);border:2px solid var(--green);border-radius:var(--radius-lg);margin:12px 0">' +
+    '<div style="font-size:40px;margin-bottom:8px">&#x2714;</div>' +
+    '<h3 style="margin:0 0 4px;color:var(--green)">All Fields Reviewed</h3>' +
+    '<p style="color:var(--text-muted);margin:0 0 12px;font-size:13px">' + reviewed + ' of ' + total + ' fields verified</p>' +
+    '<div style="display:inline-block;background:' + stageColor + ';color:#fff;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600;margin-bottom:16px">' + esc(stageDisplay) + '</div>' +
+    '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">' +
+    '<button class="btn btn-accent" onclick="openGuidedReview()" style="font-size:13px;padding:8px 16px">&#x1F50D; Audit Check</button>' +
+    '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:13px;padding:8px 16px">&#x27A1; Submit</button>' +
+    '<button class="btn btn-secondary" onclick="finishReviewGenerate()" style="font-size:13px;padding:8px 16px">&#x1F4C4; Reports</button>' +
+    '</div></div>';
+  panel.insertBefore(banner, panel.firstChild);
+  banner.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function fieldKey(page, extIdx, fieldName) { return page + ':' + extIdx + ':' + fieldName; }
@@ -9407,8 +9475,11 @@ function loadPage(page, focusIdx) {
 
   document.getElementById('reviewPager').textContent = page + ' / ' + totalPages;
   if (_loadedImagePage !== page) {
-    document.getElementById('pdfViewer').innerHTML = '<img src="/api/page-image/' + currentJobId + '/' + page + '" alt="Page ' + page + '">';
+    document.getElementById('pdfViewer').innerHTML = '<div class="review-pdf-wrap"><img src="/api/page-image/' + currentJobId + '/' + page + '" alt="Page ' + page + '" onload="_onPageImgLoad(this)"></div>';
     _loadedImagePage = page;
+    _pageWordData = null;
+    _pageWordPage = null;
+    _fetchPageWords(page);
   }
 
   const pageExts = reviewData.page_map[currentPage];
@@ -9566,6 +9637,8 @@ function loadPage(page, focusIdx) {
 
   document.getElementById('fieldsPanel').innerHTML = html;
   if (focusedFieldIdx >= pageFieldKeys.length) focusedFieldIdx = Math.max(0, pageFieldKeys.length - 1);
+  // Trigger highlight for focused field (word data may still be loading)
+  _highlightFocusedField();
   _perfEnd('loadPage');
 }
 
@@ -9581,6 +9654,7 @@ function moveFocus(newIdx) {
     newRow.classList.add('focused');
     newRow.scrollIntoView({ block: 'nearest' });
   }
+  _highlightFocusedField();
   _perfEnd('moveFocus');
 }
 
@@ -9606,13 +9680,122 @@ function _updateRowVerification(key, status) {
   }
 }
 
+// ─── PDF Highlight Overlay (grid review) ───
+function _normalizeNumJS(s) {
+  // Strip $, commas, spaces — keep digits, dots, minus
+  if (s == null) return '';
+  return String(s).replace(/[$,\s]/g, '').replace(/^0+(\d)/, '$1');
+}
+function _findValueBboxesJS(words, value) {
+  if (value == null) return [];
+  var vs = String(value).trim();
+  if (!vs) return [];
+  var norm = _normalizeNumJS(vs);
+  // Strategy 1: exact single-word numeric match
+  if (norm && /[\d.]/.test(norm)) {
+    for (var i = 0; i < words.length; i++) {
+      var wn = _normalizeNumJS(words[i].text);
+      if (wn && wn === norm) return [words[i]];
+    }
+  }
+  // Strategy 2: multi-word numeric assembly
+  if (norm && /[\d.]/.test(norm)) {
+    for (var i = 0; i < words.length; i++) {
+      var running = '', group = [];
+      for (var j = i; j < Math.min(i + 10, words.length); j++) {
+        running += words[j].text;
+        group.push(words[j]);
+        var rn = _normalizeNumJS(running);
+        if (rn && rn === norm) return group;
+      }
+    }
+  }
+  // Strategy 3: case-insensitive text sequence
+  var upper = vs.toUpperCase(), parts = upper.split(/\s+/);
+  if (parts.length) {
+    for (var i = 0; i < words.length; i++) {
+      if (words[i].text.toUpperCase() === parts[0] || parts[0].indexOf(words[i].text.toUpperCase()) === 0) {
+        if (parts.length === 1 && words[i].text.toUpperCase() === parts[0]) return [words[i]];
+        var ok = true, grp = [words[i]];
+        for (var k = 1; k < parts.length; k++) {
+          if (i + k < words.length && words[i + k].text.toUpperCase() === parts[k]) { grp.push(words[i + k]); }
+          else { ok = false; break; }
+        }
+        if (ok && grp.length === parts.length) return grp;
+      }
+    }
+  }
+  return [];
+}
+function _clearHighlights() {
+  var old = document.querySelectorAll('.pdf-highlight');
+  for (var i = 0; i < old.length; i++) old[i].remove();
+}
+function _drawHighlights(bboxes) {
+  _clearHighlights();
+  var wrap = document.querySelector('.review-pdf-wrap');
+  if (!wrap || !bboxes.length) return;
+  var img = wrap.querySelector('img');
+  if (!img || !_pageImgNatW) return;
+  var scaleX = img.clientWidth / _pageImgNatW;
+  var scaleY = img.clientHeight / _pageImgNatH;
+  var PAD = 6;
+  bboxes.forEach(function(b) {
+    var div = document.createElement('div');
+    div.className = 'pdf-highlight pdf-highlight-pulse';
+    div.style.left = Math.max(0, b.left * scaleX - PAD) + 'px';
+    div.style.top = Math.max(0, b.top * scaleY - PAD) + 'px';
+    div.style.width = (b.width * scaleX + PAD * 2) + 'px';
+    div.style.height = (b.height * scaleY + PAD * 2) + 'px';
+    wrap.appendChild(div);
+  });
+  // Scroll highlight into view within the PDF panel
+  var first = wrap.querySelector('.pdf-highlight');
+  if (first) first.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+function _onPageImgLoad(img) {
+  _pageImgNatW = img.naturalWidth;
+  _pageImgNatH = img.naturalHeight;
+  // If words already loaded, draw highlight now
+  if (_pageWordData) _highlightFocusedField();
+}
+function _highlightFocusedField() {
+  if (!_pageWordData || focusedFieldIdx < 0 || focusedFieldIdx >= pageFieldKeys.length) {
+    _clearHighlights();
+    return;
+  }
+  var key = pageFieldKeys[focusedFieldIdx];
+  // Extract the field value from the DOM
+  var row = document.querySelector('.field-row[data-idx="' + focusedFieldIdx + '"]');
+  if (!row) { _clearHighlights(); return; }
+  var valEl = row.querySelector('.field-val');
+  if (!valEl) { _clearHighlights(); return; }
+  var val = valEl.textContent.trim();
+  var bboxes = _findValueBboxesJS(_pageWordData, val);
+  _drawHighlights(bboxes);
+}
+function _fetchPageWords(page) {
+  if (_pageWordPage === page && _pageWordData !== null) return; // already have it
+  _pageWordData = null;
+  _pageWordPage = page;
+  fetch('/api/page-words/' + currentJobId + '/' + page)
+    .then(function(r) { return r.json(); })
+    .then(function(words) {
+      if (_pageWordPage === page) { // still on same page?
+        _pageWordData = words;
+        _highlightFocusedField(); // draw highlight now that words are loaded
+      }
+    })
+    .catch(function() { _pageWordData = []; });
+}
+
 function setFocus(idx) {
   // Don't change focus if an edit input is active (would destroy it)
   if (document.querySelector('.field-edit-input')) return;
   moveFocus(idx);
 }
-function prevPage() { _loadedImagePage = null; if (currentPage > 1) loadPage(currentPage - 1); }
-function nextPage() { _loadedImagePage = null; if (currentPage < totalPages) loadPage(currentPage + 1); }
+function prevPage() { _loadedImagePage = null; _pageWordData = null; _pageWordPage = null; if (currentPage > 1) loadPage(currentPage - 1); }
+function nextPage() { _loadedImagePage = null; _pageWordData = null; _pageWordPage = null; if (currentPage < totalPages) loadPage(currentPage + 1); }
 
 function reextractPage() {
   if (!currentJobId || !currentPage) return;
@@ -10652,7 +10835,7 @@ function _renderGuidedComplete(reviewed, total, stageInfo) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
       '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x27A1; Submit to Reviewer</button>' +
       '<button class="btn btn-secondary" onclick="finishReviewGenerate()" style="font-size:14px;padding:10px 20px">&#x1F4C4; Generate Reports</button>' +
-      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check Queue</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-audit</button>' +
       '<button class="btn btn-ghost" onclick="openGridReview()">&#x2630; List View</button>' +
       '</div>';
   } else if (stage === 'reviewer_review') {
@@ -10663,7 +10846,7 @@ function _renderGuidedComplete(reviewed, total, stageInfo) {
       '<button class="btn btn-primary" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x2705; Approve &rarr; Partner</button>' +
       '<button class="btn btn-warning" onclick="sendBackToPrev()" style="font-size:14px;padding:10px 20px;background:#F59E0B;color:#fff;border:none;border-radius:6px;cursor:pointer">&#x21A9; Send Back to Preparer</button>' +
       '<button class="btn btn-secondary" onclick="finishReviewGenerate()">&#x1F4C4; Generate Reports</button>' +
-      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-audit</button>' +
       '</div>';
   } else if (stage === 'partner_review') {
     html += '<h2 style="margin:0 0 8px">Partner Final Review</h2>' +
@@ -10673,7 +10856,7 @@ function _renderGuidedComplete(reviewed, total, stageInfo) {
       '<button class="btn btn-success" onclick="submitToNextStage()" style="font-size:14px;padding:10px 20px">&#x1F3C6; Finalize</button>' +
       '<button class="btn btn-warning" onclick="sendBackToPrev()" style="font-size:14px;padding:10px 20px;background:#F59E0B;color:#fff;border:none;border-radius:6px;cursor:pointer">&#x21A9; Send Back to Reviewer</button>' +
       '<button class="btn btn-secondary" onclick="finishReviewGenerate()">&#x1F4C4; Generate Reports</button>' +
-      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-audit</button>' +
       '</div>';
   } else {
     // draft or unknown — generic finish
@@ -10682,7 +10865,7 @@ function _renderGuidedComplete(reviewed, total, stageInfo) {
     html += _reportFormatCheckboxes();
     html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">' +
       '<button class="btn btn-primary" onclick="finishReviewGenerate()" style="font-size:14px;padding:10px 20px">&#x1F4C4; Generate Selected Reports</button>' +
-      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-check Queue</button>' +
+      '<button class="btn btn-ghost" onclick="openGuidedReview()">&#x21BB; Re-audit</button>' +
       '<button class="btn btn-ghost" onclick="openGridReview()">&#x2630; List View</button>' +
       '</div>';
   }
