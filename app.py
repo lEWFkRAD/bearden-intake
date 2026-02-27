@@ -8048,8 +8048,14 @@ td.actions { white-space: nowrap; text-align: right; }
 .field-val-wrap { flex: 1; display: flex; align-items: center; gap: 8px; }
 .field-val { font-size: 14px; font-weight: 600; font-family: var(--mono); color: var(--text); cursor: pointer; padding: 2px 6px; border-radius: 4px; transition: color 0.15s ease, background 0.15s ease; }
 .field-val:hover { color: var(--accent); background: rgba(52, 152, 219, 0.06); }
-.field-actions { display: flex; gap: 4px; margin-left: auto; opacity: 0.35; transition: opacity 0.2s ease; }
+.field-actions { display: flex; gap: 4px; margin-left: auto; opacity: 0.7; transition: opacity 0.2s ease; }
 .field-row:hover .field-actions, .field-row.focused .field-actions { opacity: 1; }
+.field-entity-hint { display: block; font-size: 10px; color: var(--text-light); font-weight: 400; margin-top: 1px; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.field-name { cursor: default; }
+.field-name .relabel-icon { display: none; font-size: 10px; margin-left: 4px; cursor: pointer; color: var(--accent); opacity: 0.5; }
+.field-row:hover .field-name .relabel-icon { display: inline; }
+.field-name .relabel-icon:hover { opacity: 1; }
+.field-relabel-input { font-size: 12px; padding: 2px 6px; border: 1px solid var(--accent); border-radius: 4px; background: var(--bg-card); color: var(--text); width: 90%; font-weight: 500; }
 .field-edit-input { font-size: 14px; font-family: var(--mono); padding: 4px 10px; border: 2px solid var(--accent); border-radius: 6px; width: 140px; background: var(--input-bg); color: var(--text); outline: none; box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.15); }
 .field-edit-input:focus { box-shadow: 0 0 0 4px rgba(52, 152, 219, 0.25); }
 
@@ -9977,16 +9983,20 @@ function _renderGridComplete(panel, reviewed, total, stageInfo) {
 function fieldKey(page, extIdx, fieldName) { return page + ':' + extIdx + ':' + fieldName; }
 
 // ─── Save Verification ───
-function saveVerification(key, status, correctedValue, note, category, vendorDesc) {
+function saveVerification(key, status, correctedValue, note, category, vendorDesc, opts) {
   const decision = { status: status };
   if (correctedValue !== undefined && correctedValue !== null) decision.corrected_value = correctedValue;
   if (note) decision.note = note;
   if (category) decision.category = category;
   if (vendorDesc) decision.vendor_desc = vendorDesc;
+  if (opts && opts.relabeled_name) decision.relabeled_name = opts.relabeled_name;
   const existing = verifications[key];
   if (existing && existing.category && !category) {
     decision.category = existing.category;
     if (existing.vendor_desc) decision.vendor_desc = existing.vendor_desc;
+  }
+  if (existing && existing.relabeled_name && !(opts && opts.relabeled_name)) {
+    decision.relabeled_name = existing.relabeled_name;
   }
   verifications[key] = decision;
   fetch('/api/verify/' + currentJobId, {
@@ -10100,6 +10110,51 @@ function startEdit(key, currentVal) {
   input._finishEdit = finishEdit;
   input._onKey = onKey;
   input.addEventListener('blur', finishEdit);
+  input.addEventListener('keydown', onKey);
+}
+
+function startRelabel(key, currentName) {
+  const escapedKey = key.replace(/"/g, '\\"');
+  const row = document.querySelector('[data-key="' + escapedKey + '"]');
+  if (!row) return;
+  const nameSpan = row.querySelector('.field-name');
+  if (!nameSpan) return;
+  // Replace field name with editable input
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'field-relabel-input';
+  input.value = currentName;
+  input.dataset.key = key;
+  input.dataset.original = currentName;
+  nameSpan.innerHTML = '';
+  nameSpan.appendChild(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  function finishRelabel() {
+    if (finished) return;
+    finished = true;
+    const nv = input.value.trim();
+    input.removeEventListener('blur', finishRelabel);
+    input.removeEventListener('keydown', onKey);
+    if (nv && nv !== currentName) {
+      // Save relabeled name — preserve existing verification status
+      const existing = verifications[key];
+      const curStatus = (existing && existing.status) ? existing.status : 'confirmed';
+      const curCorrected = existing ? existing.corrected_value : undefined;
+      const curNote = existing ? existing.note : undefined;
+      const curCat = existing ? existing.category : undefined;
+      const curVendor = existing ? existing.vendor_desc : undefined;
+      saveVerification(key, curStatus, curCorrected, curNote, curCat, curVendor, {relabeled_name: nv});
+      showToast('\u270E Label renamed to: ' + nv, 'success');
+    }
+    loadPage(currentPage, focusedFieldIdx);
+  }
+  function onKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); finishRelabel(); }
+    else if (e.key === 'Escape') { finished = true; loadPage(currentPage, focusedFieldIdx); }
+  }
+  input.addEventListener('blur', finishRelabel);
   input.addEventListener('keydown', onKey);
 }
 
@@ -10310,8 +10365,10 @@ function loadPage(page, focusIdx) {
 
       html += '<div class="' + rowClass + '" data-key="' + esc(vk) + '" data-idx="' + idx + '" onclick="setFocus(' + idx + ')">';
       const boxLabel = (FIELD_BOX_LABELS[ext.document_type] || {})[k];
-      const displayName = (boxLabel ? boxLabel + ' \u2014 ' : '') + k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-      html += '<span class="field-name">' + esc(displayName) + '</span>';
+      const defaultName = (boxLabel ? boxLabel + ' \u2014 ' : '') + k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+      const displayName = (vstate && vstate.relabeled_name) ? vstate.relabeled_name : defaultName;
+      const entityHint = ext.entity ? '<span class="field-entity-hint">' + esc(ext.entity) + '</span>' : '';
+      html += '<span class="field-name">' + esc(displayName) + '<span class="relabel-icon" onclick="event.stopPropagation();startRelabel(\'' + esc(vk) + '\',' + JSON.stringify(displayName).replace(/&/g,'&amp;').replace(/"/g,'&quot;') + ')" title="Rename field label">\u270E</span>' + entityHint + '</span>';
       html += '<span class="field-val-wrap"><span class="conf-dot ' + dotClass + '"></span>';
       const safeVal = JSON.stringify(displayStr).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
       html += '<span class="field-val" onclick="event.stopPropagation();startEdit(\'' + esc(vk) + '\',' + safeVal + ')">' + esc(displayStr) + '</span>';
