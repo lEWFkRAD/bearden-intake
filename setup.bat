@@ -37,7 +37,7 @@ echo.
 
 REM ─── Step 2: Install Python packages ───
 echo [2/5] Installing Python packages...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo.
     echo  ERROR: pip install failed. Make sure Python is installed correctly.
@@ -56,7 +56,7 @@ if %errorlevel% neq 0 (
     echo.
 
     REM Download Tesseract installer
-    powershell -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.5.0.20241111.exe' -OutFile '%TEMP%\tesseract-setup.exe' }"
+    powershell -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe' -OutFile '%TEMP%\tesseract-setup.exe' }"
     if not exist "%TEMP%\tesseract-setup.exe" (
         echo   Download failed. Opening manual download page...
         start "" "https://github.com/UB-Mannheim/tesseract/wiki"
