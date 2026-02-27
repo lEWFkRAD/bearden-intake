@@ -47,6 +47,7 @@ except ImportError:
     sys.exit("Install Pillow: pip3 install Pillow")
 
 import db as appdb
+from muse_capture import init_muse_captures_table, register_muse_routes
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -145,6 +146,10 @@ if appdb.needs_migration():
         print(f"  Warning: Migration failed: {e}")
 appdb.clear_stale_jobs()
 load_jobs()
+
+# ─── Muse Capture (brainstorm ingestion) ──────────────────────────────────────
+init_muse_captures_table()
+register_muse_routes(app)
 
 # ─── Chart of Accounts + Vendor Memory ────────────────────────────────────────
 
