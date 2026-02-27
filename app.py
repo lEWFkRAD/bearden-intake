@@ -4132,6 +4132,66 @@ def _build_page_map(extractions):
     return page_map
 
 
+def _populate_facts(job_id, client_name, year, page_map):
+    """Flatten all extracted fields into the facts table for cross-document queries.
+
+    Uses FactStore with monotonic trust — corrected/confirmed facts are never
+    overwritten by new extractions. Only 'extracted' status facts get refreshed.
+    """
+    try:
+        from fact_store import FactStore
+        fs = FactStore(str(DB_PATH))
+        tax_year = None
+        try:
+            tax_year = int(year) if year else None
+        except (ValueError, TypeError):
+            pass
+        count = 0
+        for page_str, exts in page_map.items():
+            page_num = int(page_str)
+            for ext_idx, ext in enumerate(exts):
+                doc_type = ext.get("document_type", "")
+                entity = ext.get("entity", "") or ext.get("payer_or_entity", "")
+                method = ext.get("method", "")
+                for field_name, field_data in (ext.get("fields") or {}).items():
+                    if isinstance(field_data, dict):
+                        value = field_data.get("value")
+                        conf = field_data.get("confidence", "")
+                    else:
+                        value = field_data
+                        conf = ""
+                    if value is None:
+                        continue
+                    value_num = None
+                    value_text = str(value)
+                    try:
+                        value_num = float(str(value).replace(",", "").replace("$", ""))
+                    except (ValueError, TypeError):
+                        pass
+                    fact_key = f"{doc_type}|{entity}|{field_name}"
+                    evidence_ref = f"{page_num}:{ext_idx}:{field_name}"
+                    # upsert respects monotonic trust — won't overwrite confirmed/corrected
+                    fs.upsert_candidate_fact(
+                        job_id=job_id,
+                        client_id=client_name or "",
+                        tax_year=tax_year or 0,
+                        fact_key=fact_key,
+                        value_num=value_num,
+                        value_text=value_text,
+                        status="extracted",
+                        confidence=conf,
+                        source_method=method,
+                        source_doc=doc_type,
+                        source_page=page_num,
+                        evidence_ref=evidence_ref,
+                    )
+                    count += 1
+        if count:
+            print(f"  [facts] populated {count} facts for {job_id}")
+    except Exception as e:
+        print(f"  [facts] populate error: {e}")
+
+
 def _get_partial_path(job_id):
     """Derive partial results file path for a job."""
     job = jobs.get(job_id)
@@ -4207,6 +4267,8 @@ def results(job_id):
             data = json.load(f)
         data["page_map"] = _build_page_map(data.get("extractions", []))
         data["total_pages"] = job.get("total_pages") or max((int(k) for k in data["page_map"].keys()), default=1)
+        # ── Populate facts table for cross-document queries ──
+        _populate_facts(job_id, job.get("client_name", ""), job.get("year", 0), data["page_map"])
         # ── Doctrine drift detection ──
         try:
             from lite.doctrine.registry import get_current_manifest
@@ -7820,6 +7882,61 @@ td.actions { white-space: nowrap; text-align: right; }
 /* ═══ DOC TYPE + OUTPUT FORMAT PILLS ═══ */
 .pill-group { display: flex; flex-wrap: wrap; gap: 6px; }
 
+/* ═══ FILTER BAR (cross-document category filter) ═══ */
+.filter-bar { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 1px solid var(--border-light); padding: 10px 16px 8px; margin: -20px -20px 12px; }
+.filter-bar-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-light); margin-bottom: 6px; }
+.filter-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.filter-pill { display: inline-flex; align-items: center; gap: 3px; padding: 3px 10px; border-radius: 16px; font-size: 11px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-secondary); transition: all 0.15s ease; user-select: none; white-space: nowrap; }
+.filter-pill:hover { border-color: var(--accent); color: var(--accent); background: rgba(52,152,219,0.04); }
+.filter-pill.active { background: var(--accent); color: white; border-color: var(--accent); box-shadow: 0 1px 4px rgba(52,152,219,0.25); }
+.filter-pill .pill-count { font-size: 10px; font-weight: 700; background: rgba(0,0,0,0.08); padding: 1px 5px; border-radius: 8px; min-width: 16px; text-align: center; line-height: 1.4; }
+.filter-pill.active .pill-count { background: rgba(255,255,255,0.25); }
+.filter-search { width: 100%; padding: 6px 10px 6px 28px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; font-family: var(--sans); background: var(--input-bg); color: var(--text); outline: none; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+.filter-search:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(52,152,219,0.1); }
+.filter-search-wrap { position: relative; }
+.filter-search-wrap::before { content: '\1F50D'; position: absolute; left: 8px; top: 50%; transform: translateY(-50%); font-size: 12px; opacity: 0.4; pointer-events: none; }
+.filter-active-hint { font-size: 11px; color: var(--accent); font-weight: 600; margin-top: 4px; display: flex; align-items: center; gap: 4px; }
+.filter-active-hint .filter-clear { cursor: pointer; font-size: 10px; background: var(--accent); color: white; border: none; border-radius: 10px; padding: 1px 6px; font-weight: 700; }
+.filter-active-hint .filter-clear:hover { background: var(--accent-hover); }
+
+/* ═══ CROSS-DOCUMENT VIEW ═══ */
+.xdoc-container { padding: 0; }
+.xdoc-group { background: var(--bg-card); border-radius: var(--radius-lg); margin-bottom: 12px; box-shadow: var(--shadow-sm); border: 1px solid var(--border-light); overflow: hidden; }
+.xdoc-group-header { font-size: 12px; font-weight: 700; padding: 10px 16px; background: var(--navy); color: white; display: flex; align-items: center; justify-content: space-between; letter-spacing: 0.01em; }
+.xdoc-group-header .xdoc-count { font-size: 10px; font-weight: 600; opacity: 0.7; background: rgba(255,255,255,0.15); padding: 2px 8px; border-radius: 10px; }
+.xdoc-field-row { display: flex; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background 0.15s ease; min-height: 38px; }
+.xdoc-field-row:last-child { border-bottom: none; }
+.xdoc-field-row:hover { background: var(--hover-bg); }
+.xdoc-field-left { flex: 1; min-width: 0; }
+.xdoc-field-name { font-size: 13px; font-weight: 500; color: var(--text-secondary); line-height: 1.3; }
+.xdoc-field-source { font-size: 10px; color: var(--text-light); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.xdoc-field-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: 12px; }
+.xdoc-field-value { font-size: 14px; font-weight: 600; font-family: var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
+.xdoc-field-icon { font-size: 12px; width: 20px; text-align: center; }
+.xdoc-field-icon.vf-ok { color: var(--green); }
+.xdoc-field-icon.vf-flag { color: var(--yellow); }
+.xdoc-field-icon.vf-none { color: var(--text-light); opacity: 0.3; }
+.xdoc-nav-hint { font-size: 10px; color: var(--accent); opacity: 0; transition: opacity 0.15s; margin-left: 4px; white-space: nowrap; }
+.xdoc-field-row:hover .xdoc-nav-hint { opacity: 1; }
+
+/* ═══ ROLLUP SUMMARY PANEL ═══ */
+.rollup-panel { background: var(--bg-card); border-radius: var(--radius-lg); margin-bottom: 12px; box-shadow: var(--shadow-sm); border: 1px solid var(--border-light); overflow: hidden; }
+.rollup-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; cursor: pointer; user-select: none; background: linear-gradient(135deg, var(--accent), #2980b9); color: white; font-size: 13px; font-weight: 700; transition: opacity 0.15s; }
+.rollup-header:hover { opacity: 0.92; }
+.rollup-header .rollup-chevron { font-size: 11px; transition: transform 0.2s ease; }
+.rollup-header .rollup-chevron.collapsed { transform: rotate(-90deg); }
+.rollup-body { padding: 0; max-height: 300px; overflow: hidden; transition: max-height 0.3s ease, padding 0.3s ease; }
+.rollup-body.collapsed { max-height: 0; }
+.rollup-body.expanded { padding: 8px 0; }
+.rollup-row { display: flex; align-items: center; justify-content: space-between; padding: 5px 16px; font-size: 13px; }
+.rollup-row:hover { background: var(--hover-bg); }
+.rollup-label { color: var(--text-secondary); font-weight: 500; }
+.rollup-value { font-family: var(--mono); font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+.rollup-total { border-top: 2px solid var(--border); margin-top: 4px; padding-top: 6px; }
+.rollup-total .rollup-label { color: var(--text); font-weight: 700; }
+.rollup-total .rollup-value { color: var(--accent); font-size: 15px; }
+.rollup-empty { font-size: 12px; color: var(--text-light); padding: 8px 16px; font-style: italic; }
+
 /* ═══ PROCESSING ═══ */
 .processing-card { max-width: 640px; margin: 0 auto; }
 .progress-bar { width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin: 12px 0; }
@@ -8826,6 +8943,397 @@ const FIELD_BOX_LABELS = {
   '1099-NEC': {nonemployee_compensation:'Box 1',federal_wh:'Box 4'},
   'SSA-1099': {net_benefits:'Box 5',federal_wh:'Box 6'},
 };
+
+// ─── Field Taxonomy — maps field keys to tax-meaningful categories ───
+const FIELD_TAXONOMY = {
+  // Wages & Compensation
+  wages:'wages', nonemployee_compensation:'wages', gross_pay:'wages', net_benefits:'wages',
+  net_pay:'wages', total_gross:'wages', total_net_pay:'wages', gross_winnings:'wages',
+  gross_amount:'wages', unemployment:'wages',
+  // Federal Withholding
+  federal_wh:'federal_wh',
+  // FICA (Social Security + Medicare)
+  ss_wages:'fica', ss_wh:'fica', social_security:'fica',
+  medicare_wages:'fica', medicare_wh:'fica', medicare:'fica',
+  total_social_security:'fica', total_medicare:'fica',
+  total_social_security_tax:'fica', total_medicare_tax:'fica',
+  // State & Local Tax
+  state_wages:'state_local', state_wh:'state_local', state_income:'state_local',
+  local_wages:'state_local', local_wh:'state_local',
+  total_state_wh:'state_local', state_local_refund:'state_local',
+  state_amount:'state_local',
+  // Interest Income
+  interest_income:'interest', us_savings_bonds_and_treasury:'interest',
+  tax_exempt_interest:'interest', interest_earned:'interest',
+  box5_interest:'interest', student_loan_interest:'interest',
+  // Dividends
+  ordinary_dividends:'dividends', qualified_dividends:'dividends',
+  section_199a:'dividends', foreign_tax_paid:'dividends',
+  nondividend_distributions:'dividends', exempt_interest_dividends:'dividends',
+  box6a_ordinary_dividends:'dividends', box6b_qualified_dividends:'dividends',
+  // Capital Gains
+  capital_gain_distributions:'capital_gains',
+  total_proceeds:'capital_gains', total_basis:'capital_gains',
+  total_gain_loss:'capital_gains', wash_sale_loss:'capital_gains',
+  short_term_gain_loss:'capital_gains', long_term_gain_loss:'capital_gains',
+  gross_proceeds:'capital_gains',
+  box8_short_term_capital_gain:'capital_gains',
+  box9a_long_term_capital_gain:'capital_gains',
+  box9c_unrecaptured_1250:'capital_gains',
+  box10_net_1231_gain:'capital_gains',
+  // Retirement & Distributions
+  gross_distribution:'retirement', taxable_amount:'retirement',
+  distribution_code:'retirement', employee_contributions:'retirement',
+  ira_contributions:'retirement', rollover_contributions:'retirement',
+  roth_conversion:'retirement', rmd_amount:'retirement',
+  repaid_benefits:'retirement',
+  // Deductions
+  mortgage_interest:'deductions', property_tax:'deductions',
+  mortgage_insurance_premiums:'deductions', tax_amount:'deductions',
+  donation_amount:'deductions', donation_type:'deductions',
+  box12_section_179:'deductions', box13_other_deductions:'deductions',
+  federal_amount:'deductions',
+  // K-1 / Partnership Income
+  box1_ordinary_income:'k1_income', box2_rental_real_estate:'k1_income',
+  box3_other_rental:'k1_income', box4a_guaranteed_services:'k1_income',
+  box7_royalties:'k1_income', box11_other_income:'k1_income',
+  box14_self_employment:'k1_income', box17_alt_min_tax:'k1_income',
+  box18_tax_exempt_income:'k1_income', box19_distributions:'k1_income',
+  box20_other_info:'k1_income',
+  net_rental_income:'k1_income', guaranteed_payments:'k1_income',
+  // Other Income
+  rents:'other_income', royalties:'other_income', other_income:'other_income',
+  debt_cancelled:'other_income', gross_farm_income:'other_income',
+  net_farm_income:'other_income', gross_income:'other_income',
+  total_revenue:'other_income', net_income:'other_income', net_profit:'other_income',
+  // Credits
+  box15_credits:'credits', scholarships_grants:'credits', payments_received:'credits',
+};
+
+const CATEGORY_LABELS = {
+  wages:'Wages', federal_wh:'Fed WH', fica:'FICA', state_local:'State/Local',
+  interest:'Interest', dividends:'Dividends', capital_gains:'Cap Gains',
+  retirement:'Retirement', deductions:'Deductions', k1_income:'K-1',
+  other_income:'Other Income', credits:'Credits',
+};
+
+const CATEGORY_ORDER = [
+  'wages','federal_wh','fica','state_local','interest','dividends',
+  'capital_gains','retirement','deductions','k1_income','other_income','credits'
+];
+
+function getFieldCategory(fieldName) {
+  var bare = fieldName.indexOf(':') >= 0 ? fieldName.split(':').pop() : fieldName;
+  return FIELD_TAXONOMY[bare] || null;
+}
+
+// ═══ CROSS-DOCUMENT FILTER STATE & LOGIC ═══
+var filterState = { activeCategory: null, searchText: '' };
+var _filterSearchTimer = null;
+
+function _initFilterBar() {
+  if (!reviewData || !reviewData.page_map) return;
+  var fp = document.getElementById('fieldsPanel');
+  if (!fp) return;
+  // Remove old bar if exists
+  var old = document.getElementById('filterBar');
+  if (old) old.remove();
+  // Count fields per category
+  var counts = {};
+  CATEGORY_ORDER.forEach(function(c) { counts[c] = 0; });
+  var totalCat = 0;
+  for (var pg in reviewData.page_map) {
+    reviewData.page_map[pg].forEach(function(ext) {
+      Object.keys(ext.fields || {}).forEach(function(k) {
+        if (REVIEW_SKIP_FIELDS.has(k)) return;
+        var f = ext.fields[k];
+        var v = f.value != null ? f.value : (typeof f !== 'object' ? f : null);
+        if (v == null) return;
+        var isNum = typeof v === 'number' || (typeof v === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(v.trim()));
+        if (!isNum) return;
+        var cat = getFieldCategory(k);
+        if (cat && counts[cat] !== undefined) { counts[cat]++; totalCat++; }
+        else { if (!counts['other_income']) counts['other_income'] = 0; counts['other_income']++; totalCat++; }
+      });
+    });
+  }
+  // Build HTML
+  var h = '<div id="filterBar" class="filter-bar">';
+  h += '<div class="filter-bar-label">Filter by Category</div>';
+  h += '<div class="filter-pills">';
+  h += '<div class="filter-pill' + (!filterState.activeCategory ? ' active' : '') + '" data-cat="" onclick="_setFilter(null)">All <span class="pill-count">' + totalCat + '</span></div>';
+  CATEGORY_ORDER.forEach(function(cat) {
+    if (!counts[cat]) return;
+    var active = filterState.activeCategory === cat ? ' active' : '';
+    h += '<div class="filter-pill' + active + '" data-cat="' + cat + '" onclick="_setFilter(\'' + cat + '\')">'
+       + esc(CATEGORY_LABELS[cat] || cat) + ' <span class="pill-count">' + counts[cat] + '</span></div>';
+  });
+  h += '</div>';
+  h += '<div class="filter-search-wrap"><input class="filter-search" id="filterSearchInput" type="text" placeholder="Search fields across all pages\u2026" value="' + esc(filterState.searchText) + '"></div>';
+  if (filterState.activeCategory || filterState.searchText) {
+    h += '<div class="filter-active-hint">\u26A1 Showing cross-document view <button class="filter-clear" onclick="_clearFilter()">✕ Clear</button></div>';
+  }
+  h += '</div>';
+  fp.insertAdjacentHTML('afterbegin', h);
+  // Debounced search
+  var si = document.getElementById('filterSearchInput');
+  if (si) {
+    si.addEventListener('input', function() {
+      clearTimeout(_filterSearchTimer);
+      var val = si.value;
+      _filterSearchTimer = setTimeout(function() {
+        filterState.searchText = val.trim();
+        _applyFilter();
+      }, 200);
+    });
+  }
+}
+
+function _setFilter(category) {
+  filterState.activeCategory = (filterState.activeCategory === category) ? null : category;
+  _applyFilter();
+}
+
+function _clearFilter() {
+  filterState.activeCategory = null;
+  filterState.searchText = '';
+  var si = document.getElementById('filterSearchInput');
+  if (si) si.value = '';
+  _applyFilter();
+}
+
+function _applyFilter() {
+  if (!filterState.activeCategory && !filterState.searchText) {
+    // No filter — reload normal page view (loadPage first, then filter bar on top)
+    loadPage(currentPage);
+    _initFilterBar();
+    return;
+  }
+  // Collect filtered fields and render cross-doc view
+  var matched = _collectFilteredFields(filterState.activeCategory, filterState.searchText);
+  _renderCrossDocView(matched);
+}
+
+function _collectFilteredFields(category, search) {
+  var results = [];
+  if (!reviewData || !reviewData.page_map) return results;
+  var searchLower = (search || '').toLowerCase();
+  for (var pg in reviewData.page_map) {
+    var pageNum = parseInt(pg);
+    reviewData.page_map[pg].forEach(function(ext, extIdx) {
+      var docType = ext.document_type || '';
+      var entity = ext.entity || ext.payer_or_entity || '';
+      var fields = ext.fields || {};
+      Object.keys(fields).forEach(function(k) {
+        if (REVIEW_SKIP_FIELDS.has(k)) return;
+        var f = fields[k];
+        var value = (typeof f === 'object' && f !== null) ? f.value : f;
+        if (value == null) return;
+        var isNum = typeof value === 'number' || (typeof value === 'string' && /^\-?\$?[\d,]+\.?\d*$/.test(String(value).trim()));
+        if (!isNum) return;
+        var fCat = getFieldCategory(k);
+        if (!fCat) fCat = 'other_income';
+        // Category filter
+        if (category && fCat !== category) return;
+        // Search filter
+        if (searchLower) {
+          var haystack = (k + ' ' + docType + ' ' + entity + ' ' + String(value)).toLowerCase();
+          if (haystack.indexOf(searchLower) < 0) return;
+        }
+        var conf = (typeof f === 'object' && f !== null) ? (f.confidence || '') : '';
+        var vk = fieldKey(pageNum, extIdx, k);
+        var vstate = verifications[vk] || null;
+        var displayVal = value;
+        if (vstate && vstate.corrected_value !== undefined) displayVal = vstate.corrected_value;
+        results.push({
+          page: pageNum, extIdx: extIdx, fieldKey: k, fieldName: k,
+          value: displayVal, rawValue: value, category: fCat,
+          docType: docType, entity: entity, confidence: conf,
+          vk: vk, vstate: vstate
+        });
+      });
+    });
+  }
+  // Sort by category order, then by page
+  var catIdx = {};
+  CATEGORY_ORDER.forEach(function(c, i) { catIdx[c] = i; });
+  results.sort(function(a, b) {
+    var ca = catIdx[a.category] != null ? catIdx[a.category] : 99;
+    var cb = catIdx[b.category] != null ? catIdx[b.category] : 99;
+    if (ca !== cb) return ca - cb;
+    if (a.page !== b.page) return a.page - b.page;
+    return a.fieldKey.localeCompare(b.fieldKey);
+  });
+  return results;
+}
+
+// ═══ CROSS-DOCUMENT VIEW RENDERING ═══
+function _renderCrossDocView(matched) {
+  var fp = document.getElementById('fieldsPanel');
+  if (!fp) return;
+  // Rebuild filter bar first (to update active states)
+  fp.innerHTML = '';
+  _initFilterBar();
+  var container = document.createElement('div');
+  container.className = 'xdoc-container';
+
+  if (matched.length === 0) {
+    container.innerHTML = '<div style="padding:30px 20px;text-align:center;color:var(--text-light)">'
+      + '<div style="font-size:28px;margin-bottom:8px">\uD83D\uDD0D</div>'
+      + '<div style="font-size:13px;font-weight:600">No matching fields found</div>'
+      + '<div style="font-size:12px;margin-top:4px">Try a different category or search term</div></div>';
+    fp.appendChild(container);
+    return;
+  }
+
+  // Build rollup summary
+  container.innerHTML += _buildRollupSummary(matched);
+
+  // Group fields
+  var grouped;
+  if (filterState.activeCategory && !filterState.searchText) {
+    grouped = _groupByEntity(matched);
+  } else {
+    grouped = _groupByCategory(matched);
+  }
+
+  grouped.forEach(function(group) {
+    var gh = '<div class="xdoc-group">';
+    gh += '<div class="xdoc-group-header"><span>' + esc(group.label) + '</span><span class="xdoc-count">' + group.fields.length + ' fields</span></div>';
+    group.fields.forEach(function(f) {
+      gh += _buildCrossDocRow(f);
+    });
+    gh += '</div>';
+    container.innerHTML += gh;
+  });
+  fp.appendChild(container);
+}
+
+function _buildCrossDocRow(f) {
+  var displayStr = typeof f.value === 'number' ? f.value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : String(f.value||'');
+  var boxLabel = (FIELD_BOX_LABELS[f.docType] || {})[f.fieldKey];
+  var displayName = (boxLabel ? boxLabel + ' \u2014 ' : '') + f.fieldKey.replace(/_/g,' ').replace(/\b\w/g, function(c){return c.toUpperCase();});
+  var iconClass = 'xdoc-field-icon vf-none';
+  var iconChar = '\u25CB';
+  if (f.vstate) {
+    if (f.vstate.status === 'confirmed' || f.vstate.status === 'corrected') { iconClass = 'xdoc-field-icon vf-ok'; iconChar = '\u2713'; }
+    else if (f.vstate.status === 'flagged') { iconClass = 'xdoc-field-icon vf-flag'; iconChar = '\u26A0'; }
+  }
+  var source = esc(f.docType) + ' \u00B7 ' + esc(f.entity || 'Unknown') + ' \u00B7 p.' + f.page;
+  return '<div class="xdoc-field-row" data-page="' + f.page + '" data-ext="' + f.extIdx + '" data-field="' + esc(f.fieldKey) + '" onclick="_xdocNavigate(this)">'
+    + '<div class="xdoc-field-left"><div class="xdoc-field-name">' + esc(displayName) + '</div><div class="xdoc-field-source">' + source + '</div></div>'
+    + '<div class="xdoc-field-right"><span class="' + iconClass + '">' + iconChar + '</span><span class="xdoc-field-value">' + esc(displayStr) + '</span>'
+    + '<span class="xdoc-nav-hint">\u2192 go</span></div></div>';
+}
+
+function _groupByCategory(fields) {
+  var groups = {};
+  var order = [];
+  fields.forEach(function(f) {
+    var label = CATEGORY_LABELS[f.category] || f.category || 'Other';
+    if (!groups[label]) { groups[label] = []; order.push(label); }
+    groups[label].push(f);
+  });
+  return order.map(function(l) { return { label: l, fields: groups[l] }; });
+}
+
+function _groupByEntity(fields) {
+  var groups = {};
+  var order = [];
+  fields.forEach(function(f) {
+    var label = (f.entity || 'Unknown') + ' (' + f.docType + ')';
+    if (!groups[label]) { groups[label] = []; order.push(label); }
+    groups[label].push(f);
+  });
+  return order.map(function(l) { return { label: l, fields: groups[l] }; });
+}
+
+function _xdocNavigate(el) {
+  var page = parseInt(el.getAttribute('data-page'));
+  var field = el.getAttribute('data-field');
+  var extIdx = parseInt(el.getAttribute('data-ext'));
+  // Clear filter, go to page, highlight field
+  filterState.activeCategory = null;
+  filterState.searchText = '';
+  loadPage(page);
+  // After DOM updates, find and focus the field
+  setTimeout(function() {
+    var vk = fieldKey(page, extIdx, field);
+    var idx = pageFieldKeys.indexOf(vk);
+    if (idx >= 0) {
+      moveFocus(idx);
+      var row = document.querySelector('.field-row[data-key="' + vk.replace(/"/g, '\\\\"') + '"]');
+      if (row) {
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        row.style.transition = 'background 0.3s';
+        row.style.background = 'rgba(52,152,219,0.15)';
+        setTimeout(function() { row.style.background = ''; }, 1500);
+      }
+    }
+    _initFilterBar();
+  }, 100);
+}
+
+// ═══ ROLLUP SUMMARY PANEL ═══
+function _buildRollupSummary(matched) {
+  var numericFields = matched.filter(function(f) {
+    var v = f.value;
+    if (typeof v === 'number') return true;
+    if (typeof v === 'string') {
+      var cleaned = v.replace(/[$,\s]/g, '');
+      return /^\-?\d+\.?\d*$/.test(cleaned);
+    }
+    return false;
+  });
+  if (numericFields.length === 0) return '<div class="rollup-panel"><div class="rollup-empty">No numeric values to summarize</div></div>';
+
+  var h = '<div class="rollup-panel">';
+  // Compute totals
+  var grandTotal = 0;
+  var subTotals = {};
+  var subOrder = [];
+  numericFields.forEach(function(f) {
+    var v = typeof f.value === 'number' ? f.value : parseFloat(String(f.value).replace(/[$,]/g, ''));
+    if (isNaN(v)) return;
+    grandTotal += v;
+    var groupKey;
+    if (filterState.activeCategory && !filterState.searchText) {
+      groupKey = (f.entity || 'Unknown') + ' (' + f.docType + ')';
+    } else {
+      groupKey = CATEGORY_LABELS[f.category] || f.category || 'Other';
+    }
+    if (!subTotals[groupKey]) { subTotals[groupKey] = 0; subOrder.push(groupKey); }
+    subTotals[groupKey] += v;
+  });
+
+  var fmt = function(n) { return (n < 0 ? '-' : '') + '$' + Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+  h += '<div class="rollup-header" onclick="_toggleRollup(this)"><span>\u03A3 Total: ' + fmt(grandTotal) + ' (' + numericFields.length + ' fields)</span><span class="rollup-chevron">\u25BC</span></div>';
+  h += '<div class="rollup-body expanded">';
+  subOrder.forEach(function(key) {
+    h += '<div class="rollup-row"><span class="rollup-label">' + esc(key) + '</span><span class="rollup-value">' + fmt(subTotals[key]) + '</span></div>';
+  });
+  if (subOrder.length > 1) {
+    h += '<div class="rollup-row rollup-total"><span class="rollup-label">Grand Total</span><span class="rollup-value">' + fmt(grandTotal) + '</span></div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+function _toggleRollup(el) {
+  var body = el.parentElement.querySelector('.rollup-body');
+  var chev = el.querySelector('.rollup-chevron');
+  if (!body) return;
+  if (body.classList.contains('expanded')) {
+    body.classList.remove('expanded');
+    body.classList.add('collapsed');
+    if (chev) chev.classList.add('collapsed');
+  } else {
+    body.classList.remove('collapsed');
+    body.classList.add('expanded');
+    if (chev) chev.classList.remove('collapsed');
+  }
+}
+
 let selectedOutputFormat = 'tax_review';
 let vendorMap = {};
 let chartOfAccounts = {};
@@ -9202,9 +9710,10 @@ function _loadReviewData(job, callback) {
     countTotalFields();
     updateVerifyBar();
     loadPage(1);
+    _initFilterBar();
     renderLiteFindings();
     if (callback) callback();
-  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); renderLiteFindings(); if (callback) callback(); });
+  }).catch(() => { reviewData = null; verifications = {}; loadPage(1); _initFilterBar(); renderLiteFindings(); if (callback) callback(); });
 }
 
 // Open grid view explicitly (from "List View" button in guided review)
@@ -9239,6 +9748,7 @@ function openEarlyReview() {
     countTotalFields();
     updateVerifyBar();
     loadPage(1);
+    _initFilterBar();
     renderLiteFindings();
     // Switch to slower polling while reviewing
     clearInterval(pollTimer);
@@ -9972,13 +10482,19 @@ function reextractPage() {
   .then(data => {
     if (data.error) { showToast('Re-extract failed: ' + data.error, 'error'); return; }
     showToast('Page ' + currentPage + ' re-extracted successfully', 'success');
-    // Reload the review data to pick up the new extraction
-    fetch('/api/results/' + currentJobId).then(r => r.json()).then(rd => {
+    // Reload extractions + verifications (must fetch both separately)
+    Promise.all([
+      fetch('/api/results/' + currentJobId).then(r => r.json()),
+      fetch('/api/verify/' + currentJobId).then(r => r.json()),
+    ]).then(function([rd, vd]) {
       if (rd.error) return;
       reviewData = rd;
-      verifications = rd.verifications || {};
+      verifications = (vd && vd.fields) ? vd.fields : verifications;
       totalPages = rd.total_pages || 1;
+      countTotalFields();
+      updateVerifyBar();
       loadPage(currentPage);
+      _initFilterBar();
     });
   })
   .catch(e => { showToast('Re-extract failed: ' + e, 'error'); });
@@ -10497,6 +11013,10 @@ document.addEventListener('keydown', function(e) {
     return;
   }
   if (e.key === '?') { toggleKbdHelp(); return; }
+  // Escape clears filter mode
+  if (e.key === 'Escape' && (filterState.activeCategory || filterState.searchText)) { _clearFilter(); e.preventDefault(); return; }
+  // Suppress page nav arrows when in cross-doc filter view
+  if ((filterState.activeCategory || filterState.searchText) && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) { e.preventDefault(); return; }
   if (e.key === 'ArrowRight') { nextPage(); e.preventDefault(); }
   else if (e.key === 'ArrowLeft') { prevPage(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || e.key === 'Tab' && !e.shiftKey) {
