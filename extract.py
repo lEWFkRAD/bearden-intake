@@ -61,6 +61,25 @@ from io import BytesIO
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ── Load .env file for persistent secrets ────────────────────────────
+def _load_env_file(base: Path = None):
+    """Read .env from project root and inject into os.environ (skip if missing)."""
+    env_path = (base or Path(__file__).resolve().parent) / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("\"'")
+            if key and val and not os.environ.get(key):
+                os.environ[key] = val
+
+_load_env_file()
+
 try:
     import anthropic
 except ImportError:

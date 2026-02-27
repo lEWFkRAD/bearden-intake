@@ -37,6 +37,25 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from io import BytesIO
 
+# ── Load .env file for persistent secrets ────────────────────────────
+def _load_env_file(base: Path = None):
+    """Read .env from project root and inject into os.environ (skip if missing)."""
+    env_path = (base or Path(__file__).resolve().parent) / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("\"'")
+            if key and val and not os.environ.get(key):
+                os.environ[key] = val
+
+_load_env_file()
+
 try:
     from flask import (Flask, render_template_string, render_template, request,
                        jsonify, send_file, abort, session, redirect)
@@ -7582,6 +7601,56 @@ def health_check():
     })
 
 
+# ─── API Key Management ──────────────────────────────────────────────────────
+
+@app.route("/api/config/api-key", methods=["GET"])
+def get_api_key_status():
+    """Check whether the Anthropic API key is configured."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    return jsonify({
+        "configured": bool(key),
+        "hint": (key[:7] + "..." + key[-4:]) if len(key) > 15 else "",
+        "source": "env" if key else "none",
+    })
+
+
+@app.route("/api/config/api-key", methods=["POST"])
+def set_api_key():
+    """Persist the Anthropic API key to .env and set in current process."""
+    data = request.get_json(force=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": "key is required"}), 400
+    if not key.startswith("sk-ant-"):
+        return jsonify({"error": "Key must start with sk-ant-"}), 400
+
+    env_path = BASE_DIR / ".env"
+
+    # Read existing .env lines (preserve other vars)
+    existing_lines = []
+    replaced = False
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                if line.strip().startswith("ANTHROPIC_API_KEY"):
+                    existing_lines.append(f"ANTHROPIC_API_KEY={key}\n")
+                    replaced = True
+                else:
+                    existing_lines.append(line)
+    if not replaced:
+        existing_lines.append(f"ANTHROPIC_API_KEY={key}\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(existing_lines)
+
+    # Set in current process so subprocesses inherit it immediately
+    os.environ["ANTHROPIC_API_KEY"] = key
+
+    hint = key[:7] + "..." + key[-4:]
+    print(f"  ✓ API key saved to .env ({hint})")
+    return jsonify({"ok": True, "hint": hint})
+
+
 # ─── HTML ─────────────────────────────────────────────────────────────────────
 
 
@@ -8277,6 +8346,14 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 <div class="section active" id="sec-upload">
   <div class="page-header"><h2>Upload Document</h2><p>Scan a PDF to extract structured data</p></div>
   <div class="page-content">
+    <div id="apiKeyBanner" style="display:none;background:var(--danger,#e74c3c);color:#fff;padding:14px 20px;border-radius:8px;margin-bottom:16px;font-size:13px;">
+      <strong>&#x26A0; Anthropic API Key Not Set</strong>
+      <p style="margin:6px 0 10px;opacity:0.9">Processing requires an Anthropic API key. Paste yours below to save it permanently.</p>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="password" id="apiKeyInput" placeholder="sk-ant-api03-..." style="flex:1;padding:8px 12px;border:none;border-radius:4px;font-size:13px;font-family:monospace;background:rgba(255,255,255,0.95);color:#222;">
+        <button onclick="saveApiKey()" style="padding:8px 16px;border:none;border-radius:4px;background:#fff;color:var(--danger,#e74c3c);font-weight:600;cursor:pointer;font-size:13px;white-space:nowrap">Save Key</button>
+      </div>
+    </div>
     <div class="card">
       <div class="card-body">
         <div class="upload-area" id="dropZone" onclick="document.getElementById('fileInput').click()">
@@ -8777,7 +8854,36 @@ const OUTPUT_FORMATS = [
   buildPills();
   loadJobs();
   loadClientSuggestions();
+  _checkApiKey();
 })();
+
+// ─── API Key Check ───
+function _checkApiKey() {
+  fetch('/api/config/api-key').then(r=>r.json()).then(d=>{
+    var banner = document.getElementById('apiKeyBanner');
+    if (!banner) return;
+    if (d.configured) {
+      banner.style.display = 'none';
+    } else {
+      banner.style.display = 'block';
+    }
+  }).catch(()=>{});
+}
+function saveApiKey() {
+  var inp = document.getElementById('apiKeyInput');
+  var key = (inp ? inp.value : '').trim();
+  if (!key) { showToast('Enter your API key', 'error'); return; }
+  if (!key.startsWith('sk-ant-')) { showToast('Key must start with sk-ant-', 'error'); return; }
+  fetch('/api/config/api-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) {
+        showToast('API key saved! (' + d.hint + ')', 'success');
+        document.getElementById('apiKeyBanner').style.display = 'none';
+      } else {
+        showToast(d.error || 'Failed to save key', 'error');
+      }
+    }).catch(()=>showToast('Network error','error'));
+}
 
 function buildPills() {
   let dh = '';
@@ -11466,7 +11572,8 @@ if __name__ == "__main__":
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("\n  WARNING:  ANTHROPIC_API_KEY not set!")
-        print("  Run: export ANTHROPIC_API_KEY=sk-ant-...")
+        print("  Option 1: Create .env file with:  ANTHROPIC_API_KEY=sk-ant-...")
+        print("  Option 2: Set it from the Upload page in the browser")
         print()
 
     if not (BASE_DIR / "extract.py").exists():
