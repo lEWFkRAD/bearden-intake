@@ -4109,26 +4109,82 @@ def status(job_id):
 
 # ─── T1.5: Helpers for partial/progressive results ──────────────────────────
 
+_NON_TAX_DOC_TYPES = frozenset({
+    "supplemental_detail", "continuation_statement",
+    "auto_insurance_policy", "insurance_card", "insurance_notice",
+    "privacy_policy", "loan_statement", "mortgage_statement",
+    "receipt",  # retail receipts (Belk, Walmart etc) are not tax forms
+})
+
+# Field names that indicate a non-tax "other" page (insurance docs misclassified as "other")
+_INSURANCE_FIELD_SIGNALS = frozenset({
+    "policy_number", "agency_code", "form_number", "coverage_type",
+    "deductible", "premium", "vin", "vehicle_year",
+})
+
+
 def _build_page_map(extractions):
-    """Build page_map dict from extractions for the review UI."""
+    """Build page_map dict from extractions for the review UI.
+
+    Filters out non-tax document types (insurance, privacy policies, supplemental
+    breakdowns) that pollute field counts and audit checks. These pages still
+    appear in the review (images render) but their fields are excluded.
+    Also flags percentage values that were misread as dollars.
+    """
     page_map = {}
     for ext in extractions:
         p = ext.get("_page")
-        if p:
+        if not p:
+            continue
+        doc_type = ext.get("document_type", "")
+        # Detect "other" pages that are really insurance (misclassified)
+        if doc_type == "other":
+            field_names = set((ext.get("fields") or {}).keys())
+            if field_names & _INSURANCE_FIELD_SIGNALS:
+                doc_type = "insurance_other"  # reclassify
+        # Skip non-tax document types — they pollute field counts and audit
+        if doc_type in _NON_TAX_DOC_TYPES or doc_type == "insurance_other":
+            # Still create the page entry so the image renders, but with zero fields
             if p not in page_map:
                 page_map[p] = []
             page_map[p].append({
-                "document_type": ext.get("document_type", ""),
+                "document_type": doc_type,
                 "entity": ext.get("payer_or_entity", ""),
                 "method": ext.get("_extraction_method", ""),
-                "confidence": ext.get("_overall_confidence", ""),
-                "fields": {k: {
-                    "value": v.get("value") if isinstance(v, dict) else v,
-                    "confidence": v.get("confidence", "") if isinstance(v, dict) else "",
-                    "label": v.get("label_on_form", "") if isinstance(v, dict) else "",
-                } for k, v in (ext.get("fields") or {}).items()
-                if (v.get("value") if isinstance(v, dict) else v) is not None}
+                "confidence": "",
+                "fields": {},
+                "_non_tax": True,
             })
+            continue
+        if p not in page_map:
+            page_map[p] = []
+        fields_out = {}
+        for k, v in (ext.get("fields") or {}).items():
+            val = v.get("value") if isinstance(v, dict) else v
+            if val is None:
+                continue
+            conf = v.get("confidence", "") if isinstance(v, dict) else ""
+            label = v.get("label_on_form", "") if isinstance(v, dict) else ""
+            # Detect percentage values misread as dollar amounts:
+            # if the label_on_form contains "percent" or "%" it's not a dollar field
+            val_str = str(val)
+            if label and ("percent" in label.lower() or "%" in label.lower()):
+                if not val_str.endswith("%"):
+                    val_str = val_str + "%"
+                    val = val_str
+                    conf = "low"  # flag as uncertain
+            fields_out[k] = {
+                "value": val,
+                "confidence": conf,
+                "label": label,
+            }
+        page_map[p].append({
+            "document_type": doc_type,
+            "entity": ext.get("payer_or_entity", ""),
+            "method": ext.get("_extraction_method", ""),
+            "confidence": ext.get("_overall_confidence", ""),
+            "fields": fields_out,
+        })
     return page_map
 
 
@@ -4793,6 +4849,12 @@ def _build_guided_queue(job_id):
             fields = ext.get("fields") or {}
             doc_type = ext.get("document_type", "")
             entity = ext.get("payer_or_entity", "") or ext.get("employer_name", "") or ""
+
+            # Skip non-tax document types (same filter as _build_page_map)
+            if doc_type in _NON_TAX_DOC_TYPES:
+                continue
+            if doc_type == "other" and set(fields.keys()) & _INSURANCE_FIELD_SIGNALS:
+                continue
 
             for field_name, fdata in fields.items():
                 if not isinstance(fdata, dict):
