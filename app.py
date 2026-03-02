@@ -52,6 +52,11 @@ from helpers import (
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB
 
+# ─── Auth gate (RALPH-REFACTOR-003) ──────────────────────────────────────────
+
+from auth import register_auth_gate
+register_auth_gate(app)
+
 # ─── Database initialization ─────────────────────────────────────────────────
 
 appdb.init_db()
