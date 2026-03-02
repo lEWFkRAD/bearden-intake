@@ -1,0 +1,49 @@
+# Phase 2 Verified-Fields Write Path Baseline
+# Captured: 2026-03-02
+# NOTE: Spec referenced "verified_fields" table — actual schema uses facts/fact_events/review_state
+# All writes go through db.py abstraction layer (appdb.*), not raw SQL in app.py
+
+## Canonical Write Functions (db.py)
+
+FUNCTION                        TABLE(S) WRITTEN          CALLED FROM (app.py lines)
+--------                        ----------------          --------------------------
+appdb.set_fact()                facts, fact_events        (indirectly via process_* functions)
+appdb.process_verify()          review_state, fact_events verification_bp: review-action (1880, 1889, 1896)
+appdb.process_approve()         review_state, fact_events verification_bp: review/approve (1624), review-action (1883)
+appdb.process_send_back()       review_state, fact_events verification_bp: review/send-back (1656), review-action (1904)
+appdb.process_override()        review_state, fact_events verification_bp: review/override (1686), review-action (1892, 1900)
+appdb.process_undo()            review_state, fact_events verification_bp: review-undo (1966)
+appdb.acquire_lock()            review_state              verification_bp: review-action (1868), review-undo (1961)
+appdb.release_lock()            review_state              verification_bp: review-action (1937), review-undo (1975)
+appdb.bulk_acquire_lock()       review_state              verification_bp: lock (1721)
+appdb.bulk_release_locks()      review_state              verification_bp: unlock (1743)
+appdb.populate_facts_from_extraction()  facts, review_state  extraction_bp: run_extraction (1066)
+appdb.save_job()                jobs                      extraction_bp: save_jobs (129), _sync_job_to_db (138)
+appdb.delete_job()              jobs                      extraction_bp: delete (1492)
+appdb.set_vendor_category()     vendor_categories         admin_bp: _save_vendor_categories (228)
+appdb.get_vendor_categories()   (read only)               admin_bp: vendor-categories (2049)
+
+## Verification JSON Write Paths (filesystem)
+
+FUNCTION                  FILE WRITTEN                        CALLED FROM (app.py lines)
+--------                  ------------                        --------------------------
+_save_verifications()     VERIFY_DIR/<job_id>.json            verify POST (1576), override (1697), review-action (1915+), review-undo (1971), batch-categories/apply (2466)
+
+## Excel Regeneration Write Paths
+
+FUNCTION                  FILE WRITTEN                        CALLED FROM
+--------                  ------------                        -----------
+_regen_excel()            OUTPUT_DIR/*.xlsx, client_folder    verify POST (1581), override (1700), review-action (1919+), review-undo (1973), batch-categories/apply (2471)
+
+## PII Guard Enforcement Points
+
+FUNCTION              ROUTE                           LINE
+--------              -----                           ----
+guard_messages()      /api/reextract-page             1305
+guard_messages()      /api/ai-chat                    1398
+
+## Summary
+- All fact/review mutations go through appdb.process_* functions
+- Zero raw SQL in app.py for fact/review writes
+- Verification JSON is parallel write path (for Excel regen)
+- PII guard enforced on both LLM call points

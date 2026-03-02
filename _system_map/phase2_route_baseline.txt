@@ -1,0 +1,78 @@
+# Phase 2 Route Baseline — bearden-intake/app.py
+# Captured: 2026-03-02
+# Source: grep @app.route app.py + muse_capture.py register_muse_routes
+# Total: 48 @app.route decorators in app.py + 1 in muse_capture.py = 49 route handlers
+# Flask url_map adds 1 static rule = 50 total rules
+
+## Route Inventory (48 handlers in app.py)
+
+LINE  METHOD  PATH                                                    FUNCTION
+----  ------  ----                                                    --------
+1091  GET     /                                                       index
+1095  POST    /api/upload                                             upload
+1167  GET     /api/status/<job_id>                                    status
+1177  GET     /api/results/<job_id>                                   results
+1210  POST    /api/reextract-page/<job_id>/<int:page_num>             reextract_page
+1353  POST    /api/ai-chat/<job_id>                                   ai_chat
+1427  GET     /api/page-image/<job_id>/<int:page_num>                 page_image
+1434  GET     /api/download/<job_id>                                  download_xlsx
+1446  GET     /api/download-log/<job_id>                              download_log
+1472  GET     /api/jobs                                               list_jobs
+1485  POST    /api/delete/<job_id>                                    delete_job
+1544  GET     /api/verify/<job_id>                                    get_verifications
+1548  POST    /api/verify/<job_id>                                    save_verification
+1590  GET     /api/users                                              api_list_users
+1595  GET     /api/inbox                                              api_inbox
+1602  POST    /api/review/<job_id>/approve                            api_approve_fields
+1632  POST    /api/review/<job_id>/send-back                          api_send_back_fields
+1665  POST    /api/review/<job_id>/override                           api_override_field
+1706  POST    /api/lock/<job_id>                                      api_lock_fields
+1728  POST    /api/unlock/<job_id>                                    api_unlock_fields
+1747  GET     /api/export-status/<job_id>                             api_export_status
+1765  GET     /api/audit/<job_id>                                     api_audit_trail
+1774  GET     /api/review-queue/<job_id>                              api_review_queue
+1846  POST    /api/review-action/<job_id>/<path:field_key>            api_review_action
+1942  POST    /api/review-undo/<job_id>/<path:field_key>              api_review_undo
+1980  GET     /api/evidence/<job_id>/<path:field_key>                 api_evidence
+2049  GET     /api/vendor-categories                                  get_vendor_categories
+2058  POST    /api/suggest-categories                                 suggest_categories
+2077  GET     /api/clients                                            list_clients
+2124  POST    /api/clients/create                                     create_client
+2146  GET     /api/clients/<path:client_name>/info                    get_client_info
+2155  PUT     /api/clients/<path:client_name>/info                    update_client_info
+2171  GET     /api/clients/<path:client_name>/documents               get_client_documents
+2213  GET     /api/context/<path:client_name>                         get_context
+2220  POST    /api/context/<path:client_name>/upload                  upload_context
+2275  DELETE  /api/context/<path:client_name>/<doc_id>                delete_context
+2320  GET     /api/context/<path:client_name>/completeness            completeness_report
+2347  GET     /api/instructions/<path:client_name>                    get_instructions
+2353  POST    /api/instructions/<path:client_name>                    save_instruction
+2389  DELETE  /api/instructions/<path:client_name>/<rule_id>          delete_instruction
+2400  GET     /api/batch-categories                                   batch_categories
+2440  POST    /api/batch-categories/apply                             apply_batch_categories
+2877  POST    /api/regen-excel/<job_id>                               regen_excel
+2887  POST    /api/clients/<path:client_name>/generate-report         generate_report
+2952  GET     /api/download-report/<report_id>                        download_report
+2964  POST    /api/retry/<job_id>                                     retry_job
+3015  POST    /api/cancel/<job_id>                                    cancel_job
+3044  GET     /api/health                                             health_check
+
+## External Route (muse_capture.py — already modular)
+
+LINE  METHOD  PATH                FUNCTION
+----  ------  ----                --------
+166   POST    /muse/capture       muse_capture
+
+## Blueprint Extraction Plan
+
+Blueprint           Routes  Handlers
+---------           ------  --------
+health_bp           1       health_check
+admin_bp            6       users, inbox, vendor-categories, suggest-categories, batch-categories, batch-categories/apply
+clients_bp          12      clients CRUD, context CRUD, instructions CRUD
+ai_bp               1       ai-chat
+verification_bp     13      verify GET/POST, review/*, lock, unlock, export-status, audit, review-queue, review-action, review-undo, evidence
+extraction_bp       15      /, upload, status, results, reextract-page, page-image, download, download-log, jobs, delete, regen-excel, generate-report, download-report, retry, cancel
+(muse_capture.py)   1       already separate — no extraction needed
+
+Total: 48 in app.py + 1 external = 49
