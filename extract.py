@@ -247,173 +247,8 @@ DOC_TYPE_CLASSIFICATIONS = {
     ],
 }
 
-# ─── PII TOKENIZER ───────────────────────────────────────────────────────────
-
-class PIITokenizer:
-    """
-    Replaces SSNs and personal names with tokens before API calls,
-    reverses them after. EINs are NOT tokenized — they're business
-    identifiers that Claude needs for classification and grouping.
-
-    Text tokenization: regex detect → replace with [SSN_1], [NAME_1], etc.
-    Image tokenization: pytesseract word-level detection → black-box SSN regions.
-
-    The token map lives in memory only and is never written to disk.
-    """
-
-    # SSN patterns: 123-45-6789, 123 45 6789, 123456789 (9 digits no dashes)
-    # Also partial-masked: XXX-XX-1234, ***-**-1234, xxx-xx-1234
-    SSN_PATTERN = re.compile(
-        r'\b(\d{3}[-\s]?\d{2}[-\s]?\d{4})\b'
-        r'|'
-        r'(?<!\w)([Xx*]{3}[-\s]?[Xx*]{2}[-\s]?\d{4})(?!\w)'
-    )
-
-    # Last-4 SSN patterns (common on W-2 copies): "SSN: ***-**-1234" already caught above
-    # Also catch standalone "last 4: 1234" type references
-    SSN_LAST4_PATTERN = re.compile(
-        r'(?:SSN|social\s*security)[\s:]*(?:last\s*4[\s:]*)(\d{4})',
-        re.IGNORECASE
-    )
-
-    def __init__(self):
-        self.ssn_map = {}       # token → real value
-        self.ssn_reverse = {}   # real value → token
-        self._ssn_counter = 0
-
-    def _next_ssn_token(self):
-        self._ssn_counter += 1
-        return f"[SSN_{self._ssn_counter}]"
-
-    def _register_ssn(self, raw_ssn):
-        """Register an SSN and return its token. Reuses token if already seen."""
-        # Normalize: strip spaces, keep dashes
-        normalized = raw_ssn.strip()
-        if normalized in self.ssn_reverse:
-            return self.ssn_reverse[normalized]
-        token = self._next_ssn_token()
-        self.ssn_map[token] = normalized
-        self.ssn_reverse[normalized] = token
-        return token
-
-    def tokenize_text(self, text):
-        """Replace SSNs in OCR text with tokens. Returns (tokenized_text, found_count)."""
-        if not text:
-            return text, 0
-
-        found = 0
-
-        def replace_ssn(match):
-            nonlocal found
-            raw = match.group(0)
-            found += 1
-            return self._register_ssn(raw)
-
-        result = self.SSN_PATTERN.sub(replace_ssn, text)
-        return result, found
-
-    def detokenize_text(self, text):
-        """Reverse all tokens back to real values in a string."""
-        if not text:
-            return text
-        for token, real in self.ssn_map.items():
-            text = text.replace(token, real)
-        return text
-
-    def detokenize_json(self, obj):
-        """Recursively reverse tokens in a parsed JSON object."""
-        if obj is None:
-            return None
-        if isinstance(obj, str):
-            return self.detokenize_text(obj)
-        if isinstance(obj, dict):
-            return {k: self.detokenize_json(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self.detokenize_json(item) for item in obj]
-        return obj
-
-    def redact_image(self, pil_image):
-        """
-        Find SSN-pattern text regions in the image and black them out.
-        Returns a new PIL Image with SSN regions redacted.
-
-        Uses pytesseract word-level bounding boxes to locate digits,
-        then blacks out any sequence matching SSN patterns.
-        """
-        if not HAS_TESSERACT:
-            return pil_image  # Can't redact without tesseract
-
-        img = pil_image.copy()
-        draw = ImageDraw.Draw(img)
-
-        try:
-            # Get word-level bounding boxes from tesseract
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        except Exception:
-            return img  # If tesseract fails, return unmodified
-
-        n = len(data['text'])
-        # Build text with positions for SSN detection
-        words = []
-        for i in range(n):
-            txt = data['text'][i].strip()
-            if txt:
-                words.append({
-                    'text': txt,
-                    'left': data['left'][i],
-                    'top': data['top'][i],
-                    'width': data['width'][i],
-                    'height': data['height'][i],
-                    'index': i
-                })
-
-        # Look for SSN patterns across consecutive words
-        # SSNs can appear as: "123-45-6789" (1 word) or "123" "-" "45" "-" "6789" (5 words)
-        # or "XXX-XX-2224" (masked, 1 word)
-        full_text_positions = []  # (start_char, end_char, word_indices)
-        running_text = ""
-        for wi, w in enumerate(words):
-            start = len(running_text)
-            running_text += w['text'] + " "
-            full_text_positions.append((start, len(running_text) - 1, wi))
-
-        # Find SSN matches in the concatenated text
-        for match in self.SSN_PATTERN.finditer(running_text):
-            mstart, mend = match.start(), match.end()
-            # Find which words overlap this match
-            indices_to_redact = []
-            for start, end, wi in full_text_positions:
-                if start < mend and end > mstart:
-                    indices_to_redact.append(wi)
-
-            # Black out those word regions with padding
-            for wi in indices_to_redact:
-                w = words[wi]
-                pad = 4
-                draw.rectangle(
-                    [w['left'] - pad, w['top'] - pad,
-                     w['left'] + w['width'] + pad, w['top'] + w['height'] + pad],
-                    fill='black'
-                )
-
-            # Register the matched SSN
-            self._register_ssn(match.group(0))
-
-        return img
-
-    def redacted_image_to_b64(self, pil_image):
-        """Redact SSNs from image and return base64 JPEG string."""
-        redacted = self.redact_image(pil_image)
-        buf = BytesIO()
-        redacted.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    def get_stats(self):
-        """Return summary of tokenization for logging."""
-        return {
-            "ssns_tokenized": len(self.ssn_map),
-            "tokens": list(self.ssn_map.keys()),
-        }
+# ─── PII TOKENIZER (imported from pii_guard.py) ─────────────────────────────
+from pii_guard import PIITokenizer, raw_pii_allowed, pii_guard_log
 
 
 # ─── PROMPTS ─────────────────────────────────────────────────────────────────
@@ -4012,8 +3847,13 @@ def main():
 
     output = args.output or args.pdf.replace(".pdf", "_intake.xlsx").replace(".PDF", "_intake.xlsx")
 
-    # Initialize PII tokenizer
-    tokenizer = None if args.no_pii else PIITokenizer()
+    # Initialize PII tokenizer (default ON unless --no-pii or LLM_ALLOW_RAW_PII=1)
+    if args.no_pii or raw_pii_allowed():
+        tokenizer = None
+        if raw_pii_allowed():
+            pii_guard_log("BYPASSED", reason="LLM_ALLOW_RAW_PII=1")
+    else:
+        tokenizer = PIITokenizer()
 
     # Initialize cost tracker
     global _cost_tracker

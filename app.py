@@ -36,6 +36,8 @@ try:
 except ImportError:
     sys.exit("Install Flask: pip3 install flask")
 
+from pii_guard import guard_messages
+
 try:
     from pdf2image import convert_from_path
 except ImportError:
@@ -1251,15 +1253,17 @@ def reextract_page(job_id, page_num):
         context = f"Document type: {doc_type}\n{context}"
     prompt = vision_prompt.replace("{context}", context)
 
-    # Call Claude
+    # Call Claude (with PII guard)
     try:
         client = _anthropic.Anthropic()
+        raw_messages = [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+            {"type": "text", "text": prompt}
+        ]}]
+        safe_messages, pii_tok = guard_messages(raw_messages, job_id=job_id)
         msg = client.messages.create(
             model=model, max_tokens=8000,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": prompt}
-            ]}]
+            messages=safe_messages
         )
         raw = msg.content[0].text
 
@@ -1277,6 +1281,10 @@ def reextract_page(job_id, page_num):
                     result = json.loads(m.group(0))
                 except json.JSONDecodeError:
                     pass
+
+        # Detokenize PII back into result
+        if pii_tok and result:
+            result = pii_tok.detokenize_json(result)
 
         if not result or "fields" not in result:
             return jsonify({"error": "AI returned invalid response", "raw": raw[:500]}), 500
@@ -1402,11 +1410,15 @@ Be concise and helpful. If the operator asks about a specific value, reference t
 
     try:
         client = _anthropic.Anthropic()
+        raw_messages = [{"role": "user", "content": content}]
+        safe_messages, pii_tok = guard_messages(raw_messages, job_id=job_id)
         msg = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=1500,
-            messages=[{"role": "user", "content": content}]
+            messages=safe_messages
         )
         reply = msg.content[0].text
+        if pii_tok:
+            reply = pii_tok.detokenize_text(reply)
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": f"AI call failed: {str(e)}"}), 500
