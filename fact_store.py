@@ -732,12 +732,69 @@ class FactStore:
                     "total_source": 0, "fact_keys": [],
                 }
 
+            # ── Dedup triple-format keys: prefer pipe > dot-name > dot-EIN ──
+            _GARBAGE = {"not visible", "not clearly visible"}
+            _FMT_PRI = {"pipe": 4, "dot_name": 3, "dot_ein": 2, "dot_bare": 1}
+
+            def _parse_fk(fk):
+                if "|" in fk:
+                    parts = fk.split("|", 2)
+                    if len(parts) >= 3:
+                        return {"entity": parts[1], "field": parts[2],
+                                "dt": parts[0].upper(), "fmt": "pipe"}
+                    return None
+                if "." not in fk:
+                    return None
+                idx = fk.index(".")
+                dt, rest = fk[:idx].upper(), fk[idx + 1:]
+                if rest.startswith("ein:"):
+                    ld = rest.rfind(".")
+                    if ld <= 0:
+                        return None
+                    return {"entity": rest[4:ld], "field": rest[ld+1:],
+                            "dt": dt, "fmt": "dot_ein"}
+                if rest.startswith("name:"):
+                    ld = rest.rfind(".")
+                    if ld <= 0:
+                        return None
+                    return {"entity": rest[5:ld], "field": rest[ld+1:],
+                            "dt": dt, "fmt": "dot_name"}
+                return {"entity": "", "field": rest, "dt": dt, "fmt": "dot_bare"}
+
+            source_by_key = {r[0]: r for r in source_facts}
+            recs = []
+            for r in source_facts:
+                p = _parse_fk(r[0])
+                if p and p["entity"].lower().strip() not in _GARBAGE:
+                    p["fk"] = r[0]
+                    recs.append(p)
+
+            # Drop dot_ein/dot_bare when pipe/dot_name exists for same (dt, field)
+            good = {(p["dt"], p["field"].lower()) for p in recs
+                    if p["fmt"] in ("pipe", "dot_name")}
+            recs = [p for p in recs
+                    if not (p["fmt"] in ("dot_ein", "dot_bare")
+                            and (p["dt"], p["field"].lower()) in good)]
+
+            # Keep highest-priority per (dt, entity, field)
+            best = {}
+            for p in recs:
+                k = (p["dt"], p["entity"].upper(), p["field"].lower())
+                if k not in best or _FMT_PRI[p["fmt"]] > _FMT_PRI[best[k]["fmt"]]:
+                    best[k] = p
+            keep = {v["fk"] for v in best.values()}
+
             created = 0
             skipped = 0
             created_keys = []
 
             for row in source_facts:
                 fk, val_num, val_text, method, doc, page, conf = row
+
+                # Skip non-canonical keys (dedup)
+                if fk not in keep:
+                    skipped += 1
+                    continue
 
                 # Check if fact already exists in target year
                 existing = conn.execute(
