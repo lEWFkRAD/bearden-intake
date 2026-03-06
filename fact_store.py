@@ -48,7 +48,10 @@ _FORBIDDEN_MODULES = frozenset({
 
 # ─── STATUS TRUST HIERARCHY ──────────────────────────────────────────────────
 # Higher number = higher trust. Never downgrade.
+# "pending" is below "extracted" — used for rollforward placeholders awaiting
+# new-year extraction. Any extraction result automatically supersedes pending.
 STATUS_RANK = {
+    "pending":       -1,
     "missing":        0,
     "extracted":      1,
     "needs_review":   2,
@@ -524,6 +527,125 @@ class FactStore:
             sql += " GROUP BY status"
             rows = conn.execute(sql, params).fetchall()
             return {r[0]: r[1] for r in rows}
+        finally:
+            conn.close()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROLLFORWARD — CLONE PRIOR YEAR FACT STRUCTURE INTO NEW YEAR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def rollforward_facts(self, client_id, from_year, to_year, new_job_id):
+        """Clone fact structure from prior year into a new year.
+
+        Creates placeholder facts for every fact_key that existed in
+        from_year, but with zeroed values and status='pending'. Text
+        labels (payer names, entity info) are preserved; numeric values
+        are cleared.
+
+        RULES:
+          - Only copies fact_keys, not values (numeric fields get NULL)
+          - Text-only facts (no value_num) get their value_text preserved
+            (entity names, EINs, codes — these rarely change year to year)
+          - Status is set to 'pending' (below 'extracted' in trust)
+          - Does NOT overwrite if facts already exist in to_year
+          - Returns count of facts created
+
+        Args:
+            client_id: Client name/identifier
+            from_year: Source tax year (int)
+            to_year: Target tax year (int)
+            new_job_id: Job ID for the new year's facts
+
+        Returns:
+            dict: {"created": N, "skipped": M, "total_source": T,
+                   "fact_keys": [...]}
+        """
+        if from_year == to_year:
+            raise ValueError("from_year and to_year must be different")
+
+        conn = self._conn()
+        try:
+            now = datetime.now().isoformat()
+
+            # Fetch all facts from prior year for this client
+            source_facts = conn.execute(
+                """SELECT fact_key, value_num, value_text, source_method,
+                          source_doc, source_page, confidence
+                   FROM facts
+                   WHERE client_id = ? AND tax_year = ?
+                   ORDER BY fact_key""",
+                (client_id, from_year)
+            ).fetchall()
+
+            if not source_facts:
+                return {
+                    "created": 0, "skipped": 0,
+                    "total_source": 0, "fact_keys": [],
+                }
+
+            created = 0
+            skipped = 0
+            created_keys = []
+
+            for row in source_facts:
+                fk, val_num, val_text, method, doc, page, conf = row
+
+                # Check if fact already exists in target year
+                existing = conn.execute(
+                    """SELECT 1 FROM facts
+                       WHERE job_id = ? AND tax_year = ? AND fact_key = ?""",
+                    (new_job_id, to_year, fk)
+                ).fetchone()
+
+                if existing:
+                    skipped += 1
+                    continue
+
+                # For rollforward:
+                #   - Numeric values → NULL (to be filled by new extraction)
+                #   - Text values for structural fields → preserved
+                #     (payer names, EINs, codes that carry forward)
+                is_structural = val_num is None and val_text is not None
+                carry_text = val_text if is_structural else None
+
+                conn.execute(
+                    """INSERT INTO facts
+                       (job_id, client_id, tax_year, fact_key,
+                        value_num, value_text, status, confidence,
+                        source_method, source_doc, source_page,
+                        evidence_ref, locked, updated_at)
+                       VALUES (?, ?, ?, ?, NULL, ?, 'pending', NULL,
+                               'rollforward', ?, NULL, NULL, 0, ?)""",
+                    (new_job_id, client_id, to_year, fk,
+                     carry_text, doc, now)
+                )
+                created += 1
+                created_keys.append(fk)
+
+            conn.commit()
+            return {
+                "created": created,
+                "skipped": skipped,
+                "total_source": len(source_facts),
+                "fact_keys": created_keys,
+            }
+        finally:
+            conn.close()
+
+    def get_client_years(self, client_id):
+        """Get all tax years that have facts for a client.
+
+        Returns list of years sorted descending (most recent first).
+        """
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT tax_year FROM facts
+                   WHERE client_id = ? AND tax_year IS NOT NULL
+                   ORDER BY tax_year DESC""",
+                (client_id,)
+            ).fetchall()
+            return [r[0] for r in rows]
         finally:
             conn.close()
 
