@@ -352,6 +352,155 @@ class FactStore:
         finally:
             conn.close()
 
+    def batch_upgrade_status(self, job_id, tax_year, fact_keys, new_status="confirmed"):
+        """Upgrade multiple facts in a single transaction. Much faster than looping.
+
+        Args:
+            job_id: Job identifier
+            tax_year: Tax year
+            fact_keys: List of canonical fact keys to upgrade
+            new_status: Target status (default: "confirmed")
+
+        Returns:
+            dict with {upgraded: int, skipped: int}
+        """
+        if new_status not in STATUS_RANK:
+            raise ValueError(f"Unknown status: {new_status!r}")
+        if not fact_keys:
+            return {"upgraded": 0, "skipped": 0}
+
+        new_rank = STATUS_RANK[new_status]
+        lock = 1 if new_status in LOCKED_STATUSES else 0
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = datetime.now().isoformat()
+            upgraded = 0
+            skipped = 0
+
+            for fk in fact_keys:
+                existing = conn.execute(
+                    """SELECT status, locked FROM facts
+                       WHERE job_id = ? AND tax_year = ? AND fact_key = ?""",
+                    (job_id, tax_year, fk)
+                ).fetchone()
+
+                if not existing:
+                    skipped += 1
+                    continue
+
+                ex_status, ex_locked = existing
+                if ex_locked:
+                    skipped += 1
+                    continue
+
+                old_rank = STATUS_RANK.get(ex_status, 1)
+                if new_rank <= old_rank:
+                    skipped += 1
+                    continue
+
+                conn.execute(
+                    """UPDATE facts SET status = ?, locked = ?, updated_at = ?
+                       WHERE job_id = ? AND tax_year = ? AND fact_key = ?""",
+                    (new_status, lock, now, job_id, tax_year, fk)
+                )
+                upgraded += 1
+
+            conn.commit()
+            return {"upgraded": upgraded, "skipped": skipped}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def batch_upsert(self, facts):
+        """Upsert multiple facts in a single transaction. Much faster than looping.
+
+        Args:
+            facts: List of dicts, each with keys matching upsert_candidate_fact args:
+                   job_id, client_id, tax_year, fact_key, value_num, value_text,
+                   status, confidence, source_method, source_doc, source_page, evidence_ref
+
+        Returns:
+            dict with {upserted: int, skipped: int}
+        """
+        if not facts:
+            return {"upserted": 0, "skipped": 0}
+
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = datetime.now().isoformat()
+            upserted = 0
+            skipped = 0
+
+            for f in facts:
+                job_id = f["job_id"]
+                tax_year = f["tax_year"]
+                fact_key = f["fact_key"]
+                status = f.get("status", "extracted")
+                value_text = f.get("value_text")
+
+                if value_text is not None:
+                    _reject_raw_inputs(value_text)
+
+                # Check existing row for lock / trust rules
+                existing = conn.execute(
+                    """SELECT status, locked FROM facts
+                       WHERE job_id = ? AND tax_year = ? AND fact_key = ?""",
+                    (job_id, tax_year, fact_key)
+                ).fetchone()
+
+                if existing:
+                    ex_status, ex_locked = existing
+                    if ex_locked:
+                        skipped += 1
+                        continue
+                    new_rank = STATUS_RANK.get(status, 1)
+                    old_rank = STATUS_RANK.get(ex_status, 1)
+                    if new_rank < old_rank:
+                        skipped += 1
+                        continue
+                    if ex_status in PROTECTED_STATUSES:
+                        skipped += 1
+                        continue
+
+                conn.execute(
+                    """INSERT INTO facts
+                       (job_id, client_id, tax_year, fact_key,
+                        value_num, value_text, status, confidence,
+                        source_method, source_doc, source_page,
+                        evidence_ref, locked, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                       ON CONFLICT(job_id, tax_year, fact_key)
+                       DO UPDATE SET
+                           value_num = excluded.value_num,
+                           value_text = excluded.value_text,
+                           status = excluded.status,
+                           confidence = excluded.confidence,
+                           source_method = excluded.source_method,
+                           source_doc = excluded.source_doc,
+                           source_page = excluded.source_page,
+                           evidence_ref = excluded.evidence_ref,
+                           updated_at = excluded.updated_at""",
+                    (job_id, f.get("client_id", ""), tax_year, fact_key,
+                     f.get("value_num"), value_text, status,
+                     f.get("confidence"), f.get("source_method"),
+                     f.get("source_doc"), f.get("source_page"),
+                     f.get("evidence_ref"), now)
+                )
+                upserted += 1
+
+            conn.commit()
+            return {"upserted": upserted, "skipped": skipped}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def apply_correction(self, job_id, tax_year, fact_key,
                           value_num=None, value_text=None, reviewer=''):
         """Apply a human correction. Sets status='corrected', locked=1.
