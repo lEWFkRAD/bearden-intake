@@ -198,6 +198,13 @@ def _get_db():
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
+def _safe_create_index(conn, sql):
+    """Create index, silently skip if column doesn't exist (older schema)."""
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError:
+        pass
+
 def _init_db():
     """Create tables if needed. Migrate from JSON files on first run."""
     conn = _get_db()
@@ -292,9 +299,10 @@ def _init_db():
                 UNIQUE(job_id, tax_year, fact_key)
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_job ON facts(job_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_client_year ON facts(client_id, tax_year)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key)")
+        # Indexes on facts — wrapped in try/except for older DBs with different schema
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_facts_job ON facts(job_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_facts_client_year ON facts(client_id, tax_year)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key)")
 
         # Sprint 2: Users table — PIN-based auth, role-based access
         conn.execute("""
@@ -310,8 +318,33 @@ def _init_db():
                 updated_at TEXT NOT NULL DEFAULT ''
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+
+        # Migrate: ensure users table has 'id' column (old DBs may lack it)
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            if "id" not in cols:
+                conn.execute("ALTER TABLE users RENAME TO users_old")
+                conn.execute("""
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL UNIQUE,
+                        display_name TEXT NOT NULL,
+                        role TEXT NOT NULL DEFAULT 'reviewer',
+                        pin_hash TEXT NOT NULL DEFAULT '',
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        last_login TEXT DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    )
+                """)
+                conn.execute("""INSERT INTO users (username, display_name, role, pin_hash, is_active, last_login, created_at, updated_at)
+                                SELECT username, display_name, role, pin_hash, is_active, last_login, created_at, updated_at FROM users_old""")
+                conn.execute("DROP TABLE users_old")
+                conn.commit()
+        except Exception:
+            pass  # Table already has id or doesn't exist yet
 
         # Sprint 2: Audit events — immutable by default, no delete endpoint
         conn.execute("""
@@ -328,11 +361,11 @@ def _init_db():
                 ip_addr TEXT DEFAULT ''
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON app_events(ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON app_events(event_type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_level ON app_events(level)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_job ON app_events(job_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON app_events(user_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_events_ts ON app_events(ts)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_events_type ON app_events(event_type)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_events_level ON app_events(level)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_events_job ON app_events(job_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_events_user ON app_events(user_id)")
 
         # Guided review: concurrency locks
         conn.execute("""
@@ -408,9 +441,9 @@ def _init_db():
                 error_message TEXT
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_job ON op_runs(job_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_started ON op_runs(started_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_runs_status ON op_runs(status)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_runs_job ON op_runs(job_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_runs_started ON op_runs(started_at)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_runs_status ON op_runs(status)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS op_phases (
@@ -494,9 +527,9 @@ def _init_db():
                 folder_path TEXT
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_id ON op_change_requests(cr_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_status ON op_change_requests(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_cr_created ON op_change_requests(created_at)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_cr_id ON op_change_requests(cr_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_cr_status ON op_change_requests(status)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_cr_created ON op_change_requests(created_at)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS op_cr_findings (
@@ -513,7 +546,7 @@ def _init_db():
                 UNIQUE(cr_id, finding_id)
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_findings_cr ON op_cr_findings(cr_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_findings_cr ON op_cr_findings(cr_id)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS op_post_fix_gates (
@@ -528,7 +561,7 @@ def _init_db():
                 details_json TEXT
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_op_gates_cr ON op_post_fix_gates(cr_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_op_gates_cr ON op_post_fix_gates(cr_id)")
 
         # ─── End CAS Tables ──────────────────────────────────────────────────
 
@@ -631,8 +664,8 @@ def _init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_lite_events_job ON lite_events(job_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_lite_events_type ON lite_events(event_type)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_lite_events_job ON lite_events(job_id)")
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_lite_events_type ON lite_events(event_type)")
         # ─── End Lite Platform Tables ─────────────────────────────────────────
 
         conn.commit()
@@ -1004,8 +1037,16 @@ def current_user():
     return get_user_by_id(uid)
 
 
+def _is_api_request():
+    """Return True if the current request is an API/JSON call (not a browser page)."""
+    return (request.path.startswith("/api/") or
+            request.accept_mimetypes.best == "application/json" or
+            "X-Scope-Id" in request.headers)
+
+
 def require_login(fn):
-    """Decorator: redirect to /login if not authenticated or session expired."""
+    """Decorator: redirect to /login if not authenticated or session expired.
+    For API requests, return JSON 401 instead of a redirect."""
     import functools
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -1014,11 +1055,15 @@ def require_login(fn):
         last = session.get("last_seen")
         now = int(_time.time())
         if not uid:
+            if _is_api_request():
+                return jsonify({"error": "Authentication required"}), 401
             return redirect("/login")
         if last and now - last > SESSION_IDLE_SECONDS:
             log_event("info", "session_expired", "Session timed out",
                       user_id=uid)
             session.clear()
+            if _is_api_request():
+                return jsonify({"error": "Session expired"}), 401
             return redirect("/login")
         session["last_seen"] = now
         return fn(*args, **kwargs)
@@ -3994,6 +4039,63 @@ def api_ledger_category_rules_delete(rule_id):
 def index():
     return render_template_string(MAIN_HTML)
 
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    """JSON login endpoint for headless clients (Excel add-in)."""
+    import time as _time
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip().lower()
+    pin = data.get("pin", "").strip()
+    ip = request.remote_addr or "unknown"
+    key = (username, ip)
+    st = _failed_logins.get(key, {"count": 0, "locked_until": 0})
+    now_epoch = int(_time.time())
+
+    if st["locked_until"] > now_epoch:
+        return jsonify({"error": "Too many attempts. Try again shortly."}), 429
+
+    u = get_user_by_username(username)
+    if not u or not u["is_active"] or not pin.isdigit() or len(pin) != 6:
+        st["count"] += 1
+        if st["count"] >= MAX_FAILED_ATTEMPTS:
+            st["locked_until"] = now_epoch + LOGIN_LOCKOUT_SECONDS
+        _failed_logins[key] = st
+        return jsonify({"error": "Invalid credentials."}), 401
+
+    if not check_password_hash(u["pin_hash"], pin):
+        st["count"] += 1
+        if st["count"] >= MAX_FAILED_ATTEMPTS:
+            st["locked_until"] = now_epoch + LOGIN_LOCKOUT_SECONDS
+        _failed_logins[key] = st
+        return jsonify({"error": "Invalid credentials."}), 401
+
+    _failed_logins.pop(key, None)
+    session.clear()
+    session["user_id"] = u["id"]
+    session["last_seen"] = now_epoch
+    update_last_login(u["id"])
+    log_event("info", "login_success",
+              f"{u['display_name']} logged in via API",
+              user_id=u["id"], ip_addr=ip)
+    return jsonify({
+        "ok": True,
+        "user_id": u["id"],
+        "username": u["username"],
+        "display_name": u["display_name"],
+        "role": u["role"],
+    })
+
+
+@app.route("/api/users-list")
+def api_users_list():
+    """Public list of active usernames for login dropdown (no secrets)."""
+    try:
+        users = list_active_users()
+        return jsonify([{"username": u["username"], "display_name": u["display_name"]} for u in users])
+    except Exception:
+        return jsonify([])
+
+
 @app.route("/api/me")
 def api_me():
     """Return current logged-in user info (or anonymous fallback)."""
@@ -4394,15 +4496,31 @@ def reextract_page(job_id, page_num):
         context = f"Document type: {doc_type}\n{context}"
     prompt = vision_prompt.replace("{context}", context)
 
-    # Call Claude
+    # Call Claude (with PII guard — GAP-001)
+    try:
+        from pii_guard import guard_messages as _guard_messages
+    except ImportError:
+        _guard_messages = None
+
     try:
         client = _anthropic.Anthropic()
+        raw_messages = [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+            {"type": "text", "text": prompt}
+        ]}]
+
+        pii_tok = None
+        if _guard_messages:
+            safe_messages, pii_tok = _guard_messages(
+                raw_messages, job_id=job_id, model=model,
+                caller="reextract_page",
+            )
+        else:
+            safe_messages = raw_messages
+
         msg = client.messages.create(
             model=model, max_tokens=8000,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": prompt}
-            ]}]
+            messages=safe_messages
         )
         raw = msg.content[0].text
 
@@ -4420,6 +4538,10 @@ def reextract_page(job_id, page_num):
                     result = json.loads(m.group(0))
                 except json.JSONDecodeError:
                     pass
+
+        # Detokenize PII back into result
+        if pii_tok and result:
+            result = pii_tok.detokenize_json(result)
 
         if not result or "fields" not in result:
             return jsonify({"error": "AI returned invalid response", "raw": raw[:500]}), 500
@@ -4541,13 +4663,35 @@ Be concise and helpful. If the operator asks about a specific value, reference t
 
     content.append({"type": "text", "text": prompt})
 
+    # PII guard — GAP-001
+    try:
+        from pii_guard import guard_messages as _guard_chat
+    except ImportError:
+        _guard_chat = None
+
     try:
         client = _anthropic.Anthropic()
+        raw_messages = [{"role": "user", "content": content}]
+
+        pii_tok = None
+        if _guard_chat:
+            safe_messages, pii_tok = _guard_chat(
+                raw_messages, job_id=job_id,
+                model="claude-sonnet-4-20250514", caller="ai_chat",
+            )
+        else:
+            safe_messages = raw_messages
+
         msg = client.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=1500,
-            messages=[{"role": "user", "content": content}]
+            messages=safe_messages
         )
         reply = msg.content[0].text
+
+        # Detokenize PII in the reply
+        if pii_tok:
+            reply = pii_tok.detokenize_text(reply)
+
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": f"AI call failed: {str(e)}"}), 500
@@ -6930,12 +7074,14 @@ def completeness_report(client_name):
 # ─── Client Instructions Routes ──────────────────────────────────────────────
 
 @app.route("/api/instructions/<path:client_name>", methods=["GET"])
+@require_login
 def get_instructions(client_name):
     """Get client instructions."""
     return jsonify(_load_instructions(client_name))
 
 
 @app.route("/api/instructions/<path:client_name>", methods=["POST"])
+@require_login
 def save_instruction(client_name):
     """Add or update a client instruction.
 
@@ -6972,6 +7118,7 @@ def save_instruction(client_name):
 
 
 @app.route("/api/instructions/<path:client_name>/<rule_id>", methods=["DELETE"])
+@require_login
 def delete_instruction(client_name, rule_id):
     """Delete a client instruction."""
     data = _load_instructions(client_name)
