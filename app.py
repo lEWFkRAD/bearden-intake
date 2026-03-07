@@ -8779,7 +8779,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
 .guided-field-label { font-size: 14px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
 .guided-field-dest { font-size: 13px; color: var(--text-light); margin-top: -8px; }
 .guided-field-value { font-size: 36px; font-weight: 700; color: var(--text); font-family: var(--mono); padding: 28px; background: var(--bg); border-radius: var(--radius-lg); border: 2px solid var(--border); text-align: center; word-break: break-all; transition: border-color 0.3s ease, box-shadow 0.3s ease; box-shadow: var(--shadow-sm); }
-.guided-field-value:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+.guided-field-value:hover { border-color: var(--accent); box-shadow: var(--shadow-md); cursor: crosshair; }
 .guided-field-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; }
 .guided-field-meta .badge { font-size: 11px; }
 .guided-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
@@ -12056,14 +12056,24 @@ function renderGuidedItem(data) {
   document.getElementById('guidedDetail').style.opacity = '1';
   // B9: Record when this field was rendered for per-field timing
   _fieldLoadTime = Date.now();
-  // Evidence image — cropped highlight preferred, full page with banner as fallback
+  // PDF-HOVER: Full page image with dynamic highlight overlays
   var evEl = document.getElementById('guidedEvidence');
-  if (data.evidence_url) {
+  _guidedCurrentData = data;
+  _guidedWordData = null;
+  _guidedNatW = 0; _guidedNatH = 0;
+  _clearGuidedHighlights();
+  // Always show full page image in a positioned container for overlay support
+  var pageUrl = data.page_url || (data.evidence_url ? null : null);
+  if (data.page_url) {
+    evEl.innerHTML = '<div class="guided-page-wrap" style="position:relative;display:inline-block;max-width:95%">' +
+      '<img id="guidedPageImg" src="' + esc(data.page_url) + '" alt="Page ' + data.page_num +
+      '" style="max-width:100%;height:auto;display:block" onload="_onGuidedPageLoad(this)">' +
+      '</div>';
+    // Fetch OCR word data for this page to enable dynamic highlighting
+    _fetchGuidedPageWords(data.page_num);
+  } else if (data.evidence_url) {
+    // Fallback: pre-rendered cropped evidence (no hover overlay possible)
     evEl.innerHTML = '<img src="' + esc(data.evidence_url) + '" alt="Evidence for ' + esc(data.field_name) + '" style="max-width:100%;height:auto">';
-  } else if (data.page_url) {
-    evEl.innerHTML = '<div style="background:#FFF3CD;color:#856404;padding:6px 12px;font-size:12px;text-align:center;border-radius:4px;margin-bottom:4px">' +
-      '&#x26A0; Exact location uncertain — showing full page</div>' +
-      '<img src="' + esc(data.page_url) + '" alt="Page ' + data.page_num + '" style="max-width:100%;height:auto">';
   }
   // Field label + destination
   document.getElementById('guidedLabel').textContent = data.display_name || data.field_name;
@@ -12090,6 +12100,84 @@ function renderGuidedItem(data) {
     metaHtml += ' <span class="badge badge-yellow">location uncertain</span>';
   }
   document.getElementById('guidedMeta').innerHTML = metaHtml;
+  // PDF-HOVER: Wire hover listeners on the value element
+  _wireGuidedValueHover();
+}
+
+// ─── PDF-HOVER: Dynamic evidence highlighting for guided review ───
+var _guidedCurrentData = null;
+var _guidedWordData = null;
+var _guidedNatW = 0;
+var _guidedNatH = 0;
+var _guidedWordPage = null;
+
+function _clearGuidedHighlights() {
+  var old = document.querySelectorAll('.guided-page-wrap .pdf-highlight');
+  for (var i = 0; i < old.length; i++) old[i].remove();
+}
+
+function _onGuidedPageLoad(img) {
+  _guidedNatW = img.naturalWidth;
+  _guidedNatH = img.naturalHeight;
+  // Draw highlight if word data already loaded
+  if (_guidedWordData && _guidedCurrentData) {
+    _drawGuidedHighlights(false);
+  }
+}
+
+function _fetchGuidedPageWords(page) {
+  if (_guidedWordPage === page && _guidedWordData !== null) {
+    // Already have it — draw now
+    if (_guidedCurrentData) _drawGuidedHighlights(false);
+    return;
+  }
+  _guidedWordData = null;
+  _guidedWordPage = page;
+  fetch('/api/page-words/' + guidedJobId + '/' + page)
+    .then(function(r) { return r.json(); })
+    .then(function(words) {
+      if (_guidedWordPage === page) {
+        _guidedWordData = words;
+        if (_guidedCurrentData) _drawGuidedHighlights(false);
+      }
+    })
+    .catch(function() { _guidedWordData = []; });
+}
+
+function _drawGuidedHighlights(pulse) {
+  _clearGuidedHighlights();
+  if (!_guidedWordData || !_guidedCurrentData) return;
+  var wrap = document.querySelector('.guided-page-wrap');
+  var img = document.getElementById('guidedPageImg');
+  if (!wrap || !img || !_guidedNatW) return;
+  var bboxes = _findValueBboxesJS(_guidedWordData, _guidedCurrentData.value);
+  if (!bboxes.length) return;
+  var scaleX = img.clientWidth / _guidedNatW;
+  var scaleY = img.clientHeight / _guidedNatH;
+  var PAD = 6;
+  bboxes.forEach(function(b) {
+    var div = document.createElement('div');
+    div.className = 'pdf-highlight' + (pulse ? ' pdf-highlight-pulse' : '');
+    div.style.left = Math.max(0, b.left * scaleX - PAD) + 'px';
+    div.style.top = Math.max(0, b.top * scaleY - PAD) + 'px';
+    div.style.width = (b.width * scaleX + PAD * 2) + 'px';
+    div.style.height = (b.height * scaleY + PAD * 2) + 'px';
+    wrap.appendChild(div);
+  });
+  // Scroll highlight into view
+  var first = wrap.querySelector('.pdf-highlight');
+  if (first) first.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function _wireGuidedValueHover() {
+  var valEl = document.getElementById('guidedValue');
+  if (!valEl) return;
+  valEl.addEventListener('mouseenter', function() {
+    _drawGuidedHighlights(true);  // Pulse on hover
+  });
+  valEl.addEventListener('mouseleave', function() {
+    _drawGuidedHighlights(false); // Static highlight on leave
+  });
 }
 
 function guidedAction(action) {
