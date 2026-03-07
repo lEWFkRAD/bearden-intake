@@ -18,8 +18,38 @@ from openpyxl.comments import Comment
 # Shared helpers from extraction engine
 from extract import get_val, get_str
 
+# ─── SHARED STYLE SYSTEM (Pi for Excel–inspired) ─────────────────────────
+# All formatting constants now live in workpaper_styles.py so inkspren,
+# oathledger/renderer.py, and the Office.js add-in share identical styles.
+from workpaper_styles import (
+    # Named style helpers
+    apply_styles, write_section_header, write_total_row,
+    write_flag_rows, write_title_block, set_standard_widths, setup_print,
+    # Number formats
+    MONEY_FMT, PCT_FMT, DATE_FMT, INT_FMT, NUMBER_FORMATS,
+    # Backward-compat constants (still used in _write_cell_value etc.)
+    BOLD, SECTION_FONT, SECTION_FILL, COL_HEADER_FONT, COL_HEADER_FILL,
+    SUM_FONT, SUM_FILL, SUM_BORDER, FLAG_FONT, FLAG_FILL,
+    CORRECTED_FILL, REVIEW_FILL, CONFIRMED_FILL, DUAL_FILL,
+    ALT_ROW_FILL, DARK_HEADER_FILL, DARK_HEADER_FONT,
+    THIN_BORDER, SECTION_BORDER,
+    # Color palette
+    COLORS,
+)
+
 
 # ─── TEMPLATE SECTIONS ──────────────────────────────────────────────────────
+# DEPRECATED (TMPL-007-B): These hardcoded section definitions are now
+# superseded by templates/tax_review_1040.json (a structured TemplateMap).
+# The new rendering path uses: TemplateMap + OutputPlan → renderer.
+#
+# This constant is preserved for backward compatibility with:
+#   - oathledger/rules_engine.py (builds payload from these sections)
+#   - extract.py (field display ordering)
+#   - tests/test_workpaper.py (MAPPING_REGISTRY coverage check)
+#
+# Kill switch: INKSPREN_LEGACY_RENDER=1 forces the old _populate_tax_review path.
+# Default: new TemplateMap-driven path (via template_bridge.py).
 
 TEMPLATE_SECTIONS = [
     {
@@ -340,40 +370,23 @@ ALWAYS_SHOW = []  # Skip empty sections entirely — only show sections with act
 
 
 # ─── EXCEL STYLES ────────────────────────────────────────────────────────────
-
-BOLD = Font(bold=True)
-SECTION_FONT = Font(bold=True, size=11, color="000000")
-SECTION_FILL = PatternFill("solid", fgColor="D9D9D9")     # Light gray — section header rows
-COL_HEADER_FONT = Font(size=11, color="000000")            # Normal weight, matches section row
-COL_HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")   # Same gray as section header
-MONEY_FMT = '#,##0.00_);(#,##0.00)'                        # Accounting: parentheses for negatives
-PCT_FMT = '0.00%'
-DATE_FMT = 'MM/DD/YYYY'
-SUM_FONT = Font(bold=True, size=11, color="000000")
-SUM_FILL = PatternFill()                                    # No fill on total rows
-FLAG_FILL = PatternFill("solid", fgColor="FFFDE7")         # Soft yellow — low confidence
-CORRECTED_FILL = PatternFill("solid", fgColor="C8E6C9")   # Green — corrected
-REVIEW_FILL = PatternFill("solid", fgColor="FFE0B2")      # Orange — needs human
-CONFIRMED_FILL = PatternFill("solid", fgColor="E8F5E9")   # Light green — confirmed
-DUAL_FILL = PatternFill("solid", fgColor="A5D6A7")        # Darker green — OCR + image agree
-FLAG_FONT = Font(italic=True, color="CC0000")
-ALT_ROW_FILL = PatternFill()                               # No alternating rows
-DARK_HEADER_FILL = PatternFill("solid", fgColor="2C3E50")
-DARK_HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
-THIN_BORDER = openpyxl.styles.Border()                     # No cell borders on data rows
-SECTION_BORDER = openpyxl.styles.Border()                  # No border on section headers
-SUM_BORDER = openpyxl.styles.Border(                        # Line above + double underline on totals
-    top=openpyxl.styles.Side(style="thin", color="000000"),
-    bottom=openpyxl.styles.Side(style="double", color="000000"),
-)
+# All style constants are now imported from workpaper_styles.py (see imports above).
+# This keeps the constants available at module scope for backward compatibility
+# with code that does `import inkspren; inkspren.MONEY_FMT` etc.
 
 
 # ─── ROUTER ──────────────────────────────────────────────────────────────────
 
 def populate_template(extractions, template_path, output_path, year, output_format="tax_review"):
-    """Router: create workbook, delegate to format-specific function, save."""
+    """Router: create workbook, delegate to format-specific function, save.
+
+    For the default 'tax_review' format, this now routes through the
+    TemplateMap + OutputPlan pipeline (TMPL-007-B) unless the legacy
+    kill switch INKSPREN_LEGACY_RENDER=1 is set.
+    """
     fmt_labels = {
         "tax_review": "Tax Review", "tax_review_payload": "Tax Review (v2 Payload)",
+        "tax_review_v3": "Tax Review (v3 TemplateMap)",
         "journal_entries": "Journal Entries",
         "account_balances": "Account Balances", "trial_balance": "Trial Balance",
         "transaction_register": "Transaction Register",
@@ -415,24 +428,30 @@ def populate_template(extractions, template_path, output_path, year, output_form
                 print(f"  [OathLedger] WARNING: TEMPLATE_SECTIONS schema drift detected")
                 print(f"    Expected: {expected_hash[:24]}...")
                 print(f"    Current:  {current_hash[:24]}...")
+    elif output_format == "tax_review_v3":
+        # Explicit v3 TemplateMap path (TMPL-007-B)
+        from template_bridge import render_tax_review_via_map
+        render_tax_review_via_map(ws, extractions, year, draft_mode=True)
     else:
-        _populate_tax_review(ws, extractions, year)
+        # Default: tax_review
+        # TMPL-007-B: Route through TemplateMap unless legacy kill switch is set
+        if os.environ.get("INKSPREN_LEGACY_RENDER") == "1":
+            _populate_tax_review(ws, extractions, year)
+        else:
+            try:
+                from template_bridge import render_tax_review_via_map
+                render_tax_review_via_map(ws, extractions, year, draft_mode=True)
+            except Exception as e:
+                print(f"  [TMPL-007-B] TemplateMap render failed, falling back to legacy: {e}")
+                _populate_tax_review(ws, extractions, year)
 
     ws.freeze_panes = "A4"
 
-    # Print setup for all formats
-    ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
-    ws.oddHeader.center.text = f"&B{fmt_labels.get(output_format, 'Document Intake')} \u2014 {year}"
-    ws.oddHeader.center.size = 10
-    ws.oddFooter.left.text = "Bearden Accounting \u2014 Document Intake v5"
-    ws.oddFooter.left.size = 8
-    ws.oddFooter.right.text = "Page &P of &N"
-    ws.oddFooter.right.size = 8
-    ws.print_options.gridLines = True
+    # Column widths (Pi-inspired character-unit math)
+    set_standard_widths(ws, num_cols=6)
+
+    # Print setup (shared across all renderers)
+    setup_print(ws, fmt_labels.get(output_format, "Document Intake"), year)
 
     # Remove default sheet if it exists and is empty
     if "Sheet" in wb.sheetnames and wb["Sheet"].max_row <= 1:
@@ -520,24 +539,12 @@ def _dedup_by_ein(exts):
     return [seen[k][0] for k in order]
 
 def _write_title(ws, title, year, client_name=""):
-    """Write title rows with optional client name, return next row number."""
-    row = 1
-    if client_name:
-        ws["A1"] = client_name
-        ws["A1"].font = Font(bold=True, size=16, color="000000")
-        ws["A1"].alignment = Alignment(horizontal="center")
-        ws.merge_cells("A1:F1")
-        row = 2
-    ws[f"A{row}"] = f"{title} \u2014 {year}"
-    ws[f"A{row}"].font = Font(bold=True, size=14, color="000000")
-    ws[f"A{row}"].alignment = Alignment(horizontal="center")
-    ws.merge_cells(f"A{row}:F{row}")
-    row += 1
-    ws[f"A{row}"] = f"Extracted {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
-    ws[f"A{row}"].font = Font(italic=True, color="999999", size=9)
-    ws[f"A{row}"].alignment = Alignment(horizontal="center")
-    ws.merge_cells(f"A{row}:F{row}")
-    return row + 2
+    """Write title rows with optional client name, return next row number.
+
+    Now delegates to workpaper_styles.write_title_block() for consistency
+    across all renderers.
+    """
+    return write_title_block(ws, title, year, client_name=client_name)
 
 def _write_cell_value(ws, col, row, fields, field_name, ext, matched):
     """Write a single field cell with formatting and confidence coloring."""
