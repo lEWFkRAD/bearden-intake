@@ -179,7 +179,25 @@ for d in [DATA_DIR, UPLOAD_DIR, OUTPUT_DIR, CLIENTS_DIR, PAGES_DIR, EVIDENCE_DIR
 REVIEW_LOCK_TIMEOUT_SECONDS = 300
 
 VENDOR_CATEGORIES_FILE = DATA_DIR / "vendor_categories.json"
-DB_PATH = DATA_DIR / "bearden.db"
+
+# GAP-009: DB path configurable via env var to avoid OneDrive sync corruption
+DB_PATH = Path(os.environ.get("BEARDEN_DB_PATH", str(DATA_DIR / "bearden.db")))
+
+# GAP-009: Warn if SQLite DB lives under a cloud-synced directory
+_CLOUD_SYNC_MARKERS = ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive")
+_db_path_str = str(DB_PATH).replace("\\", "/")
+for _marker in _CLOUD_SYNC_MARKERS:
+    if _marker.lower() in _db_path_str.lower():
+        import warnings
+        warnings.warn(
+            f"[GAP-009] SQLite database '{DB_PATH}' is under a cloud-synced "
+            f"directory ({_marker}). This risks corruption if the .db or .db-wal "
+            f"files sync mid-transaction. Set BEARDEN_DB_PATH to a local path "
+            f"(e.g., C:/data/bearden.db) to mitigate.",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+        break
 
 def _secure_file(path):
     """Set restrictive permissions on sensitive files (owner-only read/write)."""
