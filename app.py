@@ -312,6 +312,7 @@ def _init_db():
                 display_name TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'reviewer',
                 pin_hash TEXT NOT NULL DEFAULT '',
+                must_reset_pin INTEGER NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 last_login TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '',
@@ -333,18 +334,29 @@ def _init_db():
                         display_name TEXT NOT NULL,
                         role TEXT NOT NULL DEFAULT 'reviewer',
                         pin_hash TEXT NOT NULL DEFAULT '',
+                        must_reset_pin INTEGER NOT NULL DEFAULT 0,
                         is_active INTEGER NOT NULL DEFAULT 1,
                         last_login TEXT DEFAULT '',
                         created_at TEXT NOT NULL DEFAULT '',
                         updated_at TEXT NOT NULL DEFAULT ''
                     )
                 """)
-                conn.execute("""INSERT INTO users (username, display_name, role, pin_hash, is_active, last_login, created_at, updated_at)
-                                SELECT username, display_name, role, pin_hash, is_active, last_login, created_at, updated_at FROM users_old""")
+                conn.execute("""INSERT INTO users (username, display_name, role, pin_hash, must_reset_pin, is_active, last_login, created_at, updated_at)
+                                SELECT username, display_name, role, pin_hash, 0, is_active, last_login, created_at, updated_at FROM users_old""")
                 conn.execute("DROP TABLE users_old")
                 conn.commit()
         except Exception:
             pass  # Table already has id or doesn't exist yet
+
+        # SEC-006: Migrate — add must_reset_pin column if missing
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            if "must_reset_pin" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN must_reset_pin INTEGER NOT NULL DEFAULT 1")
+                conn.commit()
+                print("  Migrated: added must_reset_pin column (all existing users flagged for reset)")
+        except Exception:
+            pass  # Column already exists
 
         # Sprint 2: Audit events — immutable by default, no delete endpoint
         conn.execute("""
@@ -846,14 +858,17 @@ _failed_logins = {}  # key=(username, ip) -> {"count": int, "locked_until": epoc
 # ─── Sprint 2: User DB Functions ─────────────────────────────────────────────
 
 def _seed_default_users():
-    """Create default firm users if users table is empty. Called once at startup."""
+    """Create default firm users if users table is empty. Called once at startup.
+
+    SEC-006: Each user gets a unique random PIN (not a shared default).
+    All seeded users have must_reset_pin=1 so they're forced to change on first login.
+    """
     conn = _get_db()
     try:
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count > 0:
             return  # Already seeded
         now = datetime.now().isoformat()
-        default_pin = generate_password_hash("000000")  # Temp PIN — must be reset
         seed_users = [
             ("jeff",    "Jeffrey Watts",  "admin"),
             ("susan",   "Susan",          "reviewer"),
@@ -863,15 +878,22 @@ def _seed_default_users():
             ("leigh",   "Leigh",          "preparer"),
             ("molly",   "Molly",          "reviewer"),
         ]
+        temp_pins = {}
         for username, display_name, role in seed_users:
+            temp_pin = generate_6_digit_pin()
+            pin_hash = generate_password_hash(temp_pin)
+            temp_pins[username] = temp_pin
             conn.execute(
                 """INSERT OR IGNORE INTO users
-                   (username, display_name, role, pin_hash, is_active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 1, ?, ?)""",
-                (username, display_name, role, default_pin, now, now)
+                   (username, display_name, role, pin_hash, must_reset_pin, is_active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 1, 1, ?, ?)""",
+                (username, display_name, role, pin_hash, now, now)
             )
         conn.commit()
-        print(f"  Seeded {len(seed_users)} default users (temp PIN: 000000)")
+        # Print temp PINs to console for admin to distribute securely
+        print(f"  Seeded {len(seed_users)} default users with unique PINs (must reset on first login):")
+        for username, pin in temp_pins.items():
+            print(f"    {username}: {pin}")
     finally:
         conn.close()
 
@@ -894,7 +916,7 @@ def get_user_by_id(user_id):
     try:
         row = conn.execute(
             """SELECT id, username, display_name, role, pin_hash,
-                      is_active, last_login, created_at, updated_at
+                      must_reset_pin, is_active, last_login, created_at, updated_at
                FROM users WHERE id = ?""", (user_id,)
         ).fetchone()
         if not row:
@@ -910,7 +932,7 @@ def get_user_by_username(username):
     try:
         row = conn.execute(
             """SELECT id, username, display_name, role, pin_hash,
-                      is_active, last_login, created_at, updated_at
+                      must_reset_pin, is_active, last_login, created_at, updated_at
                FROM users WHERE username = ?""", (username,)
         ).fetchone()
         if not row:
@@ -926,7 +948,7 @@ def list_all_users():
     try:
         rows = conn.execute(
             """SELECT id, username, display_name, role, pin_hash,
-                      is_active, last_login, created_at, updated_at
+                      must_reset_pin, is_active, last_login, created_at, updated_at
                FROM users ORDER BY role, username"""
         ).fetchall()
         return [_user_row_to_dict(r) for r in rows]
@@ -940,7 +962,7 @@ def list_active_users():
     try:
         rows = conn.execute(
             """SELECT id, username, display_name, role, pin_hash,
-                      is_active, last_login, created_at, updated_at
+                      must_reset_pin, is_active, last_login, created_at, updated_at
                FROM users WHERE is_active = 1 ORDER BY display_name"""
         ).fetchall()
         return [_user_row_to_dict(r) for r in rows]
@@ -1012,18 +1034,65 @@ def generate_6_digit_pin():
     return str(_secrets.randbelow(900000) + 100000)
 
 
+# SEC-006: PIN complexity requirements
+_PIN_REJECT_PATTERNS = {
+    "000000", "111111", "222222", "333333", "444444",
+    "555555", "666666", "777777", "888888", "999999",
+    "123456", "654321", "012345", "543210",
+}
+
+
+def validate_pin_complexity(pin: str) -> str | None:
+    """Check PIN meets complexity requirements.
+
+    Returns error message or None if valid.
+    Requirements:
+      - Exactly 6 digits
+      - Not all same digit (e.g., 111111)
+      - Not a simple sequence (e.g., 123456)
+    """
+    if not pin or not isinstance(pin, str):
+        return "PIN is required"
+    if not pin.isdigit() or len(pin) != 6:
+        return "PIN must be exactly 6 digits"
+    if pin in _PIN_REJECT_PATTERNS:
+        return "PIN is too simple — avoid repeated digits or sequences"
+    # At least 2 unique digits
+    if len(set(pin)) < 2:
+        return "PIN must contain at least 2 different digits"
+    return None
+
+
+def clear_must_reset_pin(user_id: int):
+    """Clear the must_reset_pin flag after a successful PIN change."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "UPDATE users SET must_reset_pin = 0, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _user_row_to_dict(row):
-    """Convert a users table row to a dict."""
+    """Convert a users table row to a dict.
+
+    Expects columns: id, username, display_name, role, pin_hash,
+    must_reset_pin, is_active, last_login, created_at, updated_at
+    """
     return {
         "id": row[0],
         "username": row[1],
         "display_name": row[2],
         "role": row[3],
         "pin_hash": row[4],
-        "is_active": bool(row[5]),
-        "last_login": row[6] or "",
-        "created_at": row[7],
-        "updated_at": row[8],
+        "must_reset_pin": bool(row[5]) if len(row) > 9 else False,
+        "is_active": bool(row[6] if len(row) > 9 else row[5]),
+        "last_login": (row[7] if len(row) > 9 else row[6]) or "",
+        "created_at": row[8] if len(row) > 9 else row[7],
+        "updated_at": row[9] if len(row) > 9 else row[8],
     }
 
 
@@ -1066,6 +1135,11 @@ def require_login(fn):
                 return jsonify({"error": "Session expired"}), 401
             return redirect("/login")
         session["last_seen"] = now
+        # SEC-006: Force PIN reset — block navigation to anything except /change-pin and /logout
+        if session.get("force_pin_reset") and request.path not in ("/change-pin", "/logout"):
+            if _is_api_request():
+                return jsonify({"error": "PIN reset required before API access"}), 403
+            return redirect("/change-pin")
         return fn(*args, **kwargs)
     return wrapper
 
@@ -2790,6 +2864,12 @@ def login_post():
     log_event("info", "login_success",
               f"{u['display_name']} logged in",
               user_id=u["id"], ip_addr=ip)
+
+    # SEC-006: Force PIN reset if flagged
+    if u.get("must_reset_pin"):
+        session["force_pin_reset"] = True
+        return redirect("/change-pin", code=303)
+
     return redirect("/admin", code=303)
 
 
@@ -2804,6 +2884,101 @@ def logout():
                   ip_addr=request.remote_addr or "")
     session.clear()
     return redirect("/login", code=303)
+
+
+# ─── SEC-006: Forced PIN Change ──────────────────────────────────────────────
+
+@app.route("/change-pin", methods=["GET"])
+@require_login
+def change_pin_page():
+    """Show PIN change form. Users flagged with must_reset_pin are redirected here."""
+    u = current_user()
+    forced = session.get("force_pin_reset", False)
+    return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                  user=u, forced=forced, error=None, success=None)
+
+
+@app.route("/change-pin", methods=["POST"])
+@require_login
+def change_pin_submit():
+    """Process PIN change. Validates complexity and clears must_reset_pin flag."""
+    u = current_user()
+    forced = session.get("force_pin_reset", False)
+    current_pin = request.form.get("current_pin", "").strip()
+    new_pin = request.form.get("new_pin", "").strip()
+    confirm_pin = request.form.get("confirm_pin", "").strip()
+
+    # Verify current PIN
+    if not check_password_hash(u["pin_hash"], current_pin):
+        return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                      user=u, forced=forced,
+                                      error="Current PIN is incorrect.", success=None)
+
+    # Check new PINs match
+    if new_pin != confirm_pin:
+        return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                      user=u, forced=forced,
+                                      error="New PINs don't match.", success=None)
+
+    # SEC-006: Complexity check
+    complexity_err = validate_pin_complexity(new_pin)
+    if complexity_err:
+        return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                      user=u, forced=forced,
+                                      error=complexity_err, success=None)
+
+    # Don't allow reuse of same PIN
+    if check_password_hash(u["pin_hash"], new_pin):
+        return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                      user=u, forced=forced,
+                                      error="New PIN must be different from current PIN.", success=None)
+
+    # Apply change
+    new_hash = generate_password_hash(new_pin)
+    set_user_pin_hash(u["id"], new_hash)
+    clear_must_reset_pin(u["id"])
+    session.pop("force_pin_reset", None)
+    log_event("info", "pin_change",
+              f"{u['display_name']} changed their PIN",
+              user_id=u["id"], ip_addr=request.remote_addr or "")
+
+    if forced:
+        return redirect("/admin", code=303)
+    return render_template_string(_CHANGE_PIN_TEMPLATE,
+                                  user=u, forced=False,
+                                  error=None, success="PIN changed successfully.")
+
+
+# Inline template for PIN change page (avoids needing a separate HTML file)
+_CHANGE_PIN_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Change PIN</title>
+<style>
+body { font-family: 'Georgia', serif; background: #1a1a2e; color: #e8e0d0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+.card { background: #16213e; border: 1px solid #333; border-radius: 8px; padding: 2rem; max-width: 400px; width: 100%; }
+h2 { color: #e2a73b; margin-top: 0; }
+.forced { background: #5c3a08; border: 1px solid #e2a73b; padding: 0.75rem; border-radius: 4px; margin-bottom: 1rem; font-size: 0.9rem; }
+.error { color: #ff6b6b; margin-bottom: 1rem; }
+.success { color: #51cf66; margin-bottom: 1rem; }
+label { display: block; margin-top: 1rem; font-size: 0.85rem; color: #a0a0a0; }
+input[type=password] { width: 100%; padding: 0.5rem; margin-top: 0.25rem; background: #0f3460; color: #e8e0d0; border: 1px solid #444; border-radius: 4px; font-size: 1.1rem; letter-spacing: 0.3em; text-align: center; box-sizing: border-box; }
+button { margin-top: 1.5rem; width: 100%; padding: 0.6rem; background: #e2a73b; color: #1a1a2e; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 1rem; }
+button:hover { background: #d4953a; }
+.hint { font-size: 0.75rem; color: #777; margin-top: 0.25rem; }
+</style></head>
+<body><div class="card">
+<h2>Change PIN</h2>
+{% if forced %}<div class="forced">Your PIN must be changed before continuing.</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if success %}<div class="success">{{ success }}</div>{% endif %}
+<form method="POST">
+<label>Current PIN</label><input type="password" name="current_pin" maxlength="6" pattern="[0-9]{6}" required autofocus>
+<label>New PIN</label><input type="password" name="new_pin" maxlength="6" pattern="[0-9]{6}" required>
+<div class="hint">6 digits, no repeated or sequential patterns</div>
+<label>Confirm New PIN</label><input type="password" name="confirm_pin" maxlength="6" pattern="[0-9]{6}" required>
+<button type="submit">Change PIN</button>
+</form>
+{% if not forced %}<p style="text-align:center;margin-top:1rem;"><a href="/admin" style="color:#e2a73b;">Back to Dashboard</a></p>{% endif %}
+</div></body></html>"""
 
 
 # ─── Sprint 2: Admin Routes ─────────────────────────────────────────────────
@@ -2922,6 +3097,13 @@ def admin_create_user():
 def admin_reset_pin(user_id):
     temp_pin = generate_6_digit_pin()
     set_user_pin_hash(user_id, generate_password_hash(temp_pin))
+    # SEC-006: Flag user for forced PIN change on next login
+    conn = _get_db()
+    try:
+        conn.execute("UPDATE users SET must_reset_pin = 1 WHERE id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
     target = get_user_by_id(user_id)
     target_name = target["display_name"] if target else f"user_id={user_id}"
     log_event("warn", "pin_reset",
@@ -4077,12 +4259,19 @@ def api_login():
     log_event("info", "login_success",
               f"{u['display_name']} logged in via API",
               user_id=u["id"], ip_addr=ip)
+
+    # SEC-006: Inform API clients if PIN reset is required
+    must_reset = bool(u.get("must_reset_pin"))
+    if must_reset:
+        session["force_pin_reset"] = True
+
     return jsonify({
         "ok": True,
         "user_id": u["id"],
         "username": u["username"],
         "display_name": u["display_name"],
         "role": u["role"],
+        "must_reset_pin": must_reset,
     })
 
 
