@@ -4654,6 +4654,8 @@ def results(job_id):
                 print(f"  [DOCTRINE] DRIFT: {drift['message']}")
         except Exception:
             pass  # Doctrine unavailable — non-fatal
+        # B7-UX: Include user's doc type selection for mismatch transparency
+        data["user_doc_type"] = job.get("doc_type", "")
         return jsonify(data)
     return jsonify({"error": "Results not ready"}), 404
 
@@ -8946,7 +8948,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
           </div>
 
           <div class="form-group">
-            <label class="form-label">Document Type</label>
+            <label class="form-label">Document Type <span style="font-size:11px;color:var(--text-muted);font-weight:400">&mdash; helps AI focus; final type detected automatically</span></label>
             <div class="pill-group" id="docTypePills"></div>
           </div>
 
@@ -9056,6 +9058,8 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
   </div>
   <!-- Client instructions banner (if any) -->
   <div id="reviewInstructionsBanner" style="display:none; padding:8px 20px; background:#FFF8E8; border-bottom:1px solid #F5E6C8; font-size:12px;"></div>
+  <!-- B7-UX: Doc type mismatch banner -->
+  <div id="reviewDocTypeBanner" style="display:none; padding:6px 20px; background:#FEF3E8; border-bottom:1px solid #F5D8B8; font-size:12px; color:#92610A;"></div>
   <div class="review-split">
     <div class="review-pdf" id="pdfViewer"></div>
     <div class="review-fields" id="fieldsPanel"></div>
@@ -10147,6 +10151,21 @@ function _loadReviewData(job, callback) {
           banner.style.display = 'none';
         }
       }).catch(() => {});
+    }
+    // B7-UX: Show doc type mismatch banner if user selection differs from detected types
+    var dtBanner = document.getElementById('reviewDocTypeBanner');
+    if (data.user_doc_type && data.user_doc_type !== 'other') {
+      var exts = data.extractions || [];
+      var detectedTypes = [...new Set(exts.map(function(e) { return e.document_type; }).filter(Boolean))];
+      if (detectedTypes.length > 0) {
+        var labels = { tax_returns: 'Tax Returns', bank_statements: 'Bank Statements', bookkeeping: 'Bookkeeping', trust_documents: 'Trust Documents', payroll: 'Payroll', other: 'Other' };
+        dtBanner.innerHTML = '&#128270; <strong>Selected:</strong> ' + esc(labels[data.user_doc_type] || data.user_doc_type) + ' &nbsp;&bull;&nbsp; <strong>Detected:</strong> ' + detectedTypes.map(esc).join(', ') + ' <span style="margin-left:8px;font-size:11px;color:#B08030">(Final classification is automatic)</span>';
+        dtBanner.style.display = '';
+      } else {
+        dtBanner.style.display = 'none';
+      }
+    } else if (dtBanner) {
+      dtBanner.style.display = 'none';
     }
     countTotalFields();
     updateVerifyBar();
