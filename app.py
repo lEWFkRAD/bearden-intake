@@ -7866,6 +7866,7 @@ def generate_workpaper(client_name):
     data = request.get_json(silent=True) or {}
     year = data.get("year") or ""
     mode = data.get("mode") or "assisted"
+    job_id = data.get("job_id")  # WORKPAPER-001: optional canonical facts path
 
     if not year:
         return jsonify({"error": "year is required"}), 400
@@ -7875,13 +7876,27 @@ def generate_workpaper(client_name):
     try:
         fs = FactStore(str(DB_PATH))
 
-        # Check that facts exist for this client/year
-        fact_list = fs.list_legacy_facts(client_name, year)
-        if not fact_list:
-            return jsonify({
-                "error": f"No facts found for {client_name} / {year}. "
-                         "Run extraction and review first."
-            }), 404
+        # WORKPAPER-001: If job_id provided, check canonical facts first
+        fact_count = 0
+        fact_source = "legacy"
+        if job_id:
+            try:
+                canonical = fs.get_workpaper_facts(job_id, year)
+                if canonical:
+                    fact_count = len(canonical)
+                    fact_source = "canonical"
+            except Exception:
+                pass  # Fall through to legacy
+
+        if fact_count == 0:
+            fact_list = fs.list_legacy_facts(client_name, year)
+            fact_count = len(fact_list)
+            fact_source = "legacy"
+            if not fact_list:
+                return jsonify({
+                    "error": f"No facts found for {client_name} / {year}. "
+                             "Run extraction and review first."
+                }), 404
 
         # Generate filename
         safe_name = re.sub(r'[^\w\-]', '_', client_name)
@@ -7889,7 +7904,8 @@ def generate_workpaper(client_name):
         report_id = f"{safe_name}-workpaper-{year}-{timestamp}"
         output_path = OUTPUT_DIR / f"{report_id}.xlsx"
 
-        builder = WorkpaperBuilder(fs, client_name, year, mode=mode)
+        builder = WorkpaperBuilder(fs, client_name, year, mode=mode,
+                                   job_id=job_id)
         builder.build(str(output_path))
 
         if not output_path.exists():
@@ -7898,18 +7914,21 @@ def generate_workpaper(client_name):
         # Sprint 2: Log workpaper generation
         wp_user = current_user()
         log_event("info", "workpaper_generated",
-                  f"Workpaper generated: {client_name} / {year} ({mode} mode)",
+                  f"Workpaper generated: {client_name} / {year} ({mode} mode, {fact_source} facts)",
                   user_id=wp_user["id"] if wp_user else None,
                   details={"client": client_name, "year": year, "mode": mode,
-                           "facts_count": len(fact_list),
+                           "facts_count": fact_count,
+                           "fact_source": fact_source,
+                           "job_id": job_id,
                            "filename": f"{report_id}.xlsx"})
 
         return jsonify({
             "ok": True,
             "filename": f"{report_id}.xlsx",
             "download_url": f"/api/download-report/{report_id}",
-            "facts_count": len(fact_list),
+            "facts_count": fact_count,
             "mode": mode,
+            "fact_source": fact_source,  # WORKPAPER-001: "canonical" or "legacy"
         })
 
     except (ValueError, TypeError) as e:

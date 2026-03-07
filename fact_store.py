@@ -1049,6 +1049,120 @@ class FactStore:
             conn.close()
 
     # ══════════════════════════════════════════════════════════════════════════
+    # WORKPAPER-001: CANONICAL FACTS FOR WORKPAPER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _parse_fact_key(fact_key):
+        """Parse a canonical fact key into (document_type, payer_key, field_name).
+
+        Format: "{document_type}.{payer_key}.{field_name}"
+        Example: "W-2.ein:12-3456789.wages" → ("W-2", "ein:12-3456789", "wages")
+
+        The payer_key may contain dots (e.g., "ein:12-3456789"), so we split
+        on the first dot (document_type) and last dot (field_name), with
+        everything in between as payer_key.
+        """
+        parts = fact_key.split(".")
+        if len(parts) < 3:
+            # Minimal: "type.field" with no payer_key
+            return (parts[0], "", parts[-1]) if len(parts) == 2 else (fact_key, "", "")
+        return (parts[0], ".".join(parts[1:-1]), parts[-1])
+
+    @staticmethod
+    def _payer_key_to_display(payer_key):
+        """Derive a human-readable display name from a payer_key.
+
+        Examples:
+            "ein:12-3456789" → "EIN 12-3456789"
+            "Acme Corp" → "Acme Corp"
+            "" → ""
+        """
+        if not payer_key:
+            return ""
+        if payer_key.startswith("ein:"):
+            return f"EIN {payer_key[4:]}"
+        return payer_key
+
+    def get_workpaper_facts(self, job_id, tax_year):
+        """Get all canonical facts for a job/year, formatted for WorkpaperBuilder.
+
+        WORKPAPER-001: This reads from the unified `facts` table (single source
+        of truth) instead of the legacy `client_canonical_values` table.
+
+        Returns list of dicts matching the format WorkpaperBuilder._build_lookup()
+        expects:
+            {
+                "fact_key": "W-2.ein:12-3456789.wages",
+                "document_type": "W-2",
+                "payer_key": "ein:12-3456789",
+                "field_name": "wages",
+                "canonical_value": 85000.0,
+                "original_value": None,
+                "status": "confirmed",
+                "payer_display": "EIN 12-3456789",
+                "source_job_id": "abc123",
+                "reviewer": "",
+                "verified_at": "2025-03-07T...",
+                "evidence_ref": "...",
+                "source_doc": "smith_w2.pdf",
+                "page_number": 1,
+            }
+        """
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                """SELECT id, job_id, client_id, tax_year, fact_key,
+                          value_num, value_text, status, confidence,
+                          source_method, source_doc, source_page,
+                          evidence_ref, locked, updated_at
+                   FROM facts
+                   WHERE job_id = ? AND tax_year = ?
+                   ORDER BY fact_key""",
+                (job_id, str(tax_year))
+            ).fetchall()
+
+            results = []
+            for row in rows:
+                fact_key = row[4]
+                value_num = row[5]
+                value_text = row[6]
+
+                # Resolve canonical_value: prefer numeric, fall back to text
+                if value_num is not None:
+                    canonical_value = value_num
+                elif value_text is not None:
+                    # Try to parse text as JSON (for dicts, lists)
+                    try:
+                        canonical_value = json.loads(value_text)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        canonical_value = value_text
+                else:
+                    canonical_value = None
+
+                doc_type, payer_key, field_name = self._parse_fact_key(fact_key)
+
+                results.append({
+                    "fact_key": fact_key,
+                    "document_type": doc_type,
+                    "payer_key": payer_key,
+                    "field_name": field_name,
+                    "canonical_value": canonical_value,
+                    "original_value": None,  # Not tracked in unified table
+                    "status": row[7],
+                    "payer_display": self._payer_key_to_display(payer_key),
+                    "source_job_id": row[1],
+                    "reviewer": "",
+                    "verified_at": row[14],  # updated_at as proxy
+                    "evidence_ref": row[12] or "",
+                    "source_doc": row[10] or "",
+                    "page_number": row[11],
+                })
+            return results
+        finally:
+            conn.close()
+
+    # ══════════════════════════════════════════════════════════════════════════
     # HELPERS
     # ══════════════════════════════════════════════════════════════════════════
 

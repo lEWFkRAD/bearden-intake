@@ -53,7 +53,7 @@ def test_no_forbidden_imports_in_source():
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for filename in ('fact_store.py', 'workpaper_export.py'):
         filepath = os.path.join(base, filename)
-        with open(filepath) as f:
+        with open(filepath, encoding="utf-8") as f:
             source = f.read()
         # Check for actual import statements (not strings in _FORBIDDEN_MODULES)
         lines = source.split('\n')
@@ -818,6 +818,232 @@ def test_empty_workpaper():
 
         check(len(headers_found) >= len(ALWAYS_SHOW),
               f"empty workpaper shows ALWAYS_SHOW sections (found {headers_found})")
+    finally:
+        for p in (db_path, output_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKPAPER-001: CANONICAL FACTS PATH TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_canonical_facts_round_trip():
+    """WorkpaperBuilder with job_id reads from canonical facts table."""
+    from fact_store import FactStore
+
+    fd, db_path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+
+    try:
+        fs = FactStore(db_path)
+
+        # Write a fact into the canonical table
+        fs.upsert_candidate_fact(
+            job_id="test-job-001",
+            client_id="Smith, John",
+            tax_year="2025",
+            fact_key="W-2.ein:99-1234567.wages",
+            value_num=85000.0,
+            value_text=None,
+            status="confirmed",
+            confidence="high",
+            source_method="vision",
+            source_doc="smith_w2.pdf",
+            source_page=1,
+            evidence_ref="box1",
+        )
+
+        # Retrieve via workpaper method
+        facts = fs.get_workpaper_facts("test-job-001", "2025")
+        check(len(facts) == 1, f"get_workpaper_facts returns 1 fact (got {len(facts)})")
+        f = facts[0]
+        check(f["document_type"] == "W-2", f"document_type parsed correctly: {f['document_type']}")
+        check(f["payer_key"] == "ein:99-1234567", f"payer_key parsed correctly: {f['payer_key']}")
+        check(f["field_name"] == "wages", f"field_name parsed correctly: {f['field_name']}")
+        check(f["canonical_value"] == 85000.0, f"canonical_value from value_num: {f['canonical_value']}")
+        check(f["status"] == "confirmed", f"status preserved: {f['status']}")
+        check(f["payer_display"] == "EIN 99-1234567", f"payer_display derived: {f['payer_display']}")
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+
+
+def test_canonical_workpaper_build():
+    """WorkpaperBuilder with job_id generates workpaper from canonical facts."""
+    import openpyxl
+    from fact_store import FactStore
+    from workpaper_export import WorkpaperBuilder
+
+    fd, db_path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    fd2, output_path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd2)
+
+    try:
+        fs = FactStore(db_path)
+
+        # Write canonical facts for a W-2
+        for field, val in [("wages", 85000.0), ("federal_wh", 12000.0), ("state_wh", 5000.0)]:
+            fs.upsert_candidate_fact(
+                job_id="test-job-002",
+                client_id="Jones, Jane",
+                tax_year="2025",
+                fact_key=f"W-2.ein:11-2222222.{field}",
+                value_num=val,
+                value_text=None,
+                status="confirmed",
+                confidence="high",
+                source_method="vision",
+                source_doc="jones_w2.pdf",
+                source_page=1,
+                evidence_ref=f"box-{field}",
+            )
+
+        builder = WorkpaperBuilder(fs, "Jones, Jane", "2025", mode="assisted",
+                                   job_id="test-job-002")
+        builder.build(output_path)
+
+        wb = openpyxl.load_workbook(output_path)
+        ws = wb["2025"]
+
+        # Check subtitle includes "canonical facts"
+        subtitle = ws.cell(row=2, column=1).value or ""
+        check("canonical facts" in subtitle.lower(),
+              f"subtitle shows canonical facts source: {subtitle[:80]}")
+
+        # Verify data rendered
+        values_found = []
+        for row in ws.iter_rows(min_col=2, max_col=4, values_only=True):
+            for v in row:
+                if isinstance(v, (int, float)) and v > 0:
+                    values_found.append(v)
+        check(85000.0 in values_found, "wages value 85000 rendered in workpaper")
+        check(12000.0 in values_found, "federal_wh value 12000 rendered in workpaper")
+    finally:
+        for p in (db_path, output_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def test_canonical_fallback_to_legacy():
+    """WorkpaperBuilder falls back to legacy facts if job_id has no canonical facts."""
+    from fact_store import FactStore
+    from workpaper_export import WorkpaperBuilder
+
+    fd, db_path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    fd2, output_path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd2)
+
+    try:
+        fs = FactStore(db_path)
+
+        # Write only legacy facts (no canonical facts for this job)
+        fs.upsert_legacy_fact(
+            "Test, Client", "2025", "W-2", "ein:33-3333333", "wages",
+            canonical_value=50000.0, status="confirmed", payer_display="Acme Corp"
+        )
+
+        # Build with a job_id that has no canonical facts → should fall back
+        builder = WorkpaperBuilder(fs, "Test, Client", "2025", mode="assisted",
+                                   job_id="nonexistent-job")
+        builder.build(output_path)
+
+        check(os.path.exists(output_path), "workpaper generated via legacy fallback")
+    finally:
+        for p in (db_path, output_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def test_parse_fact_key():
+    """FactStore._parse_fact_key handles various key formats correctly."""
+    from fact_store import FactStore
+
+    # Standard: "W-2.ein:12-3456789.wages"
+    dt, pk, fn = FactStore._parse_fact_key("W-2.ein:12-3456789.wages")
+    check(dt == "W-2", f"doc_type=W-2: {dt}")
+    check(pk == "ein:12-3456789", f"payer_key=ein:12-3456789: {pk}")
+    check(fn == "wages", f"field_name=wages: {fn}")
+
+    # Payer with dot: "1099-INT.Chase.Bank.interest_income"
+    dt, pk, fn = FactStore._parse_fact_key("1099-INT.Chase.Bank.interest_income")
+    check(dt == "1099-INT", f"doc_type=1099-INT: {dt}")
+    check(pk == "Chase.Bank", f"payer_key=Chase.Bank: {pk}")
+    check(fn == "interest_income", f"field_name=interest_income: {fn}")
+
+    # Minimal: "W-2.field"
+    dt, pk, fn = FactStore._parse_fact_key("W-2.wages")
+    check(dt == "W-2", f"minimal doc_type=W-2: {dt}")
+    check(fn == "wages", f"minimal field_name=wages: {fn}")
+
+
+def test_custom_layout():
+    """WorkpaperBuilder accepts custom layout override."""
+    import openpyxl
+    from fact_store import FactStore
+    from workpaper_export import WorkpaperBuilder
+
+    fd, db_path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    fd2, output_path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd2)
+
+    try:
+        fs = FactStore(db_path)
+
+        # Write a fact
+        fs.upsert_candidate_fact(
+            job_id="layout-test",
+            client_id="Layout, Test",
+            tax_year="2025",
+            fact_key="W-2.ein:00-0000001.wages",
+            value_num=99000.0,
+            value_text=None,
+            status="confirmed",
+            confidence="high",
+            source_method="vision",
+            source_doc="test.pdf",
+            source_page=1,
+        )
+
+        # Minimal custom layout — just W-2 section
+        custom_layout = [
+            {
+                "id": "w2",
+                "header": "W-2 (Custom Layout):",
+                "match_types": ["W-2"],
+                "fields": {
+                    "wages": {"col": "A", "type": "input", "fmt": "money"},
+                },
+                "col_headers": {"A": "Gross Wages"},
+                "sum_cols": ["A"],
+            },
+        ]
+
+        builder = WorkpaperBuilder(fs, "Layout, Test", "2025", mode="assisted",
+                                   job_id="layout-test", layout=custom_layout)
+        builder.build(output_path)
+
+        wb = openpyxl.load_workbook(output_path)
+        ws = wb["2025"]
+
+        # Find the custom header
+        found_custom = False
+        for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
+            if row[0] and "Custom Layout" in str(row[0]):
+                found_custom = True
+                break
+        check(found_custom, "custom layout header rendered in workpaper")
     finally:
         for p in (db_path, output_path):
             try:

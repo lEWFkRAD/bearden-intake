@@ -658,7 +658,20 @@ class WorkpaperBuilder:
         ValueError: If client_name or year look like file paths or raw data.
     """
 
-    def __init__(self, fact_store, client_name, year, mode="assisted"):
+    def __init__(self, fact_store, client_name, year, mode="assisted",
+                 job_id=None, layout=None):
+        """
+        Args:
+            fact_store: FactStore instance (DB-only gateway)
+            client_name: Client name string
+            year: Tax year string (e.g. "2025")
+            mode: "assisted" (all values, flagged) or "safe" (only verified values)
+            job_id: Optional extraction job_id. When provided, pulls from the
+                    canonical `facts` table instead of legacy `client_canonical_values`.
+                    (WORKPAPER-001: B3 enforcement — export from canonical facts only)
+            layout: Optional list of section dicts to override MAPPING_REGISTRY.
+                    Enables template-registry-driven layouts.
+        """
         # ── Guardrail A: Only accept identifiers ──────────────────────────
         if not isinstance(fact_store, FactStore):
             raise TypeError(
@@ -669,11 +682,15 @@ class WorkpaperBuilder:
         _validate_identifier(str(year), "year")
         if mode not in ("assisted", "safe"):
             raise ValueError(f"mode must be 'assisted' or 'safe', got {mode!r}")
+        if job_id is not None:
+            _validate_identifier(str(job_id), "job_id")
 
         self.fs = fact_store
         self.client = client_name
         self.year = str(year)
         self.mode = mode
+        self.job_id = job_id
+        self._layout = layout  # None → use MAPPING_REGISTRY
 
     def build(self, output_path):
         """Generate the workpaper Excel file.
@@ -694,8 +711,24 @@ class WorkpaperBuilder:
         ws = wb.active
         ws.title = str(self.year)
 
-        # Load all facts for this client/year
-        facts = self.fs.get_legacy_facts(self.client, self.year)
+        # ── WORKPAPER-001: Load facts from canonical source ──────────────
+        # Prefer unified `facts` table (via job_id) over legacy table.
+        # This ensures workpapers reflect human corrections and trust hierarchy.
+        facts = None
+        fact_source = "legacy"
+
+        if self.job_id:
+            try:
+                facts = self.fs.get_workpaper_facts(self.job_id, self.year)
+                if facts:
+                    fact_source = "canonical"
+            except Exception:
+                facts = None  # Fall through to legacy
+
+        if not facts:
+            facts = self.fs.get_legacy_facts(self.client, self.year)
+            fact_source = "legacy"
+
         fact_lookup = self._build_lookup(facts)
 
         # Title block
@@ -703,15 +736,19 @@ class WorkpaperBuilder:
         ws.cell(row=row, column=1, value=f"Workpaper: {self.client}").font = TITLE_FONT
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
         row += 1
+        source_label = "canonical facts" if fact_source == "canonical" else "legacy facts"
         ws.cell(row=row, column=1,
-                value=f"Tax Year {self.year} | Generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Mode: {self.mode.title()}"
+                value=f"Tax Year {self.year} | Generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')} | Mode: {self.mode.title()} | Source: {source_label}"
                 ).font = SUBTITLE_FONT
         row += 2  # blank row
 
         audit_rows = []
 
+        # ── WORKPAPER-001: Use custom layout or default MAPPING_REGISTRY ──
+        section_layout = self._layout if self._layout is not None else MAPPING_REGISTRY
+
         # Render each section
-        for section in MAPPING_REGISTRY:
+        for section in section_layout:
             section_id = section["id"]
             matched_payers = self._match_payers(section, fact_lookup)
 
