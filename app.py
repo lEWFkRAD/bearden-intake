@@ -426,6 +426,29 @@ def _init_db():
             except sqlite3.OperationalError:
                 pass
 
+        # B9: Time tracking — per-field duration on verified_fields
+        for col, col_type in [("field_duration_ms", "INTEGER")]:
+            try:
+                conn.execute(f"ALTER TABLE verified_fields ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
+        # B9: Review sessions — tracks wall-clock review time per job
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                reviewer TEXT NOT NULL DEFAULT '',
+                reviewer_id INTEGER,
+                session_start TEXT NOT NULL,
+                session_end TEXT,
+                duration_seconds INTEGER,
+                fields_reviewed INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        _safe_create_index(conn, "CREATE INDEX IF NOT EXISTS idx_rsess_job ON review_sessions(job_id)")
+
         # B1: Auto-set existing complete jobs to preparer_review if still draft
         conn.execute("""
             UPDATE jobs SET review_stage = 'preparer_review', stage_updated = datetime('now')
@@ -5440,6 +5463,13 @@ def guided_review_action(job_id, field_id):
             "review_stage": job.get("review_stage", "") if job else "",
             "note": payload.get("note", ""),
         }
+        # B9: Per-field time tracking
+        field_dur = payload.get("field_duration_ms")
+        if field_dur is not None:
+            try:
+                field_decision["field_duration_ms"] = int(field_dur)
+            except (ValueError, TypeError):
+                pass
         if action == "correct":
             field_decision["corrected_value"] = payload.get("corrected_value")
             # Delete cached evidence for this field (value changed)
@@ -5534,6 +5564,131 @@ def guided_review_unlock(job_id, field_id):
     """Release a review lock."""
     _release_review_lock(job_id, field_id)
     return jsonify({"ok": True})
+
+
+# ─── B9: Review Time Tracking ────────────────────────────────────────────────
+
+@app.route("/api/review-session/<job_id>/start", methods=["POST"])
+@require_login
+def review_session_start(job_id):
+    """Start a review session for time tracking."""
+    u = current_user()
+    reviewer = u["display_name"] if u else "operator"
+    reviewer_id = u["id"] if u else None
+    now = datetime.now().isoformat()
+    conn = _get_db()
+    try:
+        conn.execute(
+            """INSERT INTO review_sessions
+               (job_id, reviewer, reviewer_id, session_start, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (job_id, reviewer, reviewer_id, now, now)
+        )
+        conn.commit()
+        session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    except sqlite3.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "session_id": session_id, "session_start": now})
+
+
+@app.route("/api/review-session/<job_id>/end", methods=["POST"])
+@require_login
+def review_session_end(job_id):
+    """End a review session. Computes duration from session start."""
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id")
+    fields_reviewed = payload.get("fields_reviewed", 0)
+    now = datetime.now().isoformat()
+    conn = _get_db()
+    try:
+        if session_id:
+            row = conn.execute(
+                "SELECT session_start FROM review_sessions WHERE id = ? AND job_id = ?",
+                (session_id, job_id)
+            ).fetchone()
+        else:
+            # Find most recent open session for this job
+            row = conn.execute(
+                "SELECT id, session_start FROM review_sessions WHERE job_id = ? AND session_end IS NULL ORDER BY id DESC LIMIT 1",
+                (job_id,)
+            ).fetchone()
+            if row:
+                session_id = row[0]
+                row = (row[1],)
+        if row:
+            try:
+                start_dt = datetime.fromisoformat(row[0])
+                end_dt = datetime.fromisoformat(now)
+                duration = int((end_dt - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                duration = None
+            conn.execute(
+                """UPDATE review_sessions SET session_end = ?, duration_seconds = ?, fields_reviewed = ?
+                   WHERE id = ?""",
+                (now, duration, fields_reviewed, session_id)
+            )
+            conn.commit()
+            return jsonify({"ok": True, "duration_seconds": duration})
+        return jsonify({"ok": False, "error": "No open session found"}), 404
+    except sqlite3.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/review-session/<job_id>/timing", methods=["GET"])
+@require_login
+def review_session_timing(job_id):
+    """Return aggregate review timing for a job — total time, per-field durations."""
+    conn = _get_db()
+    try:
+        # Session totals
+        rows = conn.execute(
+            "SELECT SUM(duration_seconds), SUM(fields_reviewed), COUNT(*) FROM review_sessions WHERE job_id = ? AND duration_seconds IS NOT NULL",
+            (job_id,)
+        ).fetchone()
+        total_seconds = rows[0] or 0
+        total_fields = rows[1] or 0
+        session_count = rows[2] or 0
+
+        # Per-field durations (top 10 slowest)
+        field_rows = conn.execute(
+            """SELECT field_key, field_duration_ms, status, reviewer, verified_at
+               FROM verified_fields
+               WHERE job_id = ? AND field_duration_ms IS NOT NULL AND field_duration_ms > 0
+               ORDER BY field_duration_ms DESC LIMIT 10""",
+            (job_id,)
+        ).fetchall()
+        slowest = [{"field_key": r[0], "duration_ms": r[1], "status": r[2],
+                     "reviewer": r[3], "verified_at": r[4]} for r in field_rows]
+
+        # Average per-field
+        avg_row = conn.execute(
+            "SELECT AVG(field_duration_ms), COUNT(*) FROM verified_fields WHERE job_id = ? AND field_duration_ms IS NOT NULL AND field_duration_ms > 0",
+            (job_id,)
+        ).fetchone()
+        avg_ms = int(avg_row[0]) if avg_row[0] else 0
+        timed_fields = avg_row[1] or 0
+    except sqlite3.Error:
+        total_seconds = 0
+        total_fields = 0
+        session_count = 0
+        slowest = []
+        avg_ms = 0
+        timed_fields = 0
+    finally:
+        conn.close()
+
+    return jsonify({
+        "total_review_seconds": total_seconds,
+        "total_fields_reviewed": total_fields,
+        "session_count": session_count,
+        "avg_field_ms": avg_ms,
+        "timed_fields": timed_fields,
+        "slowest_fields": slowest,
+    })
 
 
 # ─── Post-Run Audit Sampling ─────────────────────────────────────────────────
@@ -5905,6 +6060,20 @@ def _sanitize_job(j):
 def list_jobs():
     q = request.args.get("q", "").strip().lower()
     dtype = request.args.get("doc_type", "").strip()
+
+    # B9: Batch-fetch review session totals for all jobs
+    review_times = {}
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT job_id, SUM(duration_seconds) FROM review_sessions WHERE duration_seconds IS NOT NULL GROUP BY job_id"
+        ).fetchall()
+        for r in rows:
+            review_times[r[0]] = r[1]
+        conn.close()
+    except sqlite3.Error:
+        pass
+
     out = []
     for j in sorted(jobs.values(), key=lambda x: x.get("created", ""), reverse=True):
         if q and q not in j.get("client_name", "").lower() and q not in j.get("filename", "").lower():
@@ -5930,6 +6099,8 @@ def list_jobs():
                 job_out["duration_seconds"] = None
         else:
             job_out["duration_seconds"] = None
+        # B9: Include review time
+        job_out["review_time_seconds"] = review_times.get(j.get("id"))
         out.append(job_out)
     return jsonify(out)
 
@@ -5949,10 +6120,11 @@ def delete_job(job_id):
             pass
         finally:
             conn.close()
-        # Clean review locks
+        # Clean review locks + B9 review sessions
         try:
             conn2 = _get_db()
             conn2.execute("DELETE FROM review_locks WHERE job_id = ?", (job_id,))
+            conn2.execute("DELETE FROM review_sessions WHERE job_id = ?", (job_id,))
             conn2.commit()
             conn2.close()
         except sqlite3.Error:
@@ -6299,8 +6471,8 @@ def _upsert_verified_fields(job_id, incoming_fields):
                 """INSERT INTO verified_fields
                    (job_id, field_key, canonical_value, original_value, status,
                     category, vendor_desc, note, reviewer, verified_at,
-                    review_stage, reviewer_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    review_stage, reviewer_id, field_duration_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_id, field_key) DO UPDATE SET
                        canonical_value = excluded.canonical_value,
                        original_value = excluded.original_value,
@@ -6311,7 +6483,8 @@ def _upsert_verified_fields(job_id, incoming_fields):
                        reviewer = excluded.reviewer,
                        verified_at = excluded.verified_at,
                        review_stage = excluded.review_stage,
-                       reviewer_id = excluded.reviewer_id""",
+                       reviewer_id = excluded.reviewer_id,
+                       field_duration_ms = excluded.field_duration_ms""",
                 (job_id, field_key,
                  json.dumps(canonical) if canonical is not None else None,
                  json.dumps(original) if original is not None else None,
@@ -6322,7 +6495,8 @@ def _upsert_verified_fields(job_id, incoming_fields):
                  decision.get("reviewer", decision.get("reviewer", "")),
                  decision.get("timestamp", now),
                  decision.get("review_stage", ""),
-                 decision.get("reviewer_id"))
+                 decision.get("reviewer_id"),
+                 decision.get("field_duration_ms"))
             )
 
         # Promote to client-level canonical store + unified facts table
@@ -9264,7 +9438,7 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px
     <div class="card">
       <div class="table-wrap">
         <table class="data-table" id="historyTable">
-          <thead><tr><th>Client</th><th>File</th><th>Type</th><th>Year</th><th>Status</th><th>Cost</th><th>Duration</th><th>Date</th><th></th></tr></thead>
+          <thead><tr><th>Client</th><th>File</th><th>Type</th><th>Year</th><th>Status</th><th>Cost</th><th>Duration</th><th>Review Time</th><th>Date</th><th></th></tr></thead>
           <tbody id="historyBody"></tbody>
         </table>
       </div>
@@ -11124,7 +11298,7 @@ function formatDuration(secs) {
 
 function renderHistory(data) {
   const body = document.getElementById('historyBody');
-  if (!data.length) { body.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:24px;color:var(--text-light)">No jobs yet</td></tr>'; return; }
+  if (!data.length) { body.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--text-light)">No jobs yet</td></tr>'; return; }
   body.innerHTML = data.map(j => {
     const dt = j.created ? new Date(j.created).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
     const typeLabel = DOC_TYPES.find(d=>d.id===j.doc_type);
@@ -11137,6 +11311,7 @@ function renderHistory(data) {
       '<td><span class="job-status ' + (j.status||'') + '">' + esc(j.status||'') + '</span></td>' +
       '<td style="font-size:12px;font-family:var(--mono);color:var(--text-secondary)">' + costStr + '</td>' +
       '<td style="font-size:12px;font-family:var(--mono);color:var(--text-secondary)">' + formatDuration(j.duration_seconds) + '</td>' +
+      '<td style="font-size:12px;font-family:var(--mono);color:var(--text-secondary)">' + formatDuration(j.review_time_seconds) + '</td>' +
       '<td style="font-size:12px;color:var(--text-secondary)">' + dt + '</td>' +
       '<td class="actions">' +
         (j.status==='complete'?'<button class="btn btn-sm btn-secondary" onclick=\'openReview('+JSON.stringify({id:j.id,client_name:j.client_name})+')\'>\u{1F50D} Review</button> ':'') +
@@ -11694,6 +11869,11 @@ var guidedHeartbeatTimer = null;
 var guidedJobId = null;
 var guidedHistory = [];  // Stack of previously viewed field_ids for Back navigation
 var guidedReviewer = '';  // Will be populated from /api/me
+// B9: Time tracking state
+var _fieldLoadTime = null;      // Timestamp when current field was rendered
+var _reviewSessionId = null;    // Current review session ID from backend
+var _reviewSessionStart = null; // Timestamp when session started
+var _fieldsReviewedCount = 0;   // Count of fields reviewed in this session
 
 // Auto-populate reviewer from session on page load
 (function() {
@@ -11716,12 +11896,22 @@ function openGuidedReview() {
   if (!guidedJobId) { showToast('No job loaded', 'error'); return; }
   showSection('guided-review');
   guidedHistory = [];
+  _fieldLoadTime = null;
+  _fieldsReviewedCount = 0;
   document.getElementById('guidedBackBtn').disabled = true;
   document.getElementById('guidedDetail').style.opacity = '0.5';
   document.getElementById('guidedEvidence').innerHTML = '<div class="empty-state" style="color:rgba(255,255,255,0.5)"><p>Loading queue...</p></div>';
 
   // B1: Show stage badge
   _updateStageBadge();
+
+  // B9: Start review session for time tracking
+  _reviewSessionStart = Date.now();
+  fetch('/api/review-session/' + guidedJobId + '/start', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: '{}' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) { if (d.session_id) _reviewSessionId = d.session_id; })
+    .catch(function() {});
 
   fetch('/api/guided-review/queue/' + guidedJobId)
     .then(function(r) { return r.json(); })
@@ -11864,6 +12054,8 @@ function guidedGoBack() {
 
 function renderGuidedItem(data) {
   document.getElementById('guidedDetail').style.opacity = '1';
+  // B9: Record when this field was rendered for per-field timing
+  _fieldLoadTime = Date.now();
   // Evidence image — cropped highlight preferred, full page with banner as fallback
   var evEl = document.getElementById('guidedEvidence');
   if (data.evidence_url) {
@@ -11905,6 +12097,12 @@ function guidedAction(action) {
   if (!guidedCurrentItem || !guidedJobId) return;
   var noteVal = (document.getElementById('guidedNoteInput').value || '').trim();
   var body = { action: action, reviewer: _getGuidedReviewer(), note: noteVal };
+  // B9: Per-field time tracking — compute how long user spent on this field
+  if (_fieldLoadTime && action !== 'skip') {
+    body.field_duration_ms = Date.now() - _fieldLoadTime;
+  }
+  _fieldLoadTime = null;
+  if (action !== 'skip') _fieldsReviewedCount++;
   if (action === 'correct') {
     body.corrected_value = document.getElementById('guidedEditInput').value.trim();
     if (!body.corrected_value) { showToast('Enter a corrected value', 'error'); return; }
@@ -11976,15 +12174,26 @@ function showGuidedComplete(reviewed, total) {
   if (guidedHeartbeatTimer) { clearInterval(guidedHeartbeatTimer); guidedHeartbeatTimer = null; }
   guidedCurrentItem = null;
 
+  // B9: End review session — compute elapsed time
+  var sessionElapsed = _reviewSessionStart ? Math.round((Date.now() - _reviewSessionStart) / 1000) : null;
+  if (_reviewSessionId && guidedJobId) {
+    fetch('/api/review-session/' + guidedJobId + '/end', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ session_id: _reviewSessionId, fields_reviewed: _fieldsReviewedCount })
+    }).catch(function() {});
+  }
+  _reviewSessionId = null;
+  _reviewSessionStart = null;
+
   // Fetch current stage info to decide what buttons to show
   fetch('/api/jobs/' + guidedJobId + '/stage').then(r => r.json()).then(function(stageInfo) {
-    _renderGuidedComplete(reviewed, total, stageInfo);
+    _renderGuidedComplete(reviewed, total, stageInfo, sessionElapsed);
   }).catch(function() {
-    _renderGuidedComplete(reviewed, total, { stage: 'preparer_review', can_act: true, can_submit: true, can_send_back: false, display: 'Preparer Review' });
+    _renderGuidedComplete(reviewed, total, { stage: 'preparer_review', can_act: true, can_submit: true, can_send_back: false, display: 'Preparer Review' }, sessionElapsed);
   });
 }
 
-function _renderGuidedComplete(reviewed, total, stageInfo) {
+function _renderGuidedComplete(reviewed, total, stageInfo, sessionElapsed) {
   var stage = stageInfo.stage || 'preparer_review';
   var canAct = stageInfo.can_act;
   var stageDisplay = stageInfo.display || stage;
@@ -11998,13 +12207,23 @@ function _renderGuidedComplete(reviewed, total, stageInfo) {
   };
   var stageColor = stageColors[stage] || '#94A3B8';
 
-  // Left panel — completion summary with stage badge
+  // Left panel — completion summary with stage badge + B9 session timing
+  var timingHtml = '';
+  if (sessionElapsed !== null && sessionElapsed !== undefined) {
+    timingHtml = '<div style="margin-top:16px;padding:12px 20px;background:rgba(255,255,255,0.1);border-radius:10px;font-size:14px">' +
+      '<div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:0.7;margin-bottom:4px">Session Time</div>' +
+      '<div style="font-size:24px;font-weight:700;font-family:var(--mono)">' + formatDuration(sessionElapsed) + '</div>' +
+      (_fieldsReviewedCount > 0 ? '<div style="font-size:12px;opacity:0.7;margin-top:4px">' +
+        Math.round(sessionElapsed / _fieldsReviewedCount) + 's avg per field</div>' : '') +
+      '</div>';
+  }
   document.getElementById('guidedEvidence').innerHTML =
     '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:rgba(255,255,255,0.8);text-align:center;padding:40px">' +
     '<div style="font-size:64px;margin-bottom:16px">&#x2714;</div>' +
     '<h2 style="color:#fff;margin:0 0 8px">Review Complete</h2>' +
     '<p style="font-size:18px;margin:0 0 16px">' + reviewed + ' of ' + total + ' fields reviewed</p>' +
     '<div style="background:' + stageColor + ';color:#fff;padding:6px 16px;border-radius:16px;font-size:14px;font-weight:600">' + esc(stageDisplay) + '</div>' +
+    timingHtml +
     '</div>';
 
   // Right panel — stage-dependent actions
